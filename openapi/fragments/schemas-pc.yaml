@@ -1,0 +1,1391 @@
+# Группа schemas-pc: публичные типы из
+#   src/ClubShell.Contracts/Pc/HardwareInfo.cs, Pc/PcStatus.cs, Pc/PcInfo.cs (namespace ClubShell.Contracts.Pcs).
+# Внешние схемы (определяют другие группы, здесь только $ref): UpdateChannel, AntiCheatKind, Locale.
+# Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter),
+# null не пишется (WhenWritingNull), незнакомые поля пропускаются, DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ,
+# TimeOnly -> HH:mm (ClubTimeConverter). В этих файлах нет JsonPropertyName/JsonIgnore/JsonPolymorphic.
+components:
+  schemas:
+
+    # ------------------------------------------------------------------ HardwareInfo.cs
+
+    DiskType:
+      type: string
+      enum: [hdd, ssd, nvme, network, unknown]
+      description: Физический тип диска (unknown — не удалось определить).
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:8"
+
+    PeripheralKinds:
+      type: string
+      description: >-
+        Известные значения PeripheralInfo.kind. В C# это статический класс строковых констант, а не enum:
+        набор открытый, сервер обязан принимать любую строку.
+      examples: [keyboard, mouse, headset, gamepad, other]
+      x-known-values: [keyboard, mouse, headset, gamepad, other]
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:27"
+
+    CpuInfo:
+      type: object
+      description: Процессор.
+      required: [model, cores, threads]
+      properties:
+        model:
+          type: string
+          description: Модель из SMBIOS/WMI.
+        cores:
+          type: integer
+          format: int32
+          description: Физические ядра.
+        threads:
+          type: integer
+          format: int32
+          description: Логические процессоры.
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:49"
+
+    GpuInfo:
+      type: object
+      description: Видеокарта.
+      required: [model, vramMb, driver]
+      properties:
+        model:
+          type: string
+          description: Модель адаптера.
+        vramMb:
+          type: integer
+          format: int32
+          description: Выделенная видеопамять, МиБ.
+        driver:
+          type: string
+          description: Версия драйвера.
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:58"
+
+    DiskInfo:
+      type: object
+      description: Логический диск.
+      required: [mount, totalGb, freeGb, type]
+      properties:
+        mount:
+          type: string
+          description: Точка монтирования, например "C:".
+        totalGb:
+          type: number
+          format: double
+          description: Ёмкость, ГБ (1 знак после запятой).
+        freeGb:
+          type: number
+          format: double
+          description: Свободно, ГБ (1 знак после запятой).
+        type:
+          $ref: '#/components/schemas/DiskType'
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:68"
+
+    MonitorInfo:
+      type: object
+      description: Подключённый монитор.
+      required: [index, width, height, hz, primary]
+      properties:
+        index:
+          type: integer
+          format: int32
+          description: Индекс дисплея (с 0).
+        width:
+          type: integer
+          format: int32
+          description: Ширина, px.
+        height:
+          type: integer
+          format: int32
+          description: Высота, px.
+        hz:
+          type: integer
+          format: int32
+          description: Частота обновления, Гц.
+        primary:
+          type: boolean
+          description: Основной дисплей.
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:80"
+
+    NetworkInfo:
+      type: object
+      description: Основной сетевой адаптер.
+      required: [mac, ip, adapter]
+      properties:
+        mac:
+          type: string
+          description: MAC-адрес в виде AA:BB:CC:DD:EE:FF.
+        ip:
+          type: string
+          description: IPv4-адрес.
+        adapter:
+          type: string
+          description: Имя адаптера.
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:91"
+
+    OsInfo:
+      type: object
+      description: Операционная система.
+      required: [version, build]
+      properties:
+        version:
+          type: string
+          description: Название продукта, например "Windows 11 Pro".
+        build:
+          type: string
+          description: Сборка, например "26200.1234".
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:99"
+
+    PeripheralInfo:
+      type: object
+      description: USB/HID-периферия.
+      required: [kind, name, vendorId, productId]
+      properties:
+        kind:
+          $ref: '#/components/schemas/PeripheralKinds'
+          description: Вид устройства (см. PeripheralKinds; набор открытый).
+        name:
+          type: string
+          description: Имя устройства.
+        vendorId:
+          type: string
+          description: USB vendor id (hex).
+        productId:
+          type: string
+          description: USB product id (hex).
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:108"
+
+    HardwareInfo:
+      type: object
+      description: >-
+        Инвентаризация железа ПК (IPC_PROTOCOL §6.6). Агент шлёт при регистрации (AgentRegisterRequest.hardware)
+        и при изменении (телеметрия, событие hardwareChanged).
+      required: [cpu, gpu, ramMb, disks, monitors, network, os, peripherals]
+      properties:
+        cpu:
+          $ref: '#/components/schemas/CpuInfo'
+        gpu:
+          type: array
+          description: Видеокарты.
+          items:
+            $ref: '#/components/schemas/GpuInfo'
+        ramMb:
+          type: integer
+          format: int32
+          description: Установленная ОЗУ, МиБ.
+        disks:
+          type: array
+          description: Логические диски.
+          items:
+            $ref: '#/components/schemas/DiskInfo'
+        monitors:
+          type: array
+          description: Мониторы.
+          items:
+            $ref: '#/components/schemas/MonitorInfo'
+        network:
+          $ref: '#/components/schemas/NetworkInfo'
+        os:
+          $ref: '#/components/schemas/OsInfo'
+        peripherals:
+          type: array
+          description: Периферия.
+          items:
+            $ref: '#/components/schemas/PeripheralInfo'
+      x-csharp: "src/ClubShell.Contracts/Pc/HardwareInfo.cs:123"
+
+    # ------------------------------------------------------------------ PcStatus.cs
+
+    PcStatus:
+      type: string
+      enum: [offline, free, busy, locked, maintenance, booked]
+      description: >-
+        Статус места/ПК на карте клуба: offline — агент недоступен; free — онлайн без сессии; busy — идёт сессия;
+        locked — сессия заблокирована или блокировка админом; maintenance — выведен из работы; booked — забронирован.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcStatus.cs:8"
+
+    Temperatures:
+      type: object
+      description: Температуры, °C; 0 — недоступно.
+      required: [cpu, gpu]
+      properties:
+        cpu:
+          type: number
+          format: double
+          description: Температура пакета CPU.
+        gpu:
+          type: number
+          format: double
+          description: Температура GPU.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcStatus.cs:43"
+
+    NetworkThroughput:
+      type: object
+      description: Сетевой трафик, Мбит/с.
+      required: [up, down]
+      properties:
+        up:
+          type: number
+          format: double
+          description: Отдача.
+        down:
+          type: number
+          format: double
+          description: Приём.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcStatus.cs:50"
+
+    PcMetrics:
+      type: object
+      description: >-
+        Одна выборка телеметрии (IPC_PROTOCOL §6.7): payload sys.metrics и элемент samples в
+        POST /agents/{pcId}/telemetry (до 120 за пакет).
+      required: [cpuPct, gpuPct, ramUsedMb, temps, netMbps, uptimeSec, at]
+      properties:
+        cpuPct:
+          type: number
+          format: double
+          description: Загрузка CPU, 0–100.
+        gpuPct:
+          type: number
+          format: double
+          description: Загрузка GPU, 0–100; 0 — недоступно.
+        ramUsedMb:
+          type: integer
+          format: int32
+          description: Занятая ОЗУ, МиБ.
+        temps:
+          $ref: '#/components/schemas/Temperatures'
+        fps:
+          type: [number, "null"]
+          format: double
+          description: FPS из оверлей-хука запущенной игры; нет игры — поле отсутствует/null.
+        netMbps:
+          $ref: '#/components/schemas/NetworkThroughput'
+        uptimeSec:
+          type: integer
+          format: int64
+          description: Аптайм ОС, секунды.
+        at:
+          type: string
+          format: date-time
+          description: Время выборки (UTC, yyyy-MM-ddTHH:mm:ss.fffZ).
+      x-csharp: "src/ClubShell.Contracts/Pc/PcStatus.cs:63"
+
+    # ------------------------------------------------------------------ PcInfo.cs — Pc
+
+    Pc:
+      type: object
+      description: Игровой ПК в представлении сервера (IPC_PROTOCOL §6.5).
+      required: [id, name, zone, number, ipAddress, status, agentVersion, shellVersion, lastHeartbeatAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор ПК.
+        name:
+          type: string
+          description: Имя, например "PC-12".
+        zone:
+          type: string
+          description: Зона, например "VIP", "Standard", "Bootcamp".
+        number:
+          type: integer
+          format: int32
+          description: Номер места.
+        hwid:
+          type: [string, "null"]
+          description: >-
+            Hardware id (sha256 hex). Отдаётся только для собственного ПК вызывающего агента; для чужих ПК
+            в GET /pcs опускается (мок шлёт null — допустимо).
+        ipAddress:
+          type: string
+          description: IPv4-адрес.
+        status:
+          $ref: '#/components/schemas/PcStatus'
+        currentSessionId:
+          type: [string, "null"]
+          format: uuid
+          description: Открытая сессия, если есть.
+        agentVersion:
+          type: string
+          description: Версия агента (semver).
+        shellVersion:
+          type: string
+          description: Версия шелла (semver); "0.0.0", если неизвестна.
+        lastHeartbeatAt:
+          type: string
+          format: date-time
+          description: Последний heartbeat, полученный сервером.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:24"
+
+    PcsResponse:
+      type: object
+      description: Ответ GET /pcs.
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: ПК клуба (опционально отфильтрованные по зоне).
+          items:
+            $ref: '#/components/schemas/Pc'
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:39"
+
+    # ------------------------------------------------------------------ PcInfo.cs — Policy
+
+    AllowlistMode:
+      type: string
+      enum: [allow, deny]
+      description: 'Семантика ProcessAllowlistPolicy.patterns — allow: запускаться могут только совпавшие процессы; deny: совпавшие убиваются.'
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:68"
+
+    ShellReplacementPolicy:
+      type: object
+      description: Замена оболочки (explorer.exe) для киоск-пользователя.
+      required: [enabled, shellExe]
+      properties:
+        enabled:
+          type: boolean
+          description: Заменять explorer.exe.
+        shellExe:
+          type: string
+          description: Путь к исполняемому файлу шелла; при enabled=true непустой (иначе агент отвергает политику).
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:80"
+
+    ProcessAllowlistPolicy:
+      type: object
+      description: Allow/deny-список процессов; шаблоны — wildcard по имени образа ("*cheat*").
+      required: [mode, patterns]
+      properties:
+        mode:
+          $ref: '#/components/schemas/AllowlistMode'
+        patterns:
+          type: array
+          description: Wildcard-шаблоны.
+          items:
+            type: string
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:87"
+
+    UsbPolicy:
+      type: object
+      description: Политика USB-устройств.
+      required: [allowStorage, allowHid]
+      properties:
+        allowStorage:
+          type: boolean
+          description: Разрешить USB-накопители.
+        allowHid:
+          type: boolean
+          description: Разрешить USB HID.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:94"
+
+    WebFilterPolicy:
+      type: object
+      description: DNS-фильтр веба.
+      required: [enabled, blockedDomains, allowedDomains, dnsServers]
+      properties:
+        enabled:
+          type: boolean
+          description: Фильтр включён.
+        blockedDomains:
+          type: array
+          description: Блокируемые домены (wildcard).
+          items:
+            type: string
+        allowedDomains:
+          type: array
+          description: Непустой список — режим allow-list.
+          items:
+            type: string
+        dnsServers:
+          type: array
+          description: Принудительные фильтрующие DNS-резолверы.
+          items:
+            type: string
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:103"
+
+    ExplorerPolicy:
+      type: object
+      description: >-
+        Блокировка Explorer/ввода. Комбинации клавиш: модификаторы Ctrl|Alt|Shift|Win через "+", затем имя клавиши —
+        имя Win32 virtual-key без VK_ или алиас (Esc, Del, Enter, PgUp, PgDn, PrintScreen), напр. "Ctrl+Shift+Esc",
+        "Win+R", "Alt+F4" (парсер — src/ClubShell.Windows/Hooks/BlockedKeyCombos.cs).
+      required: [disableTaskManager, disableRun, disableSettings, hideTaskbar, disableAltTab, disableWinKey, blockedKeyCombos]
+      properties:
+        disableTaskManager:
+          type: boolean
+          description: Отключить диспетчер задач.
+        disableRun:
+          type: boolean
+          description: Отключить диалог «Выполнить».
+        disableSettings:
+          type: boolean
+          description: Отключить Параметры/Панель управления.
+        hideTaskbar:
+          type: boolean
+          description: Скрыть панель задач.
+        disableAltTab:
+          type: boolean
+          description: Блокировать Alt+Tab.
+        disableWinKey:
+          type: boolean
+          description: Блокировать клавишу Windows.
+        blockedKeyCombos:
+          type: array
+          description: Дополнительно блокируемые комбинации, напр. "Ctrl+Shift+Esc".
+          items:
+            type: string
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:120"
+
+    PowerPolicy:
+      type: object
+      description: Политика питания.
+      properties:
+        idleShutdownMin:
+          type: [integer, "null"]
+          format: int32
+          description: Выключать после стольких минут простоя; null/нет поля — никогда.
+        scheduledShutdown:
+          type: [string, "null"]
+          pattern: '^\d{2}:\d{2}$'
+          description: Ежедневное выключение, местное время клуба HH:mm; null/нет поля — нет.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:132"
+
+    UpdatesPolicy:
+      type: object
+      description: Политика обновлений (перекрывает agent.json → updates).
+      required: [channel, autoInstall]
+      properties:
+        channel:
+          $ref: '#/components/schemas/UpdateChannel'
+        autoInstall:
+          type: boolean
+          description: Ставить скачанные обновления автоматически в простое.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:139"
+
+    AntiCheatPolicy:
+      type: object
+      description: Политика античита.
+      required: [required, blockOnViolation]
+      properties:
+        required:
+          type: array
+          description: Подсистемы, драйверы/службы которых обязаны быть исправны.
+          items:
+            $ref: '#/components/schemas/AntiCheatKind'
+        blockOnViolation:
+          type: boolean
+          description: Блокировать запуски / сессию при нарушениях.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:146"
+
+    KioskPolicy:
+      type: object
+      description: Политика киоск-интерфейса.
+      required: [idleTimeoutSec, adsIntervalSec, allowVirtualKeyboard]
+      properties:
+        idleTimeoutSec:
+          type: integer
+          format: int32
+          description: Таймаут блокировки по простою, с.
+        adsIntervalSec:
+          type: integer
+          format: int32
+          description: Интервал между рекламными паузами, с.
+        allowVirtualKeyboard:
+          type: boolean
+          description: Разрешить экранную клавиатуру.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:154"
+
+    Policy:
+      type: object
+      description: >-
+        Применяемая политика ПК (IPC_PROTOCOL §6.18, ARCHITECTURE §12.3) — ответ GET /agents/{pcId}/policies,
+        снимок в policies.json. Все секции обязательны: документ без любой из них агент отвергает (PolicyStore.Validate).
+        Агент перезапрашивает политику, когда HeartbeatResponse.policyVersion новее применённой; файл никогда не
+        заменяет уже известную более высокую версию.
+      required: [version, updatedAt, shellReplacement, processAllowlist, usb, webFilter, explorer, power, updates, anticheat, kiosk]
+      properties:
+        version:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Монотонная версия, назначает сервер.
+        updatedAt:
+          type: string
+          format: date-time
+          description: Время последнего изменения.
+        shellReplacement:
+          $ref: '#/components/schemas/ShellReplacementPolicy'
+        processAllowlist:
+          $ref: '#/components/schemas/ProcessAllowlistPolicy'
+        usb:
+          $ref: '#/components/schemas/UsbPolicy'
+        webFilter:
+          $ref: '#/components/schemas/WebFilterPolicy'
+        explorer:
+          $ref: '#/components/schemas/ExplorerPolicy'
+        power:
+          $ref: '#/components/schemas/PowerPolicy'
+        updates:
+          $ref: '#/components/schemas/UpdatesPolicy'
+        anticheat:
+          $ref: '#/components/schemas/AntiCheatPolicy'
+          description: Политика античита (ключ на проводе — anticheat, в нижнем регистре).
+        kiosk:
+          $ref: '#/components/schemas/KioskPolicy'
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:171"
+      x-source:
+        - "src/ClubShell.Agent/Policy/PolicyStore.cs:78"
+        - "config/policies.example.json:1"
+
+    # ------------------------------------------------------------------ PcInfo.cs — Theme
+
+    ThemeColors:
+      type: object
+      description: 'Палитра темы; каждое значение — #RRGGBB или #RRGGBBAA.'
+      required: [bg, surface, primary, accent, text, muted, danger, success]
+      properties:
+        bg:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Фон страницы.
+        surface:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Фон карточек/панелей.
+        primary:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Цвет основного действия.
+        accent:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Акцентный цвет.
+        text:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Основной текст.
+        muted:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Второстепенный текст.
+        danger:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Ошибки/деструктивные действия.
+        success:
+          type: string
+          pattern: '^#([0-9A-Fa-f]{6}|[0-9A-Fa-f]{8})$'
+          description: Успех.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:230"
+
+    Theme:
+      type: object
+      description: Файл темы шелла themes\<name>.json (ARCHITECTURE §12.4) — содержимое, скачиваемое по ThemeRef.url.
+      required: [version, name, displayName, colors, radius, font, blur, animations]
+      properties:
+        version:
+          type: integer
+          format: int32
+          description: Версия схемы файла (1).
+        name:
+          type: string
+          description: Идентификатор темы; равен имени файла без расширения.
+        displayName:
+          type: string
+          description: Название для людей.
+        colors:
+          $ref: '#/components/schemas/ThemeColors'
+        radius:
+          type: integer
+          format: int32
+          description: Радиус скругления, px.
+        font:
+          type: string
+          description: Установленное семейство шрифтов; запасной — system-ui.
+        backgroundVideo:
+          type: [string, "null"]
+          description: URL/путь фонового видео.
+        wallpaper:
+          type: [string, "null"]
+          description: Путь обоев (относительно корня ProgramData) или абсолютный URL.
+        blur:
+          type: integer
+          format: int32
+          description: Размытие подложки, px; 0 — выкл.
+        animations:
+          type: boolean
+          description: Включить анимации интерфейса.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:251"
+
+    # ------------------------------------------------------------------ PcInfo.cs — Agent server config
+
+    ThemeRef:
+      type: object
+      description: Тема, которую агент должен скачать в themes\.
+      required: [name, url, sha256]
+      properties:
+        name:
+          type: string
+          description: >-
+            Идентификатор темы (имя файла без расширения). C# ограничений не задаёт; тему, которую выбирают в
+            shell.theme, шелл принимает только без "/", "\" и "." (config.rs:364).
+        url:
+          type: string
+          format: uri
+          description: URL для скачивания.
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 файла, hex в нижнем регистре.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:271"
+
+    TimeWindow:
+      type: object
+      description: Ежедневное окно по местному времени клуба (HH:mm); to < from — окно переходит через полночь.
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          description: Начало, HH:mm.
+        to:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          description: Конец, HH:mm.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:279"
+
+    UpdatesConfigOverride:
+      type: object
+      description: >-
+        Серверное переопределение agent.json → updates (форма UpdatesSettings, AppSettings.cs:556). Агент
+        сериализует его без null-полей и сливает поверх agent.json, поэтому null не сбрасывает значение
+        (applyWindow: null окно не убирает). Политика (Policy.updates) перекрывает channel/autoInstall.
+      properties:
+        channel:
+          oneOf:
+            - $ref: '#/components/schemas/UpdateChannel'
+            - type: "null"
+          description: Канал обновлений.
+        checkIntervalSec:
+          type: [integer, "null"]
+          format: int32
+          minimum: 60
+          maximum: 604800
+          description: Интервал проверки манифеста, с (диапазон из UpdatesSettings; вне диапазона весь оверлей отвергается).
+          x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:563"
+        applyWindow:
+          oneOf:
+            - $ref: '#/components/schemas/TimeWindow'
+            - type: "null"
+          description: Окно, в которое можно ставить необязательные обновления.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:287"
+      x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:556"
+
+    ClubBanner:
+      type: object
+      description: Промо-баннер на домашнем экране игрока (задаёт владелец в кассе/админке).
+      required: [id, title, imageUrl]
+      properties:
+        id:
+          type: string
+          description: Идентификатор баннера (строка, не обязательно uuid).
+        title:
+          type: string
+          description: Подпись.
+        imageUrl:
+          type: string
+          description: URL изображения (широкое, ~16:5).
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:296"
+
+    ClubRules:
+      type: object
+      description: Правила клуба на языках интерфейса; отсутствующий язык падает на русский.
+      properties:
+        ru:
+          type: [string, "null"]
+          description: Русский.
+        uz:
+          type: [string, "null"]
+          description: Узбекский.
+        en:
+          type: [string, "null"]
+          description: Английский.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:302"
+
+    ShellClub:
+      type: object
+      description: >-
+        Оформление клуба на экране игрока (shell.json → club), задаётся владельцем и приходит в
+        AgentServerConfig.shell.club. Все поля необязательны: без поля шелл оставляет встроенное умолчание.
+      properties:
+        name:
+          type: [string, "null"]
+          description: Название клуба на экранах блокировки/простоя и в верхней панели.
+        accent:
+          type: [string, "null"]
+          pattern: '^#[0-9A-Fa-f]{6}$'
+          description: 'Акцентный цвет #RRGGBB, перекрывает акцент темы (невалидный шелл игнорирует).'
+        logoUrl:
+          type: [string, "null"]
+          description: URL логотипа.
+        wallpaperUrl:
+          type: [string, "null"]
+          description: Обои за экранами блокировки и простоя.
+        banners:
+          type: [array, "null"]
+          description: Активные баннеры в порядке показа.
+          items:
+            $ref: '#/components/schemas/ClubBanner'
+        rules:
+          oneOf:
+            - $ref: '#/components/schemas/ClubRules'
+            - type: "null"
+          description: Правила клуба на экране поддержки.
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:314"
+
+    ShellConfigOverride:
+      type: object
+      description: |-
+        Серверное переопределение shell.json (блок AgentServerConfig.shell). Агент пишет его в shell.json через
+        ShellSettingsStore.ApplyServerOverride: трогает только присланные ключи (громкость и язык игрока сохраняются),
+        features/ads/idle сливает по ключам верхнего уровня (не-объект игнорируется), club заменяет целиком.
+        В работающий шелл изменения не пушатся — шелл перечитывает shell.json при следующем старте.
+        Если оверлей agent.json из того же AgentServerConfig отвергнут валидацией, этот блок не применяется вовсе.
+      properties:
+        locale:
+          oneOf:
+            - $ref: '#/components/schemas/Locale'
+            - type: "null"
+          description: Язык по умолчанию.
+        theme:
+          type: [string, "null"]
+          pattern: '^[^/\\.]*$'
+          description: >-
+            Идентификатор темы (имя файла в themes\ без .json). null, пустая строка или одни пробелы — не менять
+            (агент пишет только непустое значение, PolicyHandlers.cs:169). Шелл отвергает shell.json целиком, если в
+            имени есть "/", "\" или "." (config.rs:364), и работает на встроенных умолчаниях. Лимит 64 символа и запрет
+            :*?"<>| относятся только к IPC settings.set (PolicyHandlers.cs:465), на серверный оверрайд не действуют.
+          x-source:
+            - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:169"
+            - "apps/shell/src-tauri/src/config.rs:364"
+        features:
+          description: |-
+            Частичный shell.json → features (C#: JsonElement? — любое JSON-значение; агент применяет только объект,
+            всё прочее, включая null, молча игнорирует, PolicyHandlers.cs:186). Сервер шлёт объект формы ShellFeatures
+            (8 флагов boolean) или не шлёт поле. Непереданные ключи сохраняют прежнее значение (по умолчанию все true).
+            Значения строго boolean: иначе агент читает флаг как true, а шелл отвергает shell.json и включает всё
+            (встроенные умолчания).
+            Выключенный флаг скрывает вкладку/кнопку в шелле, и экран раздела перестаёт вызывать свои операции.
+            x-feature-gates — полная карта «флаг → операции за ним» по экранам шелла, а не список того, что надо
+            выключить. В v1 выключать стоит только разделы, где все операции notImplemented: shop, chat, booking,
+            tournaments, topup, apps, callAdmin. profile выключать не нужно: его операции (/users/*) required, а флаг
+            скрывает ещё и экран настроек игрока (ProfileScreen.tsx:367).
+            Исключение — x-feature-ungated: эти операции вызываются независимо от флага.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:332"
+          x-agent-shape: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:915"
+          x-source:
+            - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:159"
+            - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:186"
+            - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:270"
+            - "apps/shell/src-tauri/src/config.rs:192"
+            - "apps/shell/src/router.tsx:427"
+            - "apps/shell/src/router.tsx:452"
+            - "config/shell.default.json:56"
+          x-feature-gates:
+            shop: ["GET /shop/products", "POST /shop/orders", "GET /shop/orders/{id}", "POST /shop/orders/{id}/cancel"]
+            chat: ["GET /chat/{roomId}/messages", "POST /chat/{roomId}/messages", "POST /chat/{roomId}/read"]
+            booking: ["GET /booking/seats", "POST /booking/reserve", "DELETE /booking/{id}"]
+            tournaments: ["GET /tournaments", "POST /tournaments/{id}/join", "GET /tournaments/{id}/leaderboard"]
+            profile: ["PATCH /users/{userId}", "GET /users/{userId}/stats", "GET /users/{userId}/achievements", "GET /users/{userId}/loyalty"]
+            topup: ["POST /wallet/{userId}/topup-intent", "GET /wallet/{userId}/topup-intent/{intentId}"]
+            apps: ["GET /apps"]
+            callAdmin: ["POST /support/call-admin"]
+          x-feature-ungated:
+            "GET /shop/orders":
+              description: >-
+                Шелл вызывает shop.orders при каждом входе игрока (loadUserData) без проверки features.shop, а агент в
+                OrdersAsync флаг не проверяет (в отличие от ProductsAsync и OrderAsync). Запрос уходит на сервер
+                даже при shop=false.
+              x-source:
+                - "apps/shell/src/store/index.ts:47"
+                - "apps/shell/src/store/shop.ts:94"
+                - "apps/shell/src-tauri/src/commands/shop.rs:54"
+                - "src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:785"
+                - "src/ClubShell.Core/Http/ServerClient.cs:439"
+          x-open-question: >-
+            GET /shop/orders имеет статус notImplemented, но агент зовёт его при каждом входе игрока независимо от
+            features.shop (см. x-feature-ungated), так что каждый логин получает 501 (шелл пишет предупреждение в лог,
+            ordersStatus=error). Варианты: сервер v1 отдаёт пустую OrderPage (items: [], total: 0) или операция
+            становится required.
+          x-discrepancy: >-
+            Мок (tools/MockServer/src/db.ts:691) кладёт в features девятый ключ ads (boolean). Ни C# ShellFeatures
+            (IpcMessage.cs:915), ни Rust FeaturesConfig (config.rs:192) такого ключа не знают. Агент копирует его в
+            shell.json как есть (PolicyHandlers.cs:194), шелл игнорирует. Реклама выключается через ads.enabled, а не
+            features.ads; в контракт ключ не включён.
+          properties:
+            shop:
+              type: boolean
+              description: Магазин (вкладка /shop).
+            chat:
+              type: boolean
+              description: Чат (вкладка /chat, блок на рабочем столе, кнопка на экране поддержки).
+            booking:
+              type: boolean
+              description: Бронирование (вкладка /booking, панель на рабочем столе).
+            tournaments:
+              type: boolean
+              description: Турниры (вкладка /tournaments, тизер на рабочем столе).
+            profile:
+              type: boolean
+              description: Профиль (вкладка /profile, кнопка в верхней панели).
+            topup:
+              type: boolean
+              description: Пополнение баланса (кнопка у баланса).
+            apps:
+              type: boolean
+              description: Приложения (вкладка /apps).
+            callAdmin:
+              type: boolean
+              description: Вызов администратора (экраны блокировки и поддержки).
+        ads:
+          description: >-
+            Частичный shell.json → ads (C#: JsonElement? — любое JSON-значение; агент применяет только объект,
+            всё прочее, включая null, молча игнорирует, PolicyHandlers.cs:186). Рекомендуемая форма — AdsConfig шелла.
+            Типы строгие: неверный тип ломает загрузку shell.json в шелле. Реклама выключается здесь (enabled), а не
+            флагом features.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:333"
+          x-agent-shape: "apps/shell/src-tauri/src/config.rs:138"
+          x-source:
+            - "config/shell.default.json:30"
+          properties:
+            enabled:
+              type: boolean
+              description: Показывать рекламу.
+            intervalSec:
+              type: integer
+              format: int32
+              minimum: 0
+              description: Интервал между показами, с.
+            durationSec:
+              type: integer
+              format: int32
+              minimum: 0
+              description: Длительность показа, с.
+            playlist:
+              type: array
+              description: URL картинок/видео; пусто — показ по команде сервера (shell.command showAds).
+              items:
+                type: string
+        idle:
+          description: >-
+            Частичный shell.json → idle (C#: JsonElement? — любое JSON-значение; агент применяет только объект,
+            всё прочее, включая null, молча игнорирует, PolicyHandlers.cs:186). Рекомендуемая форма — IdleConfig шелла.
+            Неотрицательные целые, иначе шелл отвергает shell.json. idle.timeoutSec агент отдаёт в
+            ShellSettings.idleTimeoutSec.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:334"
+          x-agent-shape: "apps/shell/src-tauri/src/config.rs:130"
+          x-source:
+            - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:266"
+            - "config/shell.default.json:25"
+          properties:
+            timeoutSec:
+              type: integer
+              format: int32
+              minimum: 0
+              description: Переход в режим простоя, с.
+            dimAfterSec:
+              type: integer
+              format: int32
+              minimum: 0
+              description: Затемнение экрана, с.
+            screensaverAfterSec:
+              type: integer
+              format: int32
+              minimum: 0
+              description: Заставка, с.
+        club:
+          oneOf:
+            - $ref: '#/components/schemas/ShellClub'
+            - type: "null"
+          description: Оформление, баннеры и правила клуба; заменяет shell.json → club целиком (удалённый баннер исчезает).
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:329"
+      x-source:
+        - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:159"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:548"
+
+    AgentServerConfig:
+      type: object
+      description: |-
+        Серверные переопределения конфигурации ПК: ответ GET /agents/{pcId}/config (SERVER_API §4.1) и поле
+        config в ответе POST /agents/register (агент его не применяет, только сохраняет pcId).
+        Когда агент запрашивает: после первого heartbeat, при каждой смене HeartbeatResponse.configVersion и по
+        команде refreshConfig; If-None-Match для config не шлёт (всегда ждёт 200). Переопределения агент держит
+        только в памяти (SettingsLoader.cs:287, на диск не пишет): после перезапуска до первого heartbeat
+        (session.heartbeatSec) действует чистый agent.json, и службы, читающие настройку только при старте
+        (например, GamesShareMounter), серверного значения не видят.
+        Как применяет (SettingsLoader.ApplyServerOverrides → SettingsJson.FromServerConfig):
+        1) из pcName, zone, session, offline, games, storage, telemetry, remoteAdmin, updates и wsUrl (→ server.wsUrl)
+           строится оверлей agent.json; разделы-JsonElement берутся, только если это JSON-объект;
+        2) глубокое слияние поверх agent.json: объекты сливаются рекурсивно, массивы/скаляры/null заменяют,
+           ключи сравниваются без учёта регистра; незнакомые ключи игнорируются;
+        3) результат читается как AgentSettings (AppSettings.cs) и валидируется (диапазоны, обязательные строки,
+           URL). Любая ошибка типа/диапазона отвергает ВЕСЬ оверлей (остаётся прежний снимок), и блок shell тогда
+           тоже не применяется;
+        4) блок shell пишется в shell.json (см. ShellConfigOverride).
+        Поля number и themes агент сейчас не использует; секреты (пароли шары и т.п.) в конфиге не передаются.
+      required: [version, pcName, zone, number]
+      properties:
+        version:
+          type: integer
+          format: int32
+          description: >-
+            Версия конфига. Агент реагирует на HeartbeatResponse.configVersion, а не на это поле — рекомендуется
+            один и тот же счётчик.
+        pcName:
+          type: string
+          description: Имя ПК; перекрывает agent.json → pcName (пустая строка — не менять).
+        zone:
+          type: string
+          description: Зона; перекрывает agent.json → zone (пустая строка — не менять).
+        number:
+          type: integer
+          format: int32
+          description: Номер места (агентом не применяется).
+        session:
+          description: >-
+            Частичный agent.json → session (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
+            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — SessionSettings.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:361"
+          x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:354"
+          properties:
+            warningMinutes:
+              type: array
+              description: Отметки оставшихся минут для session.warning; массив заменяется целиком, каждая > 0.
+              items:
+                type: integer
+                format: int32
+                minimum: 1
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:357"
+            heartbeatSec:
+              type: integer
+              format: int32
+              minimum: 5
+              maximum: 3600
+              description: Интервал heartbeat на сервер, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:361"
+            graceSec:
+              type: integer
+              format: int32
+              minimum: 0
+              maximum: 3600
+              description: Льготный период после endsAt до принудительной блокировки, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:365"
+            autoLockOnIdleSec:
+              type: integer
+              format: int32
+              minimum: 0
+              maximum: 86400
+              description: Автоблокировка по простою, с; 0 — выкл (policy.kiosk.idleTimeoutSec важнее).
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:369"
+            persistIntervalSec:
+              type: integer
+              format: int32
+              minimum: 1
+              maximum: 600
+              description: Интервал сохранения состояния сессии в cache\session.json, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:373"
+        offline:
+          description: >-
+            Частичный agent.json → offline (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
+            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — OfflineSettings.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:362"
+          x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:377"
+          properties:
+            enabled:
+              type: boolean
+              description: Офлайн-режим включён.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:380"
+            allowNewSessions:
+              type: boolean
+              description: Разрешать новые сессии в офлайне.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:383"
+            maxOfflineMinutes:
+              type: integer
+              format: int32
+              minimum: 0
+              maximum: 100000
+              description: Максимум минут игры в офлайне.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:387"
+            maxQueue:
+              type: integer
+              format: int32
+              minimum: 1
+              maximum: 10000000
+              description: Ёмкость исходящей очереди.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:391"
+            storePath:
+              type: string
+              minLength: 1
+              description: Путь SQLite-очереди (относительно ProgramData); локальная настройка, обычно не переопределять.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:395"
+            userCacheTtlHours:
+              type: integer
+              format: int32
+              minimum: 1
+              maximum: 100000
+              description: TTL кэша пользователей, ч.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:399"
+        games:
+          description: >-
+            Частичный agent.json → games (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
+            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — GamesSettings.
+            accountPool.enabled=false и cloudSave.enabled=false отключают вызовы /games/{id}/accounts/* (лиз аккаунтов
+            и выгрузка сейвов).
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:363"
+          x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:403"
+          x-source:
+            - "src/ClubShell.Agent/Games/GameLaunchService.cs:204"
+            - "src/ClubShell.Agent/Games/Saves/CloudSaveSync.cs:51"
+          properties:
+            libraryRoots:
+              type: array
+              description: Корни библиотеки игр для сканирования; массив заменяется целиком.
+              items:
+                type: string
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:406"
+            scanIntervalSec:
+              type: integer
+              format: int32
+              minimum: 10
+              maximum: 86400
+              description: Интервал пересканирования библиотеки, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:410"
+            launchTimeoutSec:
+              type: integer
+              format: int32
+              minimum: 1
+              maximum: 3600
+              description: Таймаут запуска по умолчанию, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:414"
+            killGraceSec:
+              type: integer
+              format: int32
+              minimum: 0
+              maximum: 600
+              description: Ожидание мягкого закрытия перед принудительным завершением, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:418"
+            accountPool:
+              type: object
+              description: Пул аккаунтов (AccountPoolSettings).
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:434"
+              properties:
+                enabled:
+                  type: boolean
+                  description: Использовать пул; false — игры с requiresAccount не запускаются, лиз не запрашивается.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:437"
+                leaseTtlSec:
+                  type: integer
+                  format: int32
+                  minimum: 60
+                  maximum: 604800
+                  description: TTL лиза, с.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:441"
+                releaseOnExit:
+                  type: boolean
+                  description: Освобождать лиз при выходе из игры.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:444"
+            cloudSave:
+              type: object
+              description: Облачные сохранения (CloudSaveSettings).
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:448"
+              properties:
+                enabled:
+                  type: boolean
+                  description: Облачные сохранения включены.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:451"
+                root:
+                  type: string
+                  minLength: 1
+                  description: Локальный каталог бандлов (относительно ProgramData).
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:455"
+                maxMb:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  maximum: 100000
+                  description: Максимальный размер бандла, МБ.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:459"
+            launchers:
+              type: object
+              description: >-
+                Клиенты лаунчеров (LaunchersSettings). Значение — LauncherSettings { exePath } (AppSettings.cs:463,
+                exePath обязателен и непуст) или null (лаунчер не настроен); другие ключи агент игнорирует.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:471"
+              properties:
+                steam:
+                  type: [object, "null"]
+                  description: Steam.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:474"
+                  properties:
+                    exePath:
+                      type: string
+                      minLength: 1
+                      description: Путь к исполняемому файлу лаунчера.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:467"
+                epic:
+                  type: [object, "null"]
+                  description: Epic Games Launcher.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:477"
+                  properties:
+                    exePath:
+                      type: string
+                      minLength: 1
+                      description: Путь к исполняемому файлу лаунчера.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:467"
+                battleNet:
+                  type: [object, "null"]
+                  description: Battle.net.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:480"
+                  properties:
+                    exePath:
+                      type: string
+                      minLength: 1
+                      description: Путь к исполняемому файлу лаунчера.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:467"
+                riot:
+                  type: [object, "null"]
+                  description: Riot Client.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:483"
+                  properties:
+                    exePath:
+                      type: string
+                      minLength: 1
+                      description: Путь к исполняемому файлу лаунчера.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:467"
+                ea:
+                  type: [object, "null"]
+                  description: EA app.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:486"
+                  properties:
+                    exePath:
+                      type: string
+                      minLength: 1
+                      description: Путь к исполняемому файлу лаунчера.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:467"
+                ubisoft:
+                  type: [object, "null"]
+                  description: Ubisoft Connect.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:489"
+                  properties:
+                    exePath:
+                      type: string
+                      minLength: 1
+                      description: Путь к исполняемому файлу лаунчера.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:467"
+        storage:
+          description: |-
+            Частичный agent.json → storage (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
+            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — StorageSettings →
+            GamesShareSettings → IscsiSettings из AppSettings.cs.
+            Как агент применяет (GamesShareMounter): включить или выключить шару с сервера нельзя. Серверные
+            переопределения живут только в памяти (SettingsLoader.cs:287, на диск не пишутся) и после рестарта
+            приходят не раньше первого heartbeat, а GamesShareMounter.StartAsync проверяет enabled один раз при
+            старте хоста по локальному agent.json и на смену настроек не подписан. Поэтому серверный
+            gamesShare.enabled=true монтирование не включит, а enabled=false не остановит уже запущенный цикл.
+            Если в локальном agent.json enabled=true, с сервера реально действуют uncPath, driveLetter,
+            credentialsRef и iscsi: они читаются заново при каждой попытке монтирования (GamesShareMounter.cs:129;
+            цикл повторяет её каждые 30 с при успехе и с backoff до 2 мин при неудаче). mountRetries агент берёт один
+            раз при запуске цикла, поэтому серверное значение тоже фактически не действует.
+            Учётные данные шары с сервера не передаются: credentialsRef — путь к локальному DPAPI-файлу
+            { username, password } на ПК. Мок шлёт storage: null.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:364"
+          x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:505"
+          x-source:
+            - "src/ClubShell.Core/Configuration/SettingsLoader.cs:180"
+            - "src/ClubShell.Core/Configuration/SettingsLoader.cs:287"
+            - "src/ClubShell.Core/Configuration/SettingsLoader.cs:402"
+            - "src/ClubShell.Agent/DependencyInjection.cs:327"
+            - "src/ClubShell.Agent/DependencyInjection.cs:330"
+            - "src/ClubShell.Agent/Server/Heartbeat.cs:132"
+            - "src/ClubShell.Agent/Server/CommandReceiver.cs:527"
+            - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:78"
+            - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:87"
+            - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:129"
+            - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:219"
+            - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:247"
+          x-open-question: >-
+            Управлять сетевым хранилищем с сервера сейчас нельзя: storage.gamesShare.enabled и mountRetries из
+            AgentServerConfig агент фактически игнорирует (GamesShareMounter.cs:87 проверяет enabled один раз в
+            StartAsync, до первого heartbeat и GET config; :219 читает mountRetries один раз). Если серверное
+            управление шарой нужно, агенту требуется подписка на смену настроек (IOptionsMonitor.OnChange) или
+            сохранение серверных переопределений на диск.
+          properties:
+            gamesShare:
+              type: object
+              description: Сетевое хранилище игр — SMB-шара или iSCSI-таргет (storage.gamesShare).
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:513"
+              properties:
+                enabled:
+                  type: boolean
+                  description: >-
+                    Монтировать хранилище при старте службы. Действует только значение из локального agent.json:
+                    агент читает флаг один раз в StartAsync, до получения серверного конфига, поэтому монтирование
+                    серверное значение не включает и не выключает (см. описание storage). Побочный эффект серверного
+                    false: при остановке службы UnmountAsync не отключит диск (GamesShareMounter.cs:341).
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:516"
+                  x-source:
+                    - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:87"
+                    - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:341"
+                uncPath:
+                  type: string
+                  description: 'UNC-путь SMB-шары, напр. \\nas01\games (в JSON обратные слэши экранируются). Не используется при iscsi != null.'
+                  examples: ['\\nas01\games']
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:519"
+                driveLetter:
+                  type: string
+                  minLength: 1
+                  maxLength: 1
+                  description: Буква диска (один символ, A–Z; по умолчанию G).
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:523"
+                credentialsRef:
+                  type: string
+                  description: >-
+                    Путь (относительно ProgramData) к DPAPI-файлу { username, password } на ПК; для iSCSI те же данные
+                    идут как CHAP. Пусто — без учётных данных. Обычно не переопределять.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:526"
+                mountRetries:
+                  type: integer
+                  format: int32
+                  minimum: 1
+                  maximum: 20
+                  description: >-
+                    Порог неудачных попыток подряд, после которого агент пишет ошибку в лог. Это не лимит: цикл
+                    монтирования повторяет попытки бесконечно (backoff 5 с → 2 мин). Значение читается один раз при
+                    запуске цикла, поэтому серверное значение фактически не действует. Вне диапазона 1–20 весь
+                    оверлей отвергается.
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:530"
+                  x-source:
+                    - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:219"
+                    - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:247"
+                iscsi:
+                  type: [object, "null"]
+                  description: iSCSI-таргет вместо SMB; null — использовать SMB (null в оверлее заменяет значение).
+                  x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:537"
+                  properties:
+                    portal:
+                      type: string
+                      minLength: 1
+                      description: Портал host[:port] (порт по умолчанию 3260).
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:541"
+                    targetIqn:
+                      type: string
+                      minLength: 1
+                      description: IQN таргета.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:545"
+                    readOnly:
+                      type: boolean
+                      description: >-
+                        Перед использованием пометить диски таргета только для чтения — обязательно для LUN, который
+                        монтируют несколько ПК одновременно.
+                      x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:552"
+        updates:
+          oneOf:
+            - $ref: '#/components/schemas/UpdatesConfigOverride'
+            - type: "null"
+          description: Переопределение agent.json → updates.
+        telemetry:
+          description: >-
+            Частичный agent.json → telemetry (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
+            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — TelemetrySettings.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:366"
+          x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:597"
+          properties:
+            enabled:
+              type: boolean
+              description: Телеметрия включена.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:600"
+            metricsIntervalSec:
+              type: integer
+              format: int32
+              minimum: 1
+              maximum: 3600
+              description: Интервал локальных выборок и sys.metrics, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:604"
+            uploadIntervalSec:
+              type: integer
+              format: int32
+              minimum: 5
+              maximum: 86400
+              description: Интервал отправки пакетов на сервер, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:608"
+            hardwareRescanSec:
+              type: integer
+              format: int32
+              minimum: 60
+              maximum: 604800
+              description: Интервал пересканирования железа, с.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:612"
+        remoteAdmin:
+          description: >-
+            Частичный agent.json → remoteAdmin (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
+            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — RemoteAdminSettings.
+          x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:367"
+          x-agent-shape: "src/ClubShell.Core/Configuration/AppSettings.cs:640"
+          properties:
+            allowScreenCapture:
+              type: boolean
+              description: Разрешить скриншоты.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:643"
+            allowRemoteInput:
+              type: boolean
+              description: Разрешить удалённый ввод.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:646"
+            captureFps:
+              type: integer
+              format: int32
+              minimum: 1
+              maximum: 60
+              description: Частота кадров захвата.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:650"
+            captureQuality:
+              type: integer
+              format: int32
+              minimum: 1
+              maximum: 100
+              description: Качество JPEG.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:654"
+            showIndicator:
+              type: boolean
+              description: Показывать индикатор удалённого управления.
+              x-csharp: "src/ClubShell.Core/Configuration/AppSettings.cs:657"
+        shell:
+          oneOf:
+            - $ref: '#/components/schemas/ShellConfigOverride'
+            - type: "null"
+          description: Переопределения shell.json (фичи, тема, язык, реклама, простой, оформление клуба).
+        themes:
+          type: [array, "null"]
+          description: Темы для скачивания в themes\ (в текущем агенте не обрабатываются — загрузчика нет).
+          items:
+            $ref: '#/components/schemas/ThemeRef'
+        wsUrl:
+          type: [string, "null"]
+          format: uri
+          pattern: '^([Ww][Ss][Ss]?://.+)?$'
+          description: >-
+            Переопределение URL WebSocket (→ agent.json server.wsUrl). Непустое значение должно быть абсолютным
+            URL со схемой ws или wss (регистр схемы не важен: агент сравнивает нормализованный Uri.Scheme),
+            иначе весь оверлей отвергается. null или пустая строка — не менять (SettingsLoader.cs:188).
+          x-source:
+            - "src/ClubShell.Core/Configuration/AppSettings.cs:744"
+            - "src/ClubShell.Core/Configuration/SettingsLoader.cs:188"
+      x-csharp: "src/ClubShell.Contracts/Pc/PcInfo.cs:356"
+      x-source:
+        - "src/ClubShell.Core/Configuration/SettingsLoader.cs:102"
+        - "src/ClubShell.Core/Configuration/SettingsLoader.cs:163"
+        - "src/ClubShell.Core/Configuration/SettingsLoader.cs:389"
+        - "src/ClubShell.Core/Configuration/SettingsLoader.cs:513"
+        - "src/ClubShell.Core/Configuration/AppSettings.cs:733"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:518"
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:223"
+        - "src/ClubShell.Agent/Server/ServerConnection.cs:270"
+        - "docs/SERVER_API.md:199"
+        - "tools/MockServer/src/db.ts:662"

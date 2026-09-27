@@ -1,0 +1,74 @@
+# Конфигурация Redocly CLI для openapi/openapi.yaml (собранный файл; править base.yaml и fragments/).
+#   npm run lint:openapi   ==  redocly lint openapi/openapi.yaml
+# Базовый набор — recommended; ниже только ужесточения и отступления от него с причиной.
+extends:
+  - recommended
+
+rules:
+  # --- ужесточения (обязательны для контракта) ---
+  security-defined: error              # у каждой операции есть security (включая явное security: [] у режима none)
+  operation-operationId: error         # operationId = метод IServerClient / функция api.ts — нужен генераторам
+  operation-operationId-unique: error
+  operation-parameters-unique: error
+  path-parameters-defined: error
+  no-unresolved-refs: error
+  no-identical-paths: error
+  no-ambiguous-paths: error            # /games/{id} против /games/recent и т. п. — сервер не должен угадывать маршрут
+
+  # --- предупреждения (не блокируют check, но считаются) ---
+  operation-4xx-response: warn         # у части операций режима none/файлов 4xx осмысленно нет
+  operation-2xx-response: warn
+  # Неиспользуемые компоненты оставлены намеренно: часть схем используется только из asyncapi/asyncapi.yaml
+  # (ссылки ../openapi/openapi.yaml#/components/schemas/X), часть — IPC-типы ClubShell.Contracts, общие с шеллом.
+  no-unused-components: warn
+  # allowAdditionalProperties: true — по умолчанию Redocly проверяет примеры так, будто в КАЖДОЙ подсхеме с properties
+  # стоит additionalProperties: false. Это противоречит конвенции (поля можно добавлять всегда, агент пропускает
+  # незнакомые) и даёт ложные срабатывания на if/then (Tariff, WsFrame): поля из корневых properties считаются
+  # «лишними» внутри then. Несоответствие типов/required в примерах по-прежнему ловится.
+  no-invalid-media-type-examples:
+    severity: warn
+    allowAdditionalProperties: true
+  no-invalid-schema-examples:
+    severity: warn
+    allowAdditionalProperties: true
+  no-invalid-parameter-examples:
+    severity: warn
+    allowAdditionalProperties: true
+
+  # --- отключено, конфликтует с конвенциями ---
+  info-license: off                    # закрытый продукт, лицензии в info нет
+
+  # --- правила контракта (README «Правила») ---
+  rule/operation-x-server-status:
+    subject:
+      type: Operation
+    assertions:
+      required:
+        - x-server-status
+        - x-source
+    message: У каждой операции должны быть x-server-status и x-source.
+    severity: error
+  rule/operation-x-server-status-value:
+    subject:
+      type: Operation
+      property: x-server-status
+    assertions:
+      enum:
+        - required
+        - notImplemented
+    message: "x-server-status: только required или notImplemented."
+    severity: error
+  rule/not-implemented-declares-501:
+    subject:
+      type: Responses
+    where:
+      - subject:
+          type: Operation
+          property: x-server-status
+        assertions:
+          const: notImplemented
+    assertions:
+      required:
+        - '501'
+    message: "Операция notImplemented обязана объявить ответ '501' ($ref #/components/responses/NotImplemented)."
+    severity: error

@@ -1,0 +1,2048 @@
+# Группа paths-catalog-commerce: клиентские вызовы агента /games*, /apps, /wallet/*, /tariffs, /shop/*, /chat/*,
+# /booking/*, /tournaments*.
+# Источники: src/ClubShell.Core/Http/Endpoints.cs, src/ClubShell.Core/Abstractions/IServerClient.cs,
+# src/ClubShell.Core/Http/ServerClient.cs, docs/SERVER_API.md §4.6–4.12,
+# tools/MockServer/src/routes/{games,wallet,shop,chat}.ts (booking и tournaments в моке живут в chat.ts).
+# Приоритет при расхождении: C# агента > MockServer > SERVER_API.md.
+# Режим авторизации — по AuthMode в ServerClient.cs: Agent -> agentBearer + подпись; User -> agentBearer + подпись +
+# X-User-Token, но агент добавляет X-User-Token, только если на ПК вошёл пользователь (ServerClient.cs:836). Там, где
+# сервер лишь обогащает ответ пользователем (мок: optionalUser), security перечисляет обе альтернативы.
+# Схемы тел и ответов определяют группы schemas-*; здесь только $ref.
+paths:
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /games*, /apps
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /games:
+    get:
+      tags:
+        - games
+      operationId: getGames
+      summary: Каталог игр (ETag, страницы)
+      description: |
+        Каталог игр клуба для зоны. Скрытые владельцем игры исключены, порядок — заданный владельцем (мок: `club().catalog`).
+
+        - Агент (`GameLibrary.RefreshAsync`) запрашивает `page=1&pageSize=500`, затем догружает страницы 2..N (всегда
+          без `If-None-Match`), пока не наберёт `total`. При старте (`LoadAsync`, `force: false`) первая страница идёт
+          с `If-None-Match`; на `304` агент оставляет кэш (`cache\games.json`) и остальные страницы не запрашивает.
+          Поэтому `ETag` (и `catalogVersion`) обязаны меняться при любом изменении каталога зоны, а не только первой
+          страницы. По команде `refreshConfig` с `games` (или без флагов — «всё») агент делает принудительную
+          перезагрузку (`force: true`): ETag сбрасывается, `If-None-Match` не шлётся, сервер отдаёт полный `200`.
+        - Без `page` и `pageSize` — весь каталог одной страницей (`page = 1`, `pageSize = total`). `pageSize` — до 1000
+          (общий максимум 200 сюда не относится); только `page` — `pageSize` по умолчанию 1000 (мок). Значения вне
+          диапазона сервер не отклоняет (`400` нет), а нормализует, как общая пагинация (base §7).
+        - `X-User-Token` необязателен (агент шлёт его, если пользователь вошёл): с ним сервер заполняет `lastPlayedAt`,
+          без него — `null`. Недействительный токен здесь не даёт `401` — ответ как без пользователя (мок). `ETag` должен
+          учитывать `lastPlayedAt`, раз представление зависит от пользователя.
+        - Локальные поля `Game` сервер не знает: `installed = false`, `installPath = null`; агент перезаписывает их по
+          своему сканированию.
+        - `zone` — фильтр каталога по зоне ПК (`agent.json → zone`); мок параметр принимает, но не фильтрует.
+        GET повторяется агентом на 408/425/429/5xx; при ошибке агент отдаёт шеллу закэшированный каталог.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:51
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:213
+        - src/ClubShell.Core/Http/ServerClient.cs:340
+        - src/ClubShell.Core/Http/ServerClient.cs:659
+        - src/ClubShell.Agent/Games/GameLibrary.cs:23
+        - src/ClubShell.Agent/Games/GameLibrary.cs:67
+        - src/ClubShell.Agent/Games/GameLibrary.cs:89
+        - src/ClubShell.Agent/Games/GameLibrary.cs:91
+        - src/ClubShell.Agent/Games/GameLibrary.cs:104
+        - src/ClubShell.Agent/Games/GameLibrary.cs:148
+        - docs/SERVER_API.md:26
+        - docs/SERVER_API.md:305
+        - tools/MockServer/src/routes/games.ts:60
+        - tools/MockServer/src/routes/games.ts:75
+        - tools/MockServer/src/db.ts:289
+        - tools/MockServer/src/db.ts:461
+      security:
+        - agentBearer: []
+          userToken: []
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - name: zone
+          in: query
+          required: false
+          description: Зона ПК (`VIP`, `Standard`, …); нет — каталог без фильтра по зоне.
+          schema:
+            type: string
+          example: VIP
+        - $ref: '#/components/parameters/Page'
+        - name: pageSize
+          in: query
+          required: false
+          description: >-
+            Размер страницы, максимум 1000 (не общий 200); агент всегда шлёт 500. Нет ни `page`, ни `pageSize` — весь
+            каталог одной страницей; есть только `page` — 1000. Вне диапазона `400` нет, сервер нормализует (как мок,
+            `paginate(..., 1000)`): больше 1000 → 1000; < 0 → 1; 0 или не число → 50 (общее значение по умолчанию).
+            Применённое значение — в `pageSize` ответа.
+          schema:
+            type: integer
+            format: int32
+          example: 500
+      responses:
+        '200':
+          description: Страница каталога.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GamesListResponse'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /games/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор игры.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - games
+      operationId: getGame
+      summary: Игра по идентификатору
+      description: |
+        Одна игра каталога. Агент вызывает маршрут только как запасной путь, когда игры нет в локальном снимке каталога
+        (`GameLibrary.GetAsync`), и любую ошибку трактует как «игра недоступна» (шеллу — `null`/`notFound`).
+        `X-User-Token` необязателен и, как в `GET /games`, лишь заполняет `lastPlayedAt`. Скрытую владельцем игру мок
+        по id всё равно отдаёт. Нет игры — `404`, `details.what = "game"`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:132
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:216
+        - src/ClubShell.Core/Http/ServerClient.cs:347
+        - src/ClubShell.Agent/Games/GameLibrary.cs:165
+        - docs/SERVER_API.md:306
+        - tools/MockServer/src/routes/games.ts:80
+      security:
+        - agentBearer: []
+          userToken: []
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Игра.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Game'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '`notFound`, `details.what = "game"`.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /games/{id}/accounts/lease:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор игры.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - games
+      operationId: leaseAccount
+      summary: Аренда аккаунта лаунчера из пула клуба
+      description: |
+        **Не реализуется в сервере v1.** Пул аккаунтов клуба — открытый продуктовый вопрос Q8. Кроме того, текущий
+        агент подставляет расшифрованный пароль аренды в командную строку лаунчера (`AccountInjector.cs`: Steam
+        `-login <user> <pass>`, Epic `-AUTH_PASSWORD=<pass>`), а пароль в командной строке лаунчера в продукте запрещён.
+
+        Чтобы агент вообще не обращался к маршруту, сервер v1 обязан отдавать `requiresAccount: false` у всех игр и
+        `games.accountPool.enabled: false` в `GET /agents/{pcId}/config`. Иначе запуск такой игры вызывает этот GET
+        (`501` → `serverUnavailable` → до 5 HTTP-попыток × 3 попытки `AccountPool`, всё в общий circuit breaker), и
+        запуск заканчивается `accountPoolExhausted`.
+
+        Контракт клиента (на будущее): режим `user`; `sessionId` — открытая сессия этого пользователя; ответ
+        `AccountLease` с `secret` = AES-256-GCM (ключ — HKDF-SHA256 от `signingSecret`, info `account-pool`), base64
+        `nonce||ciphertext||tag`. Ошибки: `409 accountPoolExhausted` (`details.launcher`), `409 sessionNotActive`,
+        `403 policyDenied` (`ageRating`), `404` (`game`), `400` (`sessionId` required).
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:135
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:219
+        - src/ClubShell.Core/Http/ServerClient.cs:351
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:202
+        - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:83
+        - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:245
+        - src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:401
+        - src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:457
+        - src/ClubShell.Core/Configuration/AppSettings.cs:434
+        - docs/SERVER_API.md:308
+        - tools/MockServer/src/routes/games.ts:87
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: sessionId
+          in: query
+          required: true
+          description: Открытая сессия пользователя, для которой берётся аренда.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Аренда выдана (или возвращена действующая аренда этого пользователя на эту игру).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountLease'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /games/{id}/accounts/{leaseId}/release:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор игры.
+        schema:
+          type: string
+          format: uuid
+      - name: leaseId
+        in: path
+        required: true
+        description: Идентификатор аренды из `AccountLease.leaseId`.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - games
+      operationId: releaseAccountLease
+      summary: Вернуть аккаунт в пул
+      description: |
+        **Не реализуется в сервере v1** — пул аккаунтов (открытый вопрос Q8; пароль в командной строке лаунчера запрещён,
+        см. `GET /games/{id}/accounts/lease`). Без выданных аренд агент маршрут не вызывает.
+
+        Контракт клиента: режим `agent`, тело `AccountLeaseRelease` (при `cloudSave` агент уже выгрузил пакет по
+        `uploadUrl` из `save-upload`), ответ `204`. `404` агент считает успехом (аренда уже возвращена). Без
+        `Idempotency-Key`: HTTP-политика POST не повторяет, но `AccountPool` делает до 3 попыток на временных ошибках,
+        затем оставляет аренду истекать на сервере. Повторный release той же аренды — `204` (мок).
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:138
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:222
+        - src/ClubShell.Core/Http/ServerClient.cs:355
+        - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:278
+        - docs/SERVER_API.md:324
+        - tools/MockServer/src/routes/games.ts:141
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AccountLeaseRelease'
+      responses:
+        '204':
+          description: Аренда возвращена; тела нет.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '`notFound`, `details.what = "lease"`; агент считает успехом.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /games/{id}/accounts/{leaseId}/save-upload:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор игры.
+        schema:
+          type: string
+          format: uuid
+      - name: leaseId
+        in: path
+        required: true
+        description: Идентификатор аренды.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - games
+      operationId: getSaveUploadTarget
+      summary: Куда выгрузить облачные сохранения
+      description: |
+        **Не реализуется в сервере v1** — облачные сохранения агента привязаны к аренде аккаунта из пула (открытый
+        вопрос Q8; пароль в командной строке лаунчера запрещён, см. `GET /games/{id}/accounts/lease`).
+
+        Контракт клиента: режим `agent`; ответ `SaveUploadTarget`. Агент (`CloudSaveSync`) затем делает `PUT`
+        zip-пакета (`application/zip`) на `uploadUrl` отдельным HTTP-клиентом без `Authorization` и подписи, поэтому
+        `uploadUrl` должен быть самодостаточным pre-signed URL. Пакет больше `maxBytes` агент не выгружает. Любая ошибка —
+        аренда возвращается без сохранений. Нет аренды — `404`, `details.what = "lease"`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:141
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:225
+        - src/ClubShell.Core/Http/ServerClient.cs:369
+        - src/ClubShell.Agent/Games/Saves/CloudSaveSync.cs:196
+        - docs/SERVER_API.md:328
+        - tools/MockServer/src/routes/games.ts:154
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Pre-signed URL для выгрузки пакета сохранений.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SaveUploadTarget'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /games/{id}/launch-report:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор игры.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - games
+      operationId: sendLaunchReport
+      summary: Отчёт о запуске или завершении игры
+      description: |
+        Режим `agent`. Агент шлёт отчёт после каждой попытки запуска (`phase = launch`, при неудаче `result.ok = false`
+        и `result.error`) и после выхода из игры (`phase = exit`, `result.ok = true`, `exitCode`, `playedSec`). Ответ
+        `204` без тела (агент принимает любой 2xx).
+
+        - Без `Idempotency-Key`: агент POST не повторяет, любую ошибку только логирует — отчёт теряется. Сервер не
+          должен рассчитывать на доставку каждого отчёта.
+        - Успешный `phase = launch` обновляет «последний запуск» пользователя (`Game.lastPlayedAt` для `userId`, мок).
+        - Мок проверяет только наличие полей и значения enum (`launcher`, `phase`), существование `sessionId`/`userId`
+          не проверяет. Нет игры — `404`, `details.what = "game"`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:144
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:228
+        - src/ClubShell.Core/Http/ServerClient.cs:373
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:469
+        - src/ClubShell.Agent/Games/GameSessionTracker.cs:230
+        - docs/SERVER_API.md:330
+        - tools/MockServer/src/routes/games.ts:172
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LaunchReport'
+            examples:
+              launched:
+                value:
+                  sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5
+                  userId: 3f9a1b2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c
+                  result:
+                    ok: true
+                    pid: 4812
+                    startedAt: '2026-09-21T10:15:30.123Z'
+                  durationMs: 2140
+                  launcher: steam
+                  antiCheat:
+                    kind: eac
+                    ok: true
+                  phase: launch
+              exited:
+                value:
+                  sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5
+                  userId: 3f9a1b2c-3d4e-4f5a-8b6c-7d8e9f0a1b2c
+                  result:
+                    ok: true
+                    pid: 4812
+                    startedAt: '2026-09-21T10:15:30.123Z'
+                  durationMs: 2140
+                  launcher: steam
+                  antiCheat:
+                    kind: eac
+                    ok: true
+                  phase: exit
+                  exitCode: 0
+                  playedSec: 3605
+      responses:
+        '204':
+          description: Отчёт принят; тела нет.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '`notFound`, `details.what = "game"`.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /apps:
+    get:
+      tags:
+        - apps
+      operationId: getApps
+      summary: Каталог приложений (ETag)
+      description: |
+        **Не реализуется в сервере v1.** Агент вызывает маршрут только при `shell.features.apps = true`
+        (иначе IPC `apps.list` отдаёт пустой список, `GameHandlers.cs:87`), поэтому сервер v1 выключает `features.apps`
+        в `GET /agents/{pcId}/config` (`shell.features`). При временной ошибке (в том числе `501`) и наличии кэша агент
+        отдаёт кэш.
+
+        Контракт клиента: режим `agent`, `ETag`/`If-None-Match`; ответ `AppsListResponse`, `allowed` считается сервером
+        по зоне, агент дополнительно сверяет со своей политикой запуска.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:54
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:231
+        - src/ClubShell.Core/Http/ServerClient.cs:380
+        - src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:87
+        - src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:98
+        - docs/SERVER_API.md:350
+        - tools/MockServer/src/routes/games.ts:205
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Приложения.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppsListResponse'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /wallet/*, /tariffs
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /wallet/{userId}/balance:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags:
+        - wallet
+      operationId: getBalance
+      summary: Баланс пользователя
+      description: |
+        **Не реализуется в сервере v1.** Режим `user`; `userId` — владелец `X-User-Token`, иначе `403 forbidden`,
+        `details.reason = "notOwner"`.
+
+        Агент вызывает маршрут на каждый IPC `wallet.balance` (шелл делает его при каждом входе пользователя) без
+        feature-флага. На временную ошибку (`501` → `serverUnavailable` после до 5 HTTP-попыток) агент отдаёт последний
+        полученный баланс или `User.balance` из ответа входа (`AuthResponse.user`) с нулевым бонусом; актуальный баланс
+        приходит WS-пушем `walletUpdated`. См. открытый вопрос о статусе в выходе группы.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:147
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:238
+        - src/ClubShell.Core/Http/ServerClient.cs:388
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:643
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:1029
+        - docs/SERVER_API.md:354
+        - tools/MockServer/src/routes/wallet.ts:84
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Текущий баланс (основной и бонусный).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Balance'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "notOwner"` — `userId` не владелец `X-User-Token`.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /wallet/{userId}/transactions:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags:
+        - wallet
+      operationId: getTransactions
+      summary: История операций кошелька
+      description: |
+        **Не реализуется в сервере v1.** Режим `user` (`userId` — владелец токена, иначе `403 notOwner`). Страница
+        `TransactionPage`, новые операции первыми. Фильтры: `from` включительно, `to` исключительно (по `createdAt`),
+        `type`. Неверный `type` — `400 validation` (`field = type`, `reason = enum`), неразбираемые `from`/`to` —
+        `reason = format`.
+
+        Агент (IPC `wallet.history`) пропускает `pageSize` до 500, сервер урезает до 200 и возвращает применённый
+        `pageSize`. Вызов только онлайн, feature-флага нет.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:150
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:241
+        - src/ClubShell.Core/Http/ServerClient.cs:392
+        - src/ClubShell.Contracts/Ipc/IpcMessage.cs:698
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:674
+        - docs/SERVER_API.md:355
+        - tools/MockServer/src/routes/wallet.ts:89
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: from
+          in: query
+          required: false
+          description: Нижняя граница `createdAt`, включительно (ISO-8601 UTC с миллисекундами, URL-кодировано).
+          schema:
+            type: string
+            format: date-time
+          example: '2026-09-01T00:00:00.000Z'
+        - name: to
+          in: query
+          required: false
+          description: Верхняя граница `createdAt`, исключительно.
+          schema:
+            type: string
+            format: date-time
+          example: '2026-09-22T00:00:00.000Z'
+        - name: type
+          in: query
+          required: false
+          description: Фильтр по виду операции.
+          schema:
+            $ref: '#/components/schemas/TransactionType'
+      responses:
+        '200':
+          description: Страница операций.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "notOwner"`.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tariffs:
+    get:
+      tags:
+        - wallet
+      operationId: getTariffs
+      summary: Тарифы (ETag)
+      description: |
+        Тарифы для зоны: тариф попадает в выборку, если его `zones` пуст или содержит `zone` (без учёта регистра);
+        `zone` нет или пустая строка (`?zone=`) — фильтра по зоне нет, все тарифы (агент шлёт пустую `zone`, когда в
+        `agent.json` зона не задана: IPC `wallet.tariffs` берёт `zone ?? ""`, а `QueryBuilder` пропускает только
+        `null`). `serverTime` — текущее время сервера для оценки `timeWindows`. Режим `agent`.
+
+        - Кто вызывает: `SessionManager` при поиске тарифа сессии (со своим ETag, не чаще раза в 15 мин) и IPC
+          `wallet.tariffs` (для своей зоны — с ETag и дисковым кэшем, для чужой — без ETag).
+        - `ETag` считается по `items`, без `serverTime` (мок: `sendCached(..., items)`), иначе `304` не случится никогда.
+          Внимание: на `304` агент отдаёт шеллу закэшированный `TariffsResponse` вместе со старым `serverTime`
+          (см. открытый вопрос группы).
+        - На временную ошибку агент отдаёт кэш, если он есть. GET повторяется агентом на 408/425/429/5xx.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:57
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:244
+        - src/ClubShell.Core/Http/ServerClient.cs:405
+        - src/ClubShell.Core/Http/Endpoints.cs:231
+        - src/ClubShell.Agent/Session/SessionManager.cs:982
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:661
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:664
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:1043
+        - docs/SERVER_API.md:26
+        - docs/SERVER_API.md:356
+        - tools/MockServer/src/routes/wallet.ts:108
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - name: zone
+          in: query
+          required: false
+          description: >-
+            Зона (`agent.json → zone` или зона, выбранная в шелле); сравнение без учёта регистра. Нет параметра или
+            пустое значение — без фильтра по зоне (все тарифы), а не поиск тарифов с пустой зоной.
+          schema:
+            type: string
+          example: VIP
+      responses:
+        '200':
+          description: Тарифы зоны и время сервера.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TariffsResponse'
+              examples:
+                standard:
+                  value:
+                    items:
+                      - id: 5b1f0c2e-7a3d-4e8f-9a1b-2c3d4e5f6a7b
+                        name: Стандарт
+                        pricePerHour:
+                          amount: 1500000
+                          currency: UZS
+                        minMinutes: 30
+                        maxMinutes: 720
+                        zones: []
+                        timeWindows: []
+                        isPackage: false
+                      - id: 6c2a1d3f-8b4e-4f9a-8b2c-3d4e5f6a7b8c
+                        name: Ночь
+                        pricePerHour:
+                          amount: 1000000
+                          currency: UZS
+                        minMinutes: 480
+                        zones:
+                          - VIP
+                        timeWindows:
+                          - days: [mon, tue, wed, thu, fri, sat, sun]
+                            from: '22:00'
+                            to: '08:00'
+                        isPackage: true
+                        packageMinutes: 480
+                        packagePrice:
+                          amount: 6000000
+                          currency: UZS
+                    serverTime: '2026-09-21T10:15:30.123Z'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /wallet/{userId}/topup-intent:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags:
+        - wallet
+      operationId: createTopupIntent
+      summary: Создать намерение пополнения
+      description: |
+        **Не реализуется в сервере v1.** Агент вызывает маршрут только при `shell.features.topup = true`
+        (`SessionHandlers.cs:686`), поэтому сервер v1 выключает `features.topup` в конфигурации ПК.
+
+        Контракт клиента: режим `user`, `Idempotency-Key` обязателен (агент генерирует новый ключ на каждый вызов IPC
+        `wallet.topupIntent`). Тело `TopupIntentCreateRequest` (агент заранее проверяет `amount ≥ 100 000` минимальных
+        единиц и непустую валюту), ответ `201 TopupIntent`. Завершение оплаты приходит WS-пушем `walletUpdated`;
+        `GET .../topup-intent/{id}` — для опроса. Ошибки: `400` (`amount` `min`/`max`, `amount.currency` `unsupported`,
+        `provider` `enum`), `403` (`notOwner`, `pcMismatch` — `pcId` тела не ПК агента, `policyDenied` `guestTopup` —
+        гость может только `cash`), `503` — провайдер недоступен.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:153
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:247
+        - src/ClubShell.Core/Http/ServerClient.cs:409
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:686
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:702
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:357
+        - tools/MockServer/src/routes/wallet.ts:117
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TopupIntentCreateRequest'
+      responses:
+        '201':
+          description: Намерение пополнения создано (или повторён сохранённый ответ по `Idempotency-Key`).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopupIntent'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /wallet/{userId}/topup-intent/{id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор намерения пополнения (`TopupIntent.id`).
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - wallet
+      operationId: getTopupIntent
+      summary: Состояние намерения пополнения
+      description: |
+        **Не реализуется в сервере v1.** Опрос состояния пополнения, когда WS недоступен. Метод есть в клиенте, но
+        текущий агент его не вызывает (IPC-обработчика нет).
+
+        Контракт клиента: режим `user`; чужое намерение — `403 forbidden`, `notOwner`; нет — `404`,
+        `details.what = "topupIntent"`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:156
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:250
+        - src/ClubShell.Core/Http/ServerClient.cs:416
+        - docs/SERVER_API.md:360
+        - tools/MockServer/src/routes/wallet.ts:161
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Намерение пополнения.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TopupIntent'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /shop/*
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /shop/products:
+    get:
+      tags:
+        - shop
+      operationId: getProducts
+      summary: Товары бара (ETag)
+      description: |
+        **Не реализуется в сервере v1.** Агент вызывает маршрут только при `shell.features.shop = true`
+        (`SessionHandlers.cs:709`); сервер v1 выключает `features.shop` в конфигурации ПК.
+
+        Контракт клиента: режим `agent`, `ETag`/`If-None-Match`, ответ `ShopProductsResponse`. Агент всегда запрашивает
+        полный список без `category` (фильтрует и ищет локально) и держит его в дисковом кэше; на временную ошибку
+        отдаёт кэш. Неизвестная `category` — `400 validation`, `reason = enum`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:60
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:257
+        - src/ClubShell.Core/Http/ServerClient.cs:424
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:709
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:714
+        - docs/SERVER_API.md:26
+        - docs/SERVER_API.md:365
+        - tools/MockServer/src/routes/shop.ts:71
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/IfNoneMatch'
+        - name: category
+          in: query
+          required: false
+          description: Фильтр по категории; текущий агент не передаёт.
+          schema:
+            $ref: '#/components/schemas/ProductCategory'
+      responses:
+        '200':
+          description: Товары.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShopProductsResponse'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /shop/orders:
+    post:
+      tags:
+        - shop
+      operationId: createOrder
+      summary: Оформить заказ
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.shop = true`).
+
+        Контракт клиента: режим `user`, `Idempotency-Key` обязателен (ключ приходит из шелла в IPC `shop.order`, поэтому
+        повтор заказа из шелла тоже идемпотентен). Тело `OrderCreateRequest`, ответ `201 Order` (сумма списана с
+        баланса; статус дальше меняется пушами `orderUpdated`). Ошибки: `400` (`items` пуст/больше 20, `qty` вне 1..99),
+        `402 insufficientFunds`, `403` (`notOwner` — `userId` тела не владелец токена; `pcMismatch`; `policyDenied`
+        `noShop`), `404` (`details.what = "product"`), `409 conflict` `outOfStock` (`details: { productId, available }`).
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:63
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:260
+        - src/ClubShell.Core/Http/ServerClient.cs:428
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:733
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:774
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:366
+        - tools/MockServer/src/routes/shop.ts:78
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreateRequest'
+      responses:
+        '201':
+          description: Заказ создан (или повторён сохранённый ответ по `Idempotency-Key`).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    get:
+      tags:
+        - shop
+      operationId: getOrders
+      summary: Заказы пользователя
+      description: |
+        **Не реализуется в сервере v1.** Режим `user`; `userId` агент передаёт всегда (владелец токена, иначе
+        `403 notOwner`). `activeOnly=true` — только незавершённые (не `done` и не `cancelled`). Ответ `OrderPage`,
+        новые первыми.
+
+        Внимание: шелл вызывает IPC `shop.orders` при каждом входе пользователя, а агент **не** проверяет
+        `features.shop` для этого IPC — маршрут будет вызываться и при выключенном магазине (см. открытый вопрос группы).
+        Агент не повторяет на уровне IPC; шелл показывает ошибку в списке заказов.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:63
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:266
+        - src/ClubShell.Core/Http/ServerClient.cs:439
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:789
+        - apps/shell/src/store/index.ts:47
+        - docs/SERVER_API.md:370
+        - tools/MockServer/src/routes/shop.ts:140
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: userId
+          in: query
+          required: true
+          description: Владелец заказов (владелец `X-User-Token`).
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - name: activeOnly
+          in: query
+          required: false
+          description: '`true` — только заказы в работе; нет или `false` — все.'
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: Страница заказов.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OrderPage'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "notOwner"`.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /shop/orders/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор заказа.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - shop
+      operationId: getOrder
+      summary: Заказ по идентификатору
+      description: |
+        **Не реализуется в сервере v1.** Режим `user`. Чужой заказ — `403 forbidden`, `notOwner` (агент к тому же
+        сам превращает чужой заказ в `notFound`); нет — `404`, `details.what = "order"`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:159
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:263
+        - src/ClubShell.Core/Http/ServerClient.cs:435
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:781
+        - docs/SERVER_API.md:369
+        - tools/MockServer/src/routes/shop.ts:152
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Заказ.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /shop/orders/{id}/cancel:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор заказа.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - shop
+      operationId: cancelOrder
+      summary: Отменить заказ
+      description: |
+        **Не реализуется в сервере v1.** Метод есть в клиенте, но текущий агент его не вызывает (IPC-обработчика нет).
+
+        Контракт клиента: режим `user`, тела нет, ответ `200 Order` в статусе `cancelled`; сумма возвращается на баланс
+        (`refund`), остатки товаров восстанавливаются. Отменить можно только `pending` — иначе `409 conflict`,
+        `details: { reason: "notPending", status }`. Чужой — `403 notOwner`; нет — `404`, `details.what = "order"`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:162
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:269
+        - src/ClubShell.Core/Http/ServerClient.cs:446
+        - docs/SERVER_API.md:371
+        - tools/MockServer/src/routes/shop.ts:160
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Заказ отменён.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /chat/*
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /chat/{roomId}/messages:
+    parameters:
+      - name: roomId
+        in: path
+        required: true
+        description: >-
+          Комната (`club`, `pc:<pcId>`, `zone:<zone>`, `dm:<userIdA>:<userIdB>`). Агент кодирует сегмент
+          `Uri.EscapeDataString` (`:` → `%3A`); сервер декодирует, а подпись сверяет по сырому пути. По умолчанию
+          агент берёт `pc:<свой pcId>`.
+        schema:
+          $ref: '#/components/schemas/ChatRooms'
+        example: pc:7d2f1c3a-1111-4222-8333-444455556666
+    get:
+      tags:
+        - chat
+      operationId: getMessages
+      summary: История сообщений комнаты
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.chat = true`; шелл запрашивает
+        историю при каждом входе пользователя).
+
+        Контракт клиента: режим `user`; сообщения старые первыми, не больше `limit`, строго старше `before`;
+        `hasMore` — есть более старые; `unread` — непрочитанные в комнате. Не участник комнаты — `403 forbidden`,
+        `notMember`; неизвестный вид комнаты — `404`, `details.what = "room"`; неизвестный `before` — `404`,
+        `details.what = "message"`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:165
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:276
+        - src/ClubShell.Core/Http/ServerClient.cs:454
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:798
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:801
+        - docs/SERVER_API.md:375
+        - docs/SERVER_API.md:379
+        - tools/MockServer/src/routes/chat.ts:145
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: before
+          in: query
+          required: false
+          description: Вернуть сообщения старше сообщения с этим id (прокрутка истории назад).
+          schema:
+            type: string
+            format: uuid
+        - name: limit
+          in: query
+          required: false
+          description: >-
+            Максимум сообщений: по умолчанию 50, не больше 200 (агент сам зажимает в 1..200 и шлёт всегда). Вне
+            диапазона `400` нет, сервер нормализует (как мок): больше 200 → 200; < 0 → 1; 0 или не число → 50.
+          schema:
+            type: integer
+            format: int32
+            default: 50
+      responses:
+        '200':
+          description: Страница истории комнаты.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatHistoryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "notMember"`.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags:
+        - chat
+      operationId: postMessage
+      summary: Отправить сообщение в комнату
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.chat = true`).
+
+        Контракт клиента: режим `user`, `Idempotency-Key` обязателен (ключ приходит из шелла в IPC `chat.send`). Тело
+        `ChatPostRequest` (агент обрезает пробелы, 1..2000 символов), ответ `201 ChatMessage`; получателям сообщение
+        уходит WS-пушем `chatMessage`. Ошибки: `400` (`text` `required`/`max`), `403` (`notMember`; `policyDenied`
+        `muted`), `404` (`room`), `429`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:165
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:279
+        - src/ClubShell.Core/Http/ServerClient.cs:461
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:807
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:825
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:376
+        - tools/MockServer/src/routes/chat.ts:167
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatPostRequest'
+      responses:
+        '201':
+          description: Сообщение отправлено (или повторён сохранённый ответ по `Idempotency-Key`).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /chat/{roomId}/read:
+    parameters:
+      - name: roomId
+        in: path
+        required: true
+        description: Комната; кодирование — как в `/chat/{roomId}/messages`.
+        schema:
+          $ref: '#/components/schemas/ChatRooms'
+        example: pc:7d2f1c3a-1111-4222-8333-444455556666
+    post:
+      tags:
+        - chat
+      operationId: markRead
+      summary: Отметить сообщения прочитанными
+      description: |
+        **Не реализуется в сервере v1.** Агент не проверяет `features.chat` для этого IPC, но шелл вызывает его только
+        с экрана чата, который при выключенном чате скрыт.
+
+        Контракт клиента: режим `user`; тело `ChatReadRequest`, ответ `200 ChatMarkReadResponse` с оставшимся числом
+        непрочитанных. Без `Idempotency-Key` (операция идемпотентна по смыслу). Неизвестное сообщение — `404`,
+        `details.what = "message"`; не участник — `403 notMember`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:168
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:282
+        - src/ClubShell.Core/Http/ServerClient.cs:468
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:837
+        - docs/SERVER_API.md:377
+        - tools/MockServer/src/routes/chat.ts:200
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChatReadRequest'
+      responses:
+        '200':
+          description: Отметка прочтения сохранена.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMarkReadResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /booking/*
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /booking/seats:
+    get:
+      tags:
+        - booking
+      operationId: getSeats
+      summary: Карта мест и брони на дату
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.booking = true`).
+
+        Контракт клиента: режим `agent` — `X-User-Token` агент сюда НЕ шлёт (`AuthMode.Agent`), поэтому сервер не знает
+        «своих» броней и обезличивает все (`userId` = нулевой UUID); агент затем повторно обезличивает чужие и обнуляет
+        `openFrom`/`openTo` для шелла. Ответ `BookingSeatsResponse`. Неверная `date` — `400 validation`,
+        `reason = format`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:66
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:289
+        - src/ClubShell.Core/Http/ServerClient.cs:479
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:844
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:851
+        - docs/SERVER_API.md:383
+        - tools/MockServer/src/routes/chat.ts:214
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: date
+          in: query
+          required: true
+          description: Местная дата клуба, `YYYY-MM-DD` (агент шлёт всегда; мок без неё берёт текущую дату UTC).
+          schema:
+            type: string
+            format: date
+          example: '2026-09-21'
+      responses:
+        '200':
+          description: Места и брони на дату.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingSeatsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /booking/reserve:
+    post:
+      tags:
+        - booking
+      operationId: reserve
+      summary: Забронировать место
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.booking = true`).
+
+        Контракт клиента: режим `user`, `Idempotency-Key` обязателен (агент генерирует новый ключ на каждый вызов IPC
+        `booking.reserve`). Тело `BookingCreateRequest`, ответ `201 Booking` (`status = reserved`) + пуш
+        `bookingUpdated`. Агент заранее проверяет `to > from`, `from` не в прошлом (допуск 1 мин) и длительность
+        ≤ 12 ч; сервер-мок ограничивает 240 мин. Ошибки: `400` (`to` `range`, `from` `alignment` — не на границе слота,
+        `from` `past`, `to` `maxDuration` с `details.maxMinutes`), `402` (депозит, SERVER_API), `403` (`notOwner`;
+        `policyDenied` `pcMaintenance` | `guestBooking`), `404` (`pc`), `409 conflict` `slotTaken`
+        (`details: { bookingId, from, to }`).
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:69
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:292
+        - src/ClubShell.Core/Http/ServerClient.cs:483
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:551
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:882
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:384
+        - tools/MockServer/src/routes/chat.ts:232
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/BookingCreateRequest'
+      responses:
+        '201':
+          description: Бронь создана (или повторён сохранённый ответ по `Idempotency-Key`).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /booking/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор брони.
+        schema:
+          type: string
+          format: uuid
+    delete:
+      tags:
+        - booking
+      operationId: cancelBooking
+      summary: Отменить бронь
+      description: |
+        **Не реализуется в сервере v1.** Режим `user`, тела нет; ответ `200 Booking` со `status = cancelled` (не `204`:
+        агент читает тело) + пуш `bookingUpdated`.
+
+        `DELETE` агент повторяет автоматически (до 5 попыток на 408/425/429/5xx), поэтому операция должна быть
+        идемпотентной: повторная отмена уже отменённой брони — снова `200` с той же бронью (мок). Ошибки: `403`
+        `notOwner`, `404` (`booking`), `409 conflict` `alreadyStarted` — бронь уже началась.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:171
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:295
+        - src/ClubShell.Core/Http/ServerClient.cs:490
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:894
+        - docs/SERVER_API.md:385
+        - tools/MockServer/src/routes/chat.ts:272
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Бронь отменена (или уже была отменена).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /tournaments*
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /tournaments:
+    get:
+      tags:
+        - tournaments
+      operationId: getTournaments
+      summary: Турниры
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.tournaments = true`; шелл
+        запрашивает список при каждом показе рабочего стола и экрана турниров).
+
+        Контракт клиента: `X-User-Token` необязателен (агент шлёт, если пользователь вошёл): с ним сервер заполняет
+        `joined`, без него `joined = false`. Фильтры `state`, `gameId`; неверный `state` — `400 validation`,
+        `reason = enum`. Ответ `TournamentsListResponse`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:72
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:302
+        - src/ClubShell.Core/Http/ServerClient.cs:502
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:901
+        - apps/shell/src/screens/Desktop/DesktopScreen.tsx:264
+        - docs/SERVER_API.md:389
+        - tools/MockServer/src/routes/chat.ts:287
+      security:
+        - agentBearer: []
+          userToken: []
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: state
+          in: query
+          required: false
+          description: Фильтр по состоянию турнира.
+          schema:
+            $ref: '#/components/schemas/TournamentState'
+        - name: gameId
+          in: query
+          required: false
+          description: Фильтр по игре.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Турниры.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TournamentsListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tournaments/{id}/join:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор турнира.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - tournaments
+      operationId: joinTournament
+      summary: Записаться на турнир
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.tournaments = true`).
+
+        Контракт клиента: режим `user`, тела нет; ответ `200 Tournament` (`joined = true`) + пуш `tournamentUpdated`.
+        Взнос (SERVER_API: `402`) делает операцию списывающей, поэтому сервер принимает необязательный
+        `Idempotency-Key`, но текущий агент его не шлёт — и потому POST не повторяет. Ошибки: `402`, `403 policyDenied`
+        `guestTournament`, `404` (`tournament`), `409 conflict` `notOpen` (`details.state`) | `alreadyJoined` | `full`
+        (`details.maxPlayers`).
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:174
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:305
+        - src/ClubShell.Core/Http/ServerClient.cs:509
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:916
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:390
+        - tools/MockServer/src/routes/chat.ts:298
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Пользователь записан на турнир.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Tournament'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /tournaments/{id}/leaderboard:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор турнира.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - tournaments
+      operationId: getLeaderboard
+      summary: Таблица лидеров турнира
+      description: |
+        **Не реализуется в сервере v1** (агент вызывает только при `shell.features.tournaments = true`).
+
+        Контракт клиента: `X-User-Token` необязателен; с ним в `me` — строка текущего пользователя, если её нет среди
+        `entries`. Нет турнира — `404`, `details.what = "tournament"`. Ответ `TournamentsLeaderboardResponse`.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:177
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:308
+        - src/ClubShell.Core/Http/ServerClient.cs:513
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:929
+        - docs/SERVER_API.md:391
+        - tools/MockServer/src/routes/chat.ts:313
+        - tools/MockServer/src/routes/chat.ts:317
+      security:
+        - agentBearer: []
+          userToken: []
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: limit
+          in: query
+          required: false
+          description: >-
+            Максимум строк в `entries`: по умолчанию 50, не больше 100 (агент шлёт, только если шелл указал `limit`,
+            зажав его в 1..100). Вне диапазона `400` нет, сервер нормализует (как мок): больше 100 → 100; < 0 → 1;
+            0 или не число → 50.
+          schema:
+            type: integer
+            format: int32
+            default: 50
+      responses:
+        '200':
+          description: Таблица лидеров.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TournamentsLeaderboardResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'

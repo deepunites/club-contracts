@@ -1,0 +1,2145 @@
+# Группа paths-admin: бэкенд кассы и настройки клуба (`apps/admin`), все маршруты `/admin/*`.
+# Источники: apps/admin/src/api.ts (потребитель; приоритет), tools/MockServer/src/routes/admin.ts (касса),
+# tools/MockServer/src/routes/club.ts (настройка клуба), логика — tools/MockServer/src/{club,health,control}.ts.
+# 41 маршрут мока = 41 функция api.ts (adminApi + clubApi), расхождений по набору маршрутов нет.
+#
+# Общее для всех операций группы:
+# - Авторизация `staff`: `Authorization: Bearer <токен персонала>` из `POST /admin/login` (или ключ API клуба `ck_…`,
+#   который действует как токен владельца). Подписи, X-Agent-Version и лимита запросов у кассы нет (мок исключает
+#   `/api/v1/admin` из проверок агента: index.ts:79). Нет/неверный токен, сотрудник отключён — 401 `unauthorized`,
+#   `details.reason = "invalid"`; не хватает роли — 403 `forbidden`, `details.reason = "ownerOnly"`. Роли — `x-roles`.
+# - Касса на любой 401 (кроме `POST /admin/login`) сбрасывает токен и выходит — 401 только для проблем авторизации.
+# - Касса на любой 2xx вызывает `res.json()` (api.ts:112): у каждого успешного ответа должно быть JSON-тело,
+#   204 без тела ломает кассу. Изменяющие маршруты без результата отдают `OkResponse` `{ "ok": true }`.
+# - Касса — браузерное приложение на другом origin: сервер обязан отвечать на CORS (preflight с `Authorization`,
+#   `Content-Type`), как мок (`@fastify/cors`, origin: true, index.ts:236).
+# - Касса всегда шлёт `Content-Type: application/json`, в том числе у GET/DELETE без тела; пустое тело = null.
+# - Касса `Idempotency-Key` не шлёт; создающие/денежные POST принимают его необязательно (`IdempotencyKeyOptional`).
+# - Статус успеха — 200, кроме `POST /admin/sessions` (201); касса проверяет только `res.ok`.
+paths:
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Вход персонала
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/login:
+    post:
+      tags:
+        - admin
+      operationId: adminLogin
+      summary: Вход персонала по PIN
+      description: |
+        Выдаёт токен персонала по PIN активного сотрудника. Режим `none` (токена ещё нет). Ответ — токен, сотрудник и
+        открытая смена клуба. Касса хранит токен в localStorage и шлёт как `Authorization: Bearer`. Выхода (logout) в
+        контракте нет: касса просто забывает токен; токен перестаёт действовать при отключении сотрудника.
+
+        Ошибки: неверный PIN — `401 unauthorized`, `details.reason = "invalidPin"` (касса на 401 этого маршрута не
+        выходит, а показывает ошибку).
+      x-open-question: >-
+        Ограничение попыток входа. Мок попытки не ограничивает (tools/MockServer/src/routes/club.ts:136-145) и исключает
+        `/api/v1/admin` из лимита запросов агента (tools/MockServer/src/index.ts:79-81), а PIN — 4–8 цифр, т.е.
+        4-значный перебирается за ≤ 10 000 запросов. Предложение: `429 rateLimited` с `Retry-After` после N неверных PIN
+        (касса на любую ошибку входа показывает её текст — apps/admin/src/App.tsx:193-201). В контракт как норма не
+        внесено до решения владельца.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:502
+        - apps/admin/src/api.ts:106
+        - apps/admin/src/App.tsx:193
+        - tools/MockServer/src/routes/club.ts:136
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminLoginRequest'
+            examples:
+              pin:
+                value:
+                  pin: '1111'
+      responses:
+        '200':
+          description: Вход выполнен.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminLoginResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalidPin"` — нет активного сотрудника с таким PIN.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/me:
+    get:
+      tags:
+        - admin
+      operationId: adminMe
+      summary: Текущий сотрудник и открытая смена
+      description: |
+        Проверка сохранённого токена при старте кассы и обновление смены. На ошибку касса сбрасывает токен.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:504
+        - apps/admin/src/App.tsx:300
+        - apps/admin/src/App.tsx:320
+        - tools/MockServer/src/routes/club.ts:147
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Сотрудник и смена.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminMeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Персонал
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/staff:
+    get:
+      tags:
+        - admin
+      operationId: adminStaff
+      summary: Список сотрудников
+      description: Все сотрудники клуба, включая отключённых; PIN не отдаётся.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:506
+        - apps/admin/src/pages/StaffPage.tsx:70
+        - tools/MockServer/src/routes/club.ts:152
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Сотрудники.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminStaffList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - admin
+      operationId: adminAddStaff
+      summary: Добавить сотрудника
+      description: |
+        Создаёт активного сотрудника. PIN — 4–8 цифр и уникален в клубе (вход только по PIN).
+        Ошибки `400 validation`: `field = pin`, `reason` ∈ `digits4to8` | `taken`; `field = name`, `reason = required`.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:507
+        - apps/admin/src/pages/StaffPage.tsx:172
+        - tools/MockServer/src/routes/club.ts:157
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminStaffCreateRequest'
+      responses:
+        '200':
+          description: Сотрудник создан.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminStaffCreateResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/staff/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор сотрудника (непрозрачная строка).
+        schema:
+          type: string
+    patch:
+      tags:
+        - admin
+      operationId: adminUpdateStaff
+      summary: Изменить сотрудника
+      description: |
+        Частичное изменение: имя, включение/отключение, новый PIN. Отключение действует сразу — все токены
+        сотрудника перестают приниматься. Отключить самого себя нельзя.
+        Ошибки `400 validation`: `field = active`, `reason = self`; `field = pin`, `reason = digits4to8`. Нет
+        сотрудника — `404`, `details.what = "staff"`.
+      x-open-question: >-
+        Уникальность PIN при изменении. `POST /admin/staff` отвергает занятый PIN (`reason = taken`,
+        tools/MockServer/src/routes/club.ts:163), а `PATCH` проверяет только формат `^\d{4,8}$` (routes/club.ts:180-184).
+        Вход ищет первого активного сотрудника с таким PIN (routes/club.ts:139), поэтому дубликат PIN впускает под чужой
+        учёткой. Предложение: и в `PATCH` отвечать `400 validation`, `field = pin`, `reason = taken`. В контракт как
+        норма не внесено до решения владельца.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:509
+        - apps/admin/src/pages/StaffPage.tsx:128
+        - apps/admin/src/pages/StaffPage.tsx:149
+        - tools/MockServer/src/routes/club.ts:170
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminStaffUpdateRequest'
+      responses:
+        '200':
+          description: Изменено (касса тело не читает).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Смены
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/shift:
+    get:
+      tags:
+        - admin
+      operationId: adminShift
+      summary: Текущая смена, X-отчёт, история
+      description: |
+        Открытая смена клуба (одна на клуб), её X-отчёт с момента открытия и последние закрытые смены. Касса опрашивает
+        каждые 5 с.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:512
+        - apps/admin/src/pages/ShiftPage.tsx:114
+        - tools/MockServer/src/routes/club.ts:190
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Состояние смены.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminShiftState'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/shift/open:
+    post:
+      tags:
+        - admin
+      operationId: adminOpenShift
+      summary: Открыть смену
+      description: |
+        Открывает смену от имени текущего сотрудника с указанной наличностью в кассе; пишет `shiftOpen` в журнал
+        контроля. Смена уже открыта — `409 conflict`, `details.reason = "shiftOpen"`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:513
+        - apps/admin/src/pages/ShiftPage.tsx:134
+        - tools/MockServer/src/routes/club.ts:203
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminShiftOpenRequest'
+      responses:
+        '200':
+          description: Смена открыта.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminShiftOpenResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`conflict`, `details.reason = "shiftOpen"` — смена уже открыта.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/shift/close:
+    post:
+      tags:
+        - admin
+      operationId: adminCloseShift
+      summary: Закрыть смену (Z-отчёт)
+      description: |
+        Закрывает открытую смену (любой сотрудник, не только открывший): фиксирует пересчитанную наличность, считает
+        Z-отчёт и ожидаемую наличность (`openingCash + topUpCash`). Пишет `shiftClose` в журнал; недостача больше
+        `control.shortfallFrom` — флаг `shortfall` и событие `suspicious`; всегда — событие `shiftClosed`.
+        Смены нет — `409 conflict`, `details.reason = "noShift"`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:514
+        - apps/admin/src/pages/ShiftPage.tsx:149
+        - tools/MockServer/src/routes/club.ts:222
+        - tools/MockServer/src/control.ts:209
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminShiftCloseRequest'
+      responses:
+        '200':
+          description: Смена закрыта.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminShiftCloseResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`conflict`, `details.reason = "noShift"` — смена не открыта.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Касса: карта зала, сеансы, пополнение, команды ПК
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/overview:
+    get:
+      tags:
+        - admin
+      operationId: adminOverview
+      summary: Карта зала для кассы
+      description: |
+        Места с сессиями и игроками, тарифы, клиенты для выбора, зоны и метки ремонта. Касса опрашивает каждые 2 с
+        (WebSocket для кассы в контракте нет).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:131
+        - apps/admin/src/App.tsx:318
+        - apps/admin/src/pages/MapPage.tsx:473
+        - tools/MockServer/src/routes/admin.ts:83
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Снимок зала.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminOverview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/sessions:
+    post:
+      tags:
+        - admin
+      operationId: adminOpenSession
+      summary: Открыть сессию клиенту на месте
+      description: |
+        Открывает предоплаченную сессию: цена по правилам клуба (как `POST /admin/quote`), списание с основного баланса
+        сразу (`charge`). Агенту уходит `sessionUpdated`, всем — `pcStatusChanged` (busy), клиенту — `walletUpdated`;
+        срабатывают правила `sessionStarted`/`visitCount`, событие `sessionOpened`, журнал `sessionOpen`.
+
+        Ошибки:
+        - `404 notFound`, `details.what` ∈ `pc` | `user` | `tariff`.
+        - `403 policyDenied`, `details.rule` ∈ `pcMaintenance` | `blacklisted` | `minorCurfew`.
+        - `409 sessionAlreadyActive` — на ПК уже есть сессия (`details.pcId`) или у клиента открыта другая
+          (`details: { sessionId, pcId }`).
+        - `402 insufficientFunds` — `details: { required, available }`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:132
+        - apps/admin/src/pages/MapPage.tsx:396
+        - tools/MockServer/src/routes/admin.ts:98
+        - tools/MockServer/src/club.ts:511
+        - tools/MockServer/src/club.ts:642
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminOpenSessionRequest'
+      responses:
+        '201':
+          description: Сессия открыта; `session`, `charged`, `balance`.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSessionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`policyDenied`, `details.rule` ∈ `pcMaintenance` | `blacklisted` | `minorCurfew`.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`sessionAlreadyActive` — на ПК или у клиента уже открыта сессия.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/sessions/extend:
+    post:
+      tags:
+        - admin
+      operationId: adminExtend
+      summary: Добавить время к сессии
+      description: |
+        Докупает минуты к открытой предоплаченной сессии (по `pcId` или `sessionId`) по цене клуба; тариф продления
+        становится тарифом сессии, предупреждения сбрасываются. Агенту — `sessionUpdated`, клиенту — `walletUpdated`;
+        журнал `sessionExtend`.
+
+        Ошибки: нет открытой сессии — `404`, `details.what = "session"`; `404` `tariff`/`user`; постоплатная сессия —
+        `409 conflict`, `details.reason = "postpaidSession"`; не хватает средств — `402 insufficientFunds`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:134
+        - apps/admin/src/pages/MapPage.tsx:268
+        - tools/MockServer/src/routes/admin.ts:165
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminExtendSessionRequest'
+      responses:
+        '200':
+          description: Время добавлено; `session`, `charged`, `balance`.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSessionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`conflict`, `details.reason = "postpaidSession"` — к постоплатной сессии время не докупается.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/sessions/end:
+    post:
+      tags:
+        - admin
+      operationId: adminEnd
+      summary: Завершить сессию с кассы
+      description: |
+        Завершает открытую сессию (по `pcId` или `sessionId`) с причиной `admin`: неиспользованное предоплаченное время
+        почасового тарифа возвращается (`refund`), постоплата списывается. Агенту — `sessionUpdated`, всем —
+        `pcStatusChanged`; журнал `sessionEnd` (ранний возврат — флаги `earlyEnd`/`earlyEnds`).
+        Нет открытой сессии — `404`, `details.what = "session"`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:136
+        - apps/admin/src/pages/MapPage.tsx:306
+        - tools/MockServer/src/routes/admin.ts:197
+        - tools/MockServer/src/routes/session.ts:66
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminEndSessionRequest'
+      responses:
+        '200':
+          description: Сессия завершена; `session`, `charged`, `refunded`.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminSessionResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/wallet/topup:
+    post:
+      tags:
+        - admin
+      operationId: adminTopUp
+      summary: Пополнить кошелёк клиента на кассе
+      description: |
+        Наличное/карточное пополнение (`topUp`) и бонус по шкале `bonusTiers` (отдельная операция `bonus`). Клиенту —
+        `walletUpdated`; правила `topupAtLeast`, событие `bigTopup` (от `notifications.bigTopupAt`), журнал `topUp`.
+        Нет клиента — `404`, `details.what = "user"`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:137
+        - apps/admin/src/pages/MapPage.tsx:287
+        - tools/MockServer/src/routes/admin.ts:215
+        - tools/MockServer/src/routes/club.ts:796
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminTopUpRequest'
+      responses:
+        '200':
+          description: Пополнено.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTopUpResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/pcs/{pcId}/command:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+    post:
+      tags:
+        - admin
+      operationId: adminCommand
+      summary: Команда ПК с кассы
+      description: |
+        Отправляет агенту `ServerCommand` (сообщение, блокировка, разблокировка, перезагрузка, выключение) и ждёт
+        подтверждения до 30 с. Результат доставки — в `ack` ответа 200 (ПК офлайн — `agentOffline`, команда в очереди;
+        нет ack — `timeout`). Журнал `pcCommand`.
+        Ошибки: нет ПК — `404`, `details.what = "pc"`; `400 validation`: `field = kind`, `reason = unknown` или
+        `field = text`, `reason = required` (для `message`).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:145
+        - apps/admin/src/pages/MapPage.tsx:321
+        - apps/admin/src/pages/MapPage.tsx:420
+        - tools/MockServer/src/routes/admin.ts:233
+        - tools/MockServer/src/ws.ts:153
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminPcCommandRequest'
+            examples:
+              message:
+                value:
+                  kind: message
+                  text: Подойдите к стойке администратора
+              lock:
+                value:
+                  kind: lock
+      responses:
+        '200':
+          description: Команда отправлена; итог доставки — в `ack`.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPcCommandResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Настройки клуба
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/club:
+    get:
+      tags:
+        - admin
+      operationId: adminSettings
+      summary: Документ настроек клуба
+      description: |
+        Всё, что владелец настраивает на страницах «Клуб»: брендинг, разделы шелла, зоны, цены, группы, бонусы,
+        промокоды, счастливые часы, лояльность, ограничения, каталог, баннеры, правила, склад, автоматизация,
+        уведомления, вебхуки, пороги контроля, ключ API. Читают все сотрудники (кассе нужны группы клиентов).
+        Telegram-поля `notifications` запрещены (x-prohibited: telegram): всегда `""`/false. Ключ API — предложение
+        контракта: кассиру `""` (мок отдаёт любому сотруднику).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:517
+        - apps/admin/src/settings.ts:29
+        - apps/admin/src/pages/ClientsPage.tsx:382
+        - tools/MockServer/src/routes/club.ts:249
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Документ настроек.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminClubSettings'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    patch:
+      tags:
+        - admin
+      operationId: adminSaveSettings
+      summary: Изменить настройки клуба
+      description: |
+        Частичное изменение: касса шлёт только изменённые ключи верхнего уровня, каждый целиком заменяет сохранённый
+        (правила слияния — `AdminClubSettingsPatch`). Изменение `features`/`branding`/`catalog`/`rulesText`/`banners`
+        повышает версию конфигурации агентов и каталога игр. После успеха касса перечитывает `GET /admin/club`.
+        Telegram-поля принимаются и игнорируются.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:518
+        - apps/admin/src/settings.ts:60
+        - tools/MockServer/src/routes/club.ts:277
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminClubSettingsPatch'
+      responses:
+        '200':
+          description: Сохранено (касса тело не читает).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/club/api-key:
+    post:
+      tags:
+        - admin
+      operationId: adminRotateApiKey
+      summary: Заменить ключ API клуба
+      description: |
+        Генерирует новый ключ `ck_…` (действует как токен владельца на `/admin/*`); прежний перестаёт приниматься сразу.
+        Касса шлёт пустой объект `{}`.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:519
+        - apps/admin/src/pages/IntegrationsPage.tsx:140
+        - tools/MockServer/src/routes/club.ts:341
+        - tools/MockServer/src/routes/club.ts:69
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Новый ключ.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminApiKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/notifications/test:
+    post:
+      tags:
+        - admin
+      operationId: adminTestNotification
+      summary: Тестовое уведомление в Telegram (запрещено)
+      description: |
+        В моке — тестовое сообщение Telegram-боту владельца (и вебхукам, подписанным на `ruleFired`). Telegram в
+        продукте запрещён: сервер v1 не реализует, отвечает `501` (`serverUnavailable`,
+        `details.reason = "notImplemented"`). Касса вызывает маршрут только при сохранённых токене бота и chat id, а
+        сервер их всегда отдаёт пустыми — поэтому на практике вызова не будет.
+      x-server-status: notImplemented
+      x-prohibited: telegram
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:520
+        - apps/admin/src/pages/IntegrationsPage.tsx:90
+        - apps/admin/src/pages/IntegrationsPage.tsx:99
+        - tools/MockServer/src/routes/club.ts:348
+        - tools/MockServer/src/club.ts:564
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: (Мок) уведомление отправлено.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Тарифы и цена
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/tariffs:
+    get:
+      tags:
+        - admin
+      operationId: adminTariffs
+      summary: Все тарифы
+      description: >-
+        Все тарифы клуба без фильтра по зоне (агентский `GET /tariffs` фильтрует по `zone`; окна `timeWindows` не
+        фильтрует ни тот, ни другой).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:522
+        - apps/admin/src/pages/PricingPage.tsx:174
+        - tools/MockServer/src/routes/club.ts:355
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Тарифы.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTariffList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - admin
+      operationId: adminAddTariff
+      summary: Создать тариф
+      description: |
+        Создаёт тариф; `id` генерирует сервер. Цены в теле — целые тийины, в ответе — `Tariff` с Money. Изменение
+        тарифов меняет ETag `GET /tariffs` агента.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:523
+        - apps/admin/src/pages/PricingPage.tsx:200
+        - tools/MockServer/src/routes/club.ts:360
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminTariffInput'
+      responses:
+        '200':
+          description: Тариф создан.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTariffResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/tariffs/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор тарифа.
+        schema:
+          type: string
+          format: uuid
+    put:
+      tags:
+        - admin
+      operationId: adminSaveTariff
+      summary: Заменить тариф
+      description: |
+        Полная замена тарифа (id сохраняется). Открытые сессии с этим тарифом продолжают по нему (мок).
+        Нет тарифа — `404`, `details.what = "tariff"`.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:524
+        - apps/admin/src/pages/PricingPage.tsx:200
+        - tools/MockServer/src/routes/club.ts:368
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminTariffInput'
+      responses:
+        '200':
+          description: Тариф сохранён.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTariffResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - admin
+      operationId: adminDeleteTariff
+      summary: Удалить тариф
+      description: |
+        Удаляет тариф. Идемпотентно: отсутствующий тариф — тоже `200 { ok: true }` (мок). Проверки открытых сессий с
+        этим тарифом мок не делает.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:525
+        - apps/admin/src/pages/PricingPage.tsx:215
+        - tools/MockServer/src/routes/club.ts:377
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Удалено (касса тело не читает, но JSON-тело обязательно).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/quote:
+    post:
+      tags:
+        - admin
+      operationId: adminQuote
+      summary: Предпросмотр цены
+      description: |
+        Цена `minutes` минут по тарифу на ПК для клиента сейчас: процент дня недели/праздника и наибольшая из скидок
+        (группа клиента, уровень лояльности, счастливые часы в зоне ПК). Ничего не списывает. Для пакетного тарифа
+        минуты берутся из тарифа. Нет тарифа/ПК — `404`, `details.what` ∈ `tariff` | `pc`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:526
+        - apps/admin/src/pages/MapPage.tsx:206
+        - tools/MockServer/src/routes/club.ts:385
+        - tools/MockServer/src/club.ts:511
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminQuoteRequest'
+      responses:
+        '200':
+          description: Расчёт цены.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPriceQuote'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Клиенты и промокоды
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/clients:
+    get:
+      tags:
+        - admin
+      operationId: adminClients
+      summary: Поиск клиентов
+      description: |
+        Клиенты клуба (без гостей и персонала), включая чёрный список. `q` — подстрока имени или логина (без учёта
+        регистра) либо телефона; пустой — все. Без пагинации.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:529
+        - apps/admin/src/pages/ClientsPage.tsx:369
+        - tools/MockServer/src/routes/club.ts:397
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - name: q
+          in: query
+          required: false
+          description: Строка поиска (касса шлёт всегда, возможно пустую).
+          schema:
+            type: string
+            default: ''
+      responses:
+        '200':
+          description: Клиенты.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminClientList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - admin
+      operationId: adminAddClient
+      summary: Зарегистрировать клиента
+      description: |
+        Создаёт пользователя-участника (member, нулевые балансы) и его профиль клуба. Логин уникален без учёта регистра
+        (`400 validation`, `field = username`, `reason = taken`). Поле `telegram` запрещено — принимается и
+        игнорируется.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:530
+        - apps/admin/src/pages/ClientsPage.tsx:291
+        - tools/MockServer/src/routes/club.ts:413
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminClientCreateRequest'
+      responses:
+        '200':
+          description: Клиент создан.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор клиента (пользователя).
+        schema:
+          type: string
+          format: uuid
+    patch:
+      tags:
+        - admin
+      operationId: adminUpdateClient
+      summary: Изменить карточку клиента
+      description: |
+        Частичное изменение профиля: имя, группа, заметка, телефон, год рождения, чёрный список (только владелец —
+        кассиру `403 forbidden`, `details.reason = "ownerOnly"`). Смена группы (флаг `discount` при большой скидке) и
+        чёрного списка пишутся в журнал контроля. `telegram` запрещён — принимается и игнорируется.
+        Нет клиента — `404`, `details.what = "user"`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-owner-only-fields:
+        - blacklisted
+      x-source:
+        - apps/admin/src/api.ts:538
+        - apps/admin/src/pages/ClientsPage.tsx:129
+        - tools/MockServer/src/routes/club.ts:449
+        - tools/MockServer/src/routes/club.ts:463
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminClientUpdateRequest'
+      responses:
+        '200':
+          description: Карточка после изменения.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — `blacklisted` меняет только владелец.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{id}/transactions:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор клиента (пользователя).
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - admin
+      operationId: adminClientTransactions
+      summary: Последние операции клиента
+      description: |
+        До 100 последних операций кошелька клиента, новые первыми. Неизвестный клиент — пустой список (мок, без 404).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:540
+        - apps/admin/src/pages/ClientsPage.tsx:93
+        - tools/MockServer/src/routes/club.ts:488
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Операции.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTransactionList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/promo/redeem:
+    post:
+      tags:
+        - admin
+      operationId: adminRedeemPromo
+      summary: Применить промокод к клиенту
+      description: |
+        Начисляет бонус промокода (`bonus`) и уменьшает остаток применений. Клиенту — `walletUpdated`; журнал
+        `promoRedeem`.
+        Ошибки: `404`, `details.what` ∈ `user` | `promo`; `400 validation`, `field = code`, `reason` ∈ `expired` |
+        `exhausted` | `discountAtCheckout` (промокод-скидка на кассе не применяется).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:541
+        - apps/admin/src/pages/ClientsPage.tsx:143
+        - tools/MockServer/src/routes/club.ts:495
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminPromoRedeemRequest'
+      responses:
+        '200':
+          description: Промокод применён.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPromoRedeemResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Зал (редактор карты)
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/pcs:
+    get:
+      tags:
+        - admin
+      operationId: adminPcs
+      summary: Места зала для редактора карты
+      description: Все места с координатами, видом устройства, железом и последней телеметрией; зоны.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:544
+        - apps/admin/src/pages/HallPage.tsx:375
+        - tools/MockServer/src/routes/club.ts:520
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Места и зоны.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminHallPcList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - admin
+      operationId: adminAddPc
+      summary: Добавить место в зал
+      description: |
+        Добавляет ПК, консоль или VR-место (status = offline, без hwid). Касса читает из ответа только `pc.id`.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:557
+        - apps/admin/src/pages/HallPage.tsx:261
+        - tools/MockServer/src/routes/club.ts:554
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminPcCreateRequest'
+      responses:
+        '200':
+          description: Место создано.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPcResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/pcs/{pcId}:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+    patch:
+      tags:
+        - admin
+      operationId: adminUpdatePc
+      summary: Изменить место (карта, обслуживание)
+      description: |
+        Частичное изменение: зона, имя, номер, координаты, вид устройства, вывод на обслуживание/возврат в работу.
+        Рассылает `pcStatusChanged`. Изменение имени/зоны/номера меняет `AgentServerConfig` ПК. Единственный способ
+        в контракте кассы вывести из `maintenance` новый ПК, ожидающий одобрения (`pendingApproval`).
+        Нет ПК — `404`, `details.what = "pc"`.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:545
+        - apps/admin/src/pages/HallPage.tsx:169
+        - apps/admin/src/pages/HallPage.tsx:218
+        - apps/admin/src/pages/HallPage.tsx:407
+        - tools/MockServer/src/routes/club.ts:536
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminPcUpdateRequest'
+      responses:
+        '200':
+          description: Место после изменения (касса тело не читает).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminPcResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    delete:
+      tags:
+        - admin
+      operationId: adminDeletePc
+      summary: Удалить место
+      description: |
+        Удаляет место из зала. Нет ПК — `404`, `details.what = "pc"`; идёт сессия — `409 conflict`,
+        `details.reason = "pcBusy"`. Судьба токенов агента удалённого ПК — `401 revoked` на его запросах (см. agentBearer).
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:565
+        - apps/admin/src/pages/HallPage.tsx:197
+        - tools/MockServer/src/routes/club.ts:585
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Удалено (касса тело не читает, но JSON-тело обязательно).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`conflict`, `details.reason = "pcBusy"` — на ПК идёт сессия.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Склад
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/products:
+    get:
+      tags:
+        - admin
+      operationId: adminProducts
+      summary: Товары и остатки
+      description: Все товары магазина (включая отсутствующие) и порог «заканчивается».
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:567
+        - apps/admin/src/pages/ShopPage.tsx:149
+        - tools/MockServer/src/routes/club.ts:596
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Товары.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProductList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/products/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор товара.
+        schema:
+          type: string
+          format: uuid
+    patch:
+      tags:
+        - admin
+      operationId: adminUpdateProduct
+      summary: Изменить товар
+      description: |
+        Частичное изменение: название, цена (целые тийины), наличие, остаток. Изменение остатка — журнал `stockEdit`.
+        Меняет ETag `GET /shop/products` агента. Нет товара — `404`, `details.what = "product"`.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:568
+        - apps/admin/src/pages/ShopPage.tsx:90
+        - apps/admin/src/pages/ShopPage.tsx:172
+        - tools/MockServer/src/routes/club.ts:601
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminProductUpdateRequest'
+      responses:
+        '200':
+          description: Товар после изменения.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProductResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/products/{id}/receive:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор товара.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - admin
+      operationId: adminReceiveProduct
+      summary: Приёмка товара
+      description: |
+        Прибавляет `qty` к остатку (неведущийся остаток считается 0) и ставит «в наличии». Журнал `stockReceive`.
+        Нет товара — `404`, `details.what = "product"`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:572
+        - apps/admin/src/pages/ShopPage.tsx:107
+        - tools/MockServer/src/routes/club.ts:622
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminProductReceiveRequest'
+      responses:
+        '200':
+          description: Товар после приёмки.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminProductResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Каталог игр
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/games:
+    get:
+      tags:
+        - admin
+      operationId: adminGames
+      summary: Игры для редактора каталога
+      description: |
+        Все игры сервера, включая скрытые, с отметками `hidden`/`featured` и сохранённым порядком. Сам порядок и
+        отметки меняются через `PATCH /admin/club` (`catalog`).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:574
+        - apps/admin/src/pages/CatalogPage.tsx:48
+        - tools/MockServer/src/routes/club.ts:635
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Игры.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminGameList'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Состояние ПК
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/health:
+    get:
+      tags:
+        - admin
+      operationId: adminHealth
+      summary: Состояние ПК и тикеты ремонта
+      description: |
+        По каждому ПК — оценка, живые и обычные температуры/FPS, последние 24 ч, проблемы и незакрытый тикет; пороги;
+        последние тикеты. Строится из `POST /agents/{pcId}/telemetry` (часовые корзины за неделю).
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:577
+        - apps/admin/src/pages/HealthPage.tsx:222
+        - tools/MockServer/src/routes/club.ts:656
+        - tools/MockServer/src/health.ts:154
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Отчёт о состоянии.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminHealthReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/health/tickets/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор тикета ремонта.
+        schema:
+          type: string
+          format: uuid
+    patch:
+      tags:
+        - admin
+      operationId: adminUpdateTicket
+      summary: Перевести тикет ремонта
+      description: |
+        Меняет статус (и заметку) тикета; решение тикета, по которому система вывела ПК на обслуживание, возвращает ПК
+        в работу (если других таких тикетов нет). Журнал `pcCommand` с `meta.kind = repair`.
+        Ошибки: `400 validation`, `field = status`, `reason = unknown`; нет тикета — `404`, `details.what = "ticket"`.
+      x-server-status: required
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:578
+        - apps/admin/src/pages/HealthPage.tsx:124
+        - tools/MockServer/src/routes/club.ts:674
+        - tools/MockServer/src/health.ts:295
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminTicketUpdateRequest'
+      responses:
+        '200':
+          description: Тикет после изменения.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminTicketResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/health/settings:
+    patch:
+      tags:
+        - admin
+      operationId: adminSaveHealthSettings
+      summary: Пороги диагностики ПК
+      description: |
+        Сохраняет пороги (касса шлёт объект целиком); отсутствующие значения остаются прежними, выходящие за диапазон
+        приводятся к границам (`AdminHealthSettingsPatch`, `x-clamp`), ответ — сохранённые пороги целиком.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:580
+        - apps/admin/src/pages/HealthPage.tsx:167
+        - tools/MockServer/src/routes/club.ts:689
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminHealthSettingsPatch'
+      responses:
+        '200':
+          description: Сохранённые пороги.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminHealthSettingsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # Контроль кассиров и отчёты
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /admin/control:
+    get:
+      tags:
+        - admin
+      operationId: adminControl
+      summary: Контроль кассиров
+      description: |
+        Флаги подозрительных операций, итоги по сотрудникам и журнал действий за последние `days` суток; `staffId`
+        сужает флаги и журнал (итоги — всегда по всем).
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:582
+        - apps/admin/src/pages/ControlPage.tsx:179
+        - tools/MockServer/src/routes/club.ts:710
+        - tools/MockServer/src/control.ts:113
+        - tools/MockServer/src/control.ts:172
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - name: days
+          in: query
+          required: false
+          description: Период, суток; вне 1–90 или не число — приводится к границам / 7 (мок).
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 90
+            default: 7
+        - name: staffId
+          in: query
+          required: false
+          description: Только этот сотрудник (флаги и журнал).
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Отчёт контроля.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminControlReport'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/reports:
+    get:
+      tags:
+        - admin
+      operationId: adminReports
+      summary: Отчёты владельца
+      description: |
+        Выручка по дням (время, магазин, пополнения), итоги, тепловая карта загрузки по дням недели и часам, топ игр и
+        товаров, смены периода. Период — последние `days` суток от полуночи.
+      x-server-status: required
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:576
+        - apps/admin/src/pages/ReportsPage.tsx:160
+        - tools/MockServer/src/routes/club.ts:728
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - name: days
+          in: query
+          required: false
+          description: Период, суток; вне 1–90 или не число — приводится к границам / 7 (мок).
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+            maximum: 90
+            default: 7
+      responses:
+        '200':
+          description: Отчёты.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminReports'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'

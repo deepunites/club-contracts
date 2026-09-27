@@ -1,0 +1,1091 @@
+# Группа paths-agents: маршруты агента /agents/*, /pcs*, /updates/*, /support/*, /anticheat/*.
+# Источник истины — C# агента (Endpoints.cs, IServerClient.cs, ServerClient.cs) > MockServer (routes/pcs.ts) > SERVER_API.md.
+# Пути x-source указаны от корня репозитория club-shell.
+paths:
+  /agents/register:
+    post:
+      tags:
+        - agents
+      operationId: register
+      summary: Регистрация ПК (агента) в клубе
+      description: |
+        Первичная и повторная регистрация агента по ключу клуба (`X-Club-Key`, без Bearer и без подписи). Сервер
+        находит ПК по `hwid` (или по подсказке `previousPcId` после переустановки) и выдаёт токены агента, секрет подписи
+        и конфигурацию. Новый, неизвестный ПК создаётся в статусе `maintenance` и получает `403 forbidden`,
+        `details.reason = "pendingApproval"` (`details.pcId`) до одобрения администратором.
+
+        Когда агент регистрируется (`ServerConnection`):
+        - при каждом старте процесса, если токенов нет или сохранённый access-токен истёк либо истекает в ближайшие
+          2 мин, — refresh в этом случае не вызывается (access-токен живёт ≈ 1 ч, так что это, например, каждое утро
+          после выключения ПК);
+        - на пути WebSocket, если refresh отвергнут (401/403).
+        Поэтому повторная регистрация известного `hwid` — штатный путь: сервер должен без побочных эффектов вернуть тот
+        же `pcId` и выдать новые токены и секрет подписи — не создавать новый ПК и не менять одобрение, статус и
+        открытую сессию (мок лишь обновляет инвентаризацию и переводит `offline` → `free`).
+        Любую ошибку регистрации (включая 403) агент повторяет с backoff 3…60 с. Автоматических HTTP-повторов нет
+        (POST без `Idempotency-Key`).
+
+        Из ответа агент использует только `pcId`, `pc` (имя и зона — в лог), `accessToken`, `refreshToken`,
+        `signingSecret`, `expiresAt` и `serverTime` (смещение часов). `config` текущий агент игнорирует (не сохраняет и
+        не применяет): конфигурацию он получает только через `GET /agents/{pcId}/config` после первого heartbeat.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:24
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:120
+        - src/ClubShell.Core/Http/ServerClient.cs:137
+        - src/ClubShell.Core/Http/ServerClient.cs:141
+        - src/ClubShell.Core/Http/ServerClient.cs:813
+        - src/ClubShell.Agent/Server/ServerConnection.cs:224
+        - src/ClubShell.Agent/Server/ServerConnection.cs:229
+        - src/ClubShell.Agent/Server/ServerConnection.cs:239
+        - src/ClubShell.Agent/Server/ServerConnection.cs:256
+        - src/ClubShell.Agent/Server/ServerConnection.cs:271
+        - docs/SERVER_API.md:36
+        - docs/SERVER_API.md:116
+        - docs/SERVER_API.md:143
+        - tools/MockServer/src/routes/pcs.ts:103
+        - tools/MockServer/src/routes/pcs.ts:65
+      security:
+        - clubKey: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRegisterRequest'
+      responses:
+        '200':
+          description: ПК зарегистрирован; выданы токены агента, секрет подписи и конфигурация.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRegisterResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: |
+            `unauthorized`, `details.reason = "clubKey"` — нет или неверен `X-Club-Key`. Агент повторяет регистрацию
+            с backoff; обновление токена не выполняется.
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: |
+            `forbidden`, `details.reason`:
+            - `pendingApproval` — ПК новый и ждёт одобрения администратора (`details.pcId` — созданный ПК в статусе
+              `maintenance`);
+            - `clubDisabled` — клуб отключён.
+            Агент повторяет регистрацию с backoff 3…60 с.
+        '409':
+          $ref: '#/components/responses/Conflict'
+          description: '`conflict` — `hwid` привязан к ПК другого клуба.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /agents/refresh:
+    post:
+      tags:
+        - agents
+      operationId: refresh
+      summary: Обновление токенов агента
+      description: |
+        Ротация токенов агента по одноразовому `refreshToken` и `hwid` (оба в теле; без Bearer и без подписи).
+        Старый refresh-токен после успеха недействителен. `signingSecret` в ответе — только при ротации секрета
+        подписи; агент переключается на него атомарно, иначе сохраняет прежний.
+
+        Когда агент вызывает refresh (однопоточно, single-flight):
+        - реактивно — на `401` любого запроса с авторизацией агента или пользователя, кроме `details.reason = userToken`
+          (при `clockSkew` сначала один повтор с поправкой часов); после refresh исходный запрос повторяется один раз;
+        - заранее (access-токен истёк или истекает в ближайшие 2 мин) — только перед (пере)подключением WebSocket, а
+          также после отказа WS по токену.
+        Таймера упреждающего обновления нет. При старте процесса с истёкшим/истекающим токеном агент не обновляет его, а
+        регистрируется заново (`POST /agents/register`).
+        `401/403` на refresh на пути WebSocket ведёт к повторной регистрации; при реактивном refresh ошибка уходит
+        исходному запросу (перерегистрации нет). POST без `Idempotency-Key` — автоматически не повторяется.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:27
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:123
+        - src/ClubShell.Core/Http/ServerClient.cs:148
+        - src/ClubShell.Core/Http/ServerClient.cs:729
+        - src/ClubShell.Core/Http/ServerClient.cs:843
+        - src/ClubShell.Core/Http/ServerClient.cs:862
+        - src/ClubShell.Agent/Server/ServerConnection.cs:278
+        - src/ClubShell.Agent/Server/ServerConnection.cs:287
+        - src/ClubShell.Agent/Server/ServerConnection.cs:300
+        - src/ClubShell.Agent/Server/ServerConnection.cs:306
+        - docs/SERVER_API.md:40
+        - docs/SERVER_API.md:146
+        - tools/MockServer/src/routes/pcs.ts:138
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AgentRefreshRequest'
+      responses:
+        '200':
+          description: Новые токены агента.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentRefreshResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: |
+            `unauthorized`, `details.reason`:
+            - `expired` — refresh-токен истёк (30 дней);
+            - `revoked` — токен неизвестен/отозван, ПК удалён или `hwid` не совпадает с ПК токена;
+            - `reused` — токен уже использован (ротация одноразовая).
+            На пути WebSocket агент в ответ регистрируется заново (`POST /agents/register`); при реактивном refresh
+            ошибка уходит исходному запросу.
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /agents/{pcId}/heartbeat:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+    post:
+      tags:
+        - agents
+      operationId: heartbeat
+      summary: Heartbeat агента
+      description: |
+        Периодический отчёт агента (каждые `session.heartbeatSec`, по умолчанию 30 с, минимум 5 с). В ответе —
+        состояние и версии на стороне сервера, по которым агент:
+        - выставляет смещение часов по `serverTime`;
+        - перезапрашивает `GET /agents/{pcId}/policies`, если `policyVersion` новее применённой;
+        - запрашивает `GET /agents/{pcId}/config` на первом heartbeat и при каждой смене `configVersion`;
+        - обновляет каталоги игр/приложений при смене `catalogVersion` (первое значение — только базовая точка);
+        - при `pendingCommands > 0` забирает команды `GET /agents/{pcId}/commands` (независимо от состояния WS).
+        `pcStatus` и `session` текущий агент не читает: это только взгляд сервера (SERVER_API задумывает `session` для
+        сверки сессии, агент её не выполняет — см. `x-discrepancy`).
+        Ошибки агент только логирует; автоматических HTTP-повторов нет (POST без `Idempotency-Key`).
+      x-discrepancy: >-
+        SERVER_API.md:173 называет pcStatus авторитетным статусом ПК, а SERVER_API.md:178 — session взглядом сервера на
+        текущую сессию для сверки (reconciliation); мок (tools/MockServer/src/routes/pcs.ts:173-181) заполняет оба поля.
+        C# агента читает из HeartbeatResponse только serverTime (ServerClient.cs:167, Heartbeat.cs:182), policyVersion
+        (Heartbeat.cs:189), configVersion и catalogVersion (Heartbeat.cs:223-224) и pendingCommands (Heartbeat.cs:197);
+        pcStatus и session нигде не используются (grep HeartbeatResponse по src/: ServerCommand.cs:794,
+        IServerClient.cs:126, ServerClient.cs:163-166, Heartbeat.cs:218, JsonDefaults.cs:403). Поля в контракте
+        сохранены по C# (pcStatus обязателен), но сервер не может рассчитывать, что агент по ним сменит статус или
+        сверит сессию.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:81
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:126
+        - src/ClubShell.Core/Http/ServerClient.cs:163
+        - src/ClubShell.Agent/Server/Heartbeat.cs:163
+        - src/ClubShell.Agent/Server/Heartbeat.cs:218
+        - docs/SERVER_API.md:151
+        - docs/SERVER_API.md:180
+        - tools/MockServer/src/routes/pcs.ts:153
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/HeartbeatRequest'
+      responses:
+        '200':
+          description: Авторитетное состояние ПК и версии политики/конфига/каталога.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HeartbeatResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` пути не совпадает с ПК из токена агента.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: |
+            `notFound`, `details.what = "pc"` — ПК удалён (SERVER_API: агент должен перерегистрироваться). Внимание:
+            текущий агент на 404 heartbeat только логирует ошибку; перерегистрация происходит лишь после отказа
+            refresh (`401 revoked`). Мок для удалённого ПК отвечает `401`, `details.reason = "revoked"`.
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /agents/{pcId}/telemetry:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+    post:
+      tags:
+        - agents
+      operationId: sendTelemetry
+      summary: Выгрузка телеметрии
+      description: |
+        Пачка метрик (`samples`, ≤ 120), диагностических событий агента (`events`) и, при изменении/пересканировании,
+        инвентаризации (`hardware`); при непустых `events` — хвост лога (`logsTail`, ≤ 50 строк Warning+). Отправляется
+        каждые `telemetry.uploadIntervalSec` (по умолчанию 60 с). Пока выгрузка не удаётся, агент копит до 120 замеров и
+        до 1024 событий и шлёт их одной пачкой без деления — отказ `400` на валидной пачке заблокирует выгрузку.
+        Среди событий бывает `kind = "callAdmin"` с `data` = `CallAdminTicketRequest` — вызов администратора, не
+        доставленный через `POST /support/call-admin` (временная ошибка/офлайн). Пока `POST /support/call-admin`
+        не реализован (`notImplemented`: 501 агент считает временной ошибкой), это единственный канал вызова
+        администратора — сервер v1 должен разбирать такие события, иначе вызовы молча теряются.
+        Автоматических HTTP-повторов нет (POST без `Idempotency-Key`); неотправленное остаётся до следующей попытки.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:84
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:129
+        - src/ClubShell.Core/Http/ServerClient.cs:172
+        - src/ClubShell.Agent/Server/TelemetryReporter.cs:96
+        - src/ClubShell.Agent/Server/TelemetryReporter.cs:294
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:48
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253
+        - docs/SERVER_API.md:186
+        - docs/SERVER_API.md:197
+        - tools/MockServer/src/routes/pcs.ts:184
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TelemetryBatch'
+      responses:
+        '204':
+          description: Пачка принята.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: |
+            `validation` — нарушена форма пачки (`details.field`: `samples`, `events`, `samples[i]`, …). Сервер обязан
+            принимать до 120 `samples` и до 1024 `events` (агент пачку не делит).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` пути не совпадает с ПК из токена агента.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /agents/{pcId}/config:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+    get:
+      tags:
+        - agents
+      operationId: getConfig
+      summary: Серверная конфигурация ПК
+      description: |
+        Серверные переопределения `agent.json`/`shell.json` для ПК (`AgentServerConfig`), с `ETag`.
+        Агент запрашивает конфиг после первого heartbeat, при смене `HeartbeatResponse.configVersion` и по команде
+        `refreshConfig`. Клиент поддерживает `If-None-Match`/`304`, но текущий агент для конфига `If-None-Match` не
+        шлёт и всегда ждёт `200` с телом. GET повторяется агентом на 408/425/429/5xx.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:87
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:132
+        - src/ClubShell.Core/Http/ServerClient.cs:179
+        - src/ClubShell.Core/Http/ServerClient.cs:659
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:527
+        - docs/SERVER_API.md:26
+        - docs/SERVER_API.md:199
+        - tools/MockServer/src/routes/pcs.ts:204
+        - tools/MockServer/src/db.ts:461
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Текущая серверная конфигурация ПК.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentServerConfig'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` пути не совпадает с ПК из токена агента.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /agents/{pcId}/policies:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+    get:
+      tags:
+        - agents
+      operationId: getPolicies
+      summary: Политика ПК
+      description: |
+        Применяемая политика ПК (`Policy`), с `ETag`. Агент запрашивает её при старте, когда
+        `HeartbeatResponse.policyVersion` новее применённой, и по команде `reloadPolicy`; шлёт `If-None-Match` с
+        сохранённым ETag. На `304` без локальной копии агент повторяет запрос без `If-None-Match`. Документ, в котором
+        нет любой из секций, агент отвергает. GET повторяется агентом на 408/425/429/5xx.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:90
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:135
+        - src/ClubShell.Core/Http/ServerClient.cs:183
+        - src/ClubShell.Core/Http/ServerClient.cs:659
+        - src/ClubShell.Agent/Policy/PolicyStore.cs:277
+        - docs/SERVER_API.md:26
+        - docs/SERVER_API.md:220
+        - tools/MockServer/src/routes/pcs.ts:209
+        - tools/MockServer/src/db.ts:461
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - $ref: '#/components/parameters/IfNoneMatch'
+      responses:
+        '200':
+          description: Текущая политика ПК.
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Policy'
+        '304':
+          $ref: '#/components/responses/NotModified'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` пути не совпадает с ПК из токена агента.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /agents/{pcId}/commands:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+    get:
+      tags:
+        - agents
+      operationId: getCommands
+      summary: Ожидающие команды (REST-фолбэк WebSocket)
+      description: |
+        Неподтверждённые и непросроченные команды для ПК, старые первыми (каждый элемент — кадр `command` WS без
+        `type`). Агент вызывает маршрут после heartbeat с `pendingCommands > 0`; дубли отсекает по `id` (24 ч);
+        просроченные подтверждает с ошибкой `timeout`. Каждую команду подтверждает
+        `POST /agents/{pcId}/commands/{commandId}/ack`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:93
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:138
+        - src/ClubShell.Core/Http/ServerClient.cs:187
+        - src/ClubShell.Agent/Server/Heartbeat.cs:261
+        - docs/SERVER_API.md:182
+        - tools/MockServer/src/routes/pcs.ts:214
+        - tools/MockServer/src/ws.ts:113
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Ожидающие команды (может быть пустой список).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ServerCommandsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` пути не совпадает с ПК из токена агента.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /agents/{pcId}/commands/{commandId}/ack:
+    parameters:
+      - $ref: '#/components/parameters/PcId'
+      - name: commandId
+        in: path
+        required: true
+        description: Идентификатор команды (`ServerCommandEnvelope.id`).
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - agents
+      operationId: ackCommand
+      summary: Подтверждение команды
+      description: |
+        Результат выполнения команды (`CommandAck`): для команд, полученных через `GET /agents/{pcId}/commands`, и
+        второе, внеочередное подтверждение команды `message` с `requiresAck` (результат с `ackedAt`, когда пользователь
+        нажал «OK») — даже если первое подтверждение ушло по WS. Повторное подтверждение той же команды сервер
+        принимает (`204`, результат перезаписывается), а не отвергает. Ошибки агент только логирует; POST без
+        `Idempotency-Key` автоматически не повторяется.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:96
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:141
+        - src/ClubShell.Core/Http/ServerClient.cs:191
+        - src/ClubShell.Agent/Server/Heartbeat.cs:303
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:315
+        - docs/SERVER_API.md:184
+        - tools/MockServer/src/routes/pcs.ts:219
+        - tools/MockServer/src/ws.ts:121
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommandAck'
+      responses:
+        '204':
+          description: Подтверждение принято.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` пути не совпадает с ПК из токена агента.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '`notFound`, `details.what = "command"` — команды нет или она адресована другому ПК.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /pcs:
+    get:
+      tags:
+        - pcs
+      operationId: getPcs
+      summary: ПК клуба
+      description: |
+        Все ПК клуба (для карты мест и «друзей»), опционально по зоне. `hwid` отдаётся только для собственного ПК
+        вызывающего агента, для остальных — опускается или `null`. Метод есть в клиенте, но текущий агент его не
+        вызывает.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:30
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:144
+        - src/ClubShell.Core/Http/ServerClient.cs:198
+        - docs/SERVER_API.md:226
+        - tools/MockServer/src/routes/pcs.ts:236
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: zone
+          in: query
+          required: false
+          description: Фильтр по зоне (`VIP`, `Standard`, …); сравнение без учёта регистра (мок). Нет — все ПК.
+          schema:
+            type: string
+          example: VIP
+      responses:
+        '200':
+          description: ПК клуба.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PcsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /pcs/{pcId}:
+    parameters:
+      - name: pcId
+        in: path
+        required: true
+        description: Идентификатор любого ПК клуба (не обязательно ПК вызывающего агента).
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags:
+        - pcs
+      operationId: getPc
+      summary: ПК по идентификатору
+      description: |
+        Один ПК клуба. Агент вызывает маршрут для собственного ПК при обработке IPC `sys.pcInfo` (шелл запрашивает при
+        старте), кэширует ответ на 60 с; при любой ошибке синтезирует сведения о ПК локально (ошибку не кэширует).
+        `hwid` отдаётся только для собственного ПК вызывающего агента. GET повторяется агентом на 408/425/429/5xx,
+        в том числе на 501 (см. `x-open-question`).
+      x-server-status: required
+      x-server-note: >-
+        Решение владельца 2026-09-27: реализуется в v1 — агент вызывает его при каждом старте шелла, 501 повторяется агентом (docs/SHELL_CHANGES.md п. 1).
+      x-open-question: >-
+        Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55 —
+        любой статус ≥ 500) и повторяет GET до 5 попыток (RetryPolicy.cs:66-71, AppSettings.cs:242); каждая попытка
+        проходит через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155:
+        FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с — AppSettings.cs:258, 262). Ошибка не кэшируется
+        (SystemHandlers.cs:446-454), поэтому каждый некэшированный sys.pcInfo (шелл зовёт его при каждой загрузке:
+        apps/shell/src/store/settings.ts:139, store/index.ts:374) даёт 5 отказов подряд; если в 30-секундном окне был
+        лишь 1 успешный запрос (5/6 ≥ 0,8), цепь размыкается на 30 с и required-операции (heartbeat, сессии, вход)
+        получают serverUnavailable. Загрузка шелла (bootstrapStores ждёт loadSystem) к тому же задерживается на время
+        повторов с backoff, а итоговый ответ IPC sys.pcInfo (C# PcInfo) агент всё равно синтезирует локально. Варианты: владелец делает операцию
+        required (данные ПК у сервера v1 и так есть для register/heartbeat) или сервер v1 отвечает на неё хотя бы
+        минимальной реализацией вместо 501.
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:99
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:147
+        - src/ClubShell.Core/Http/ServerClient.cs:202
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:433
+        - docs/SERVER_API.md:227
+        - tools/MockServer/src/routes/pcs.ts:244
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: ПК.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pc'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '`notFound`, `details.what = "pc"` — ПК не найден.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /updates/{channel}/manifest:
+    x-note: >-
+      Пакеты релиза загружаются издателем отдельно, ВНЕ /api/v1: PUT <base>/<channel>/<version>/<file> с
+      `Authorization: Bearer <publishToken>` и `Cache-Control` (пакеты неизменяемы год, манифест no-cache), затем POST
+      манифеста на этот путь. `UpdateManifest.url` указывает на эти файлы (package.ps1 строит
+      <BaseUrl>/<channel>/<version>/<file>). Где сервер клуба (или облако) хранит и раздаёт пакеты — не решено.
+      Источник: tools/scripts/publish.ps1:16-18, :188-191, :339-349; tools/scripts/package.ps1:10-11.
+    parameters:
+      - name: channel
+        in: path
+        required: true
+        description: Канал обновлений (camelCase-строка enum `UpdateChannel`).
+        schema:
+          $ref: '#/components/schemas/UpdateChannel'
+    get:
+      tags:
+        - updates
+      operationId: getUpdateManifest
+      summary: Манифест обновления компонента
+      description: |
+        Манифест последнего пакета компонента в канале, если он новее `current`; иначе `204` (обновлений нет).
+        Агент проверяет оба компонента (`agent`, затем `shell`) при старте и каждые `updates.checkIntervalSec`
+        (по умолчанию 3600 с, минимум 60 с); любую ошибку логирует и считает, что манифеста нет. Скачивание пакета по
+        `manifest.url` требует того же Bearer-токена агента и поддерживает `Range`. GET повторяется агентом на
+        408/425/429/5xx, в том числе на 501 (см. `x-open-question`).
+      x-server-status: required
+      x-server-note: >-
+        Решение владельца 2026-09-27: сервер v1 всегда отвечает 204 («обновлений нет»), пока агент считает 501 временной ошибкой (docs/SHELL_CHANGES.md п. 1). Раздача обновлений не реализована.
+      x-open-question: >-
+        Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55 —
+        любой статус ≥ 500) и повторяет GET до 5 попыток (RetryPolicy.cs:66-71, AppSettings.cs:242); каждая попытка
+        проходит через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155:
+        FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с — AppSettings.cs:258, 262). Проверка обновлений
+        идёт при старте (AgentUpdater.cs:229), каждые updates.checkIntervalSec (по умолчанию 3600 с;
+        UpdateChecker.cs:144-152) и по IPC update.check (AgentUpdater.cs:97), по двум компонентам подряд — agent, затем
+        shell (UpdateChecker.cs:135-136), т. е. 2 × 5 отказов за один прогон. В тихом 30-секундном окне успешных
+        запросов обычно 1-2 (heartbeat раз в 30 с, телеметрия раз в 60 с), так что 10/12 ≥ 0,8 (при 1 успехе — уже
+        5/6): цепь размыкается, и на 30 с required-операции (heartbeat, сессии, вход) получают serverUnavailable.
+        Варианты: сервер v1 отвечает на этот маршрут заглушкой 204 («обновлений нет») вместо 501, либо владелец делает
+        операцию required.
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:180
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:315
+        - src/ClubShell.Core/Http/ServerClient.cs:521
+        - src/ClubShell.Core/Updates/UpdateChecker.cs:132
+        - src/ClubShell.Core/Updates/UpdateChecker.cs:170
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:229
+        - docs/SERVER_API.md:395
+        - tools/MockServer/src/routes/pcs.ts:306
+        - tools/scripts/publish.ps1:232-236
+      security:
+        - agentBearer: []
+        - publishToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+        - name: component
+          in: query
+          required: true
+          description: Обновляемый компонент (camelCase-строка enum `UpdateComponent`).
+          schema:
+            $ref: '#/components/schemas/UpdateComponent'
+        - name: current
+          in: query
+          required: true
+          description: Текущая версия компонента на ПК (semver, без build-метаданных).
+          schema:
+            type: string
+          example: 1.4.2
+        - name: arch
+          in: query
+          required: false
+          description: Архитектура; агент всегда шлёт `x64`.
+          schema:
+            type: string
+            default: x64
+          example: x64
+      responses:
+        '200':
+          description: Доступен пакет новее `current`.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateManifest'
+        '204':
+          description: Компонент актуален (версия в канале не новее `current`); тела нет.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+          description: '`validation`, `details: { field: "current", reason: "required" }` — нет `current` (мок).'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+          description: '`notFound`, `details.what` ∈ `channel` | `component` — неизвестный канал или компонент.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags:
+        - updates
+      operationId: publishUpdateManifest
+      summary: Опубликовать манифест релиза в канале
+      description: |
+        Вызывает скрипт релиза шелла `publish.ps1 -Target Http` последним шагом, после загрузки всех пакетов, чтобы
+        недозагруженный релиз не объявлялся. Тело — `manifest.json` из `package.ps1`, подписанный `sign.ps1`
+        (`components.<c>.signature` — RSA-PSS-SHA256 над байтами пакета, `manifestSignatures.<c>` — над
+        `Signing.ManifestCanonicalBytes`). Неподписанный манифест скрипт отправляет только с `-AllowUnsigned`.
+        После публикации скрипт сверяет каждый компонент через `GET` этого пути с `component=<c>&current=0.0.0`.
+      x-server-status: notImplemented
+      x-source:
+        - tools/scripts/publish.ps1:16-18
+        - tools/scripts/publish.ps1:339-349
+        - tools/scripts/package.ps1:439-449
+        - docs/UPDATES.md:340
+      security:
+        - publishToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Манифест релиза (`manifest.json`); C#-типа нет, форма из `package.ps1`.
+              x-source: tools/scripts/package.ps1:439-449
+              required: [schema, product, version, channel, publishedAt, components, manifestSignatures]
+              properties:
+                schema:
+                  type: integer
+                  format: int32
+                  const: 1
+                product:
+                  type: string
+                  const: ClubShell
+                version:
+                  type: string
+                  description: Версия релиза (semver).
+                channel:
+                  $ref: '#/components/schemas/UpdateChannel'
+                publishedAt:
+                  type: string
+                  format: date-time
+                baseUrl:
+                  type: string
+                  description: База URL пакетов (`-BaseUrl` в `package.ps1`).
+                components:
+                  type: object
+                  description: Компонент (`agent`, `shell`) → его манифест.
+                  additionalProperties:
+                    $ref: '#/components/schemas/UpdateManifest'
+                packages:
+                  description: Перечень пакетов релиза (форма задаётся `package.ps1`).
+                manifestSignatures:
+                  type: object
+                  description: Компонент → base64 RSA-PSS-SHA256 над `Signing.ManifestCanonicalBytes`.
+                  additionalProperties:
+                    type: string
+                files:
+                  type: array
+                  description: Файлы релиза (форма задаётся `package.ps1`).
+      responses:
+        '200':
+          description: Манифест принят; тело скрипт не читает.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+
+  /support/call-admin:
+    post:
+      tags:
+        - support
+      operationId: callAdmin
+      summary: Вызов администратора
+      description: |
+        Тикет «позвать администратора» с ПК (IPC `sys.callAdmin`; агент локально ограничивает 1 вызов в 30 с).
+        `Idempotency-Key` агент шлёт всегда. `X-User-Token` необязателен: агент добавляет его, только если на ПК вошёл
+        пользователь; `userId` берётся из тела (мок проверяет лишь токен агента и игнорирует пользовательский).
+        `pcId` тела должен совпадать с ПК из токена агента.
+
+        На временную ошибку (`serverUnavailable`, `timeout`, `rateLimited`, сетевой сбой) агент не отдаёт ошибку шеллу:
+        ставит тикет в телеметрию (событие `kind = "callAdmin"`, `data` = это же тело) и возвращает шеллу тикет с
+        клиентским `ticketId` и без `queuePosition`.
+
+        Пока маршрут не реализован (`notImplemented`), 501 агент считает временной ошибкой (`serverUnavailable`),
+        поэтому вызовы администратора приходят на сервер только как события телеметрии `kind = "callAdmin"` в
+        `POST /agents/{pcId}/telemetry` — сервер v1 должен их разбирать (см. `x-open-question`).
+      x-server-status: notImplemented
+      x-open-question: >-
+        Статус notImplemented (по правилам) вредит агенту. POST несёт Idempotency-Key, поэтому на 501 (временная ошибка:
+        RetryPolicy.cs:55, 71) агент делает до 5 попыток (AppSettings.cs:242) через один общий для всех запросов агента
+        circuit breaker (RetryPolicy.cs:112-120 и 155: FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с —
+        AppSettings.cs:258, 262): при ≤ 1 успешном запросе в 30-секундном окне 5 отказов подряд размыкают цепь на 30 с
+        для всех запросов агента, включая required. Затем код serverUnavailable (IsRetryable, ErrorCode.cs:156-163)
+        уводит тикет в телеметрию (SystemHandlers.cs:247-253), а шелл получает выдуманный успешный тикет: пока маршрут
+        не реализован, вызов администратора доходит до сервера только как событие kind = "callAdmin" в
+        POST /agents/{pcId}/telemetry, и если сервер v1 такие события не разбирает, вызов молча теряется. Варианты:
+        владелец делает операцию required либо явно закрепляет за сервером v1 обработку события callAdmin в телеметрии.
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:75
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:322
+        - src/ClubShell.Core/Http/ServerClient.cs:529
+        - src/ClubShell.Core/Http/ServerClient.cs:834
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:238
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253
+        - docs/SERVER_API.md:399
+        - tools/MockServer/src/routes/pcs.ts:251
+      security:
+        - agentBearer: []
+          userToken: []
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallAdminTicketRequest'
+      responses:
+        '201':
+          description: Тикет создан (или повторён по `Idempotency-Key`).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SysCallAdminResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` тела не совпадает с ПК из токена агента.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+          description: |
+            `rateLimited` — слишком частые вызовы; `details.retryAfterSec` и `Retry-After`. Агент считает это временной
+            ошибкой и отправляет тикет через телеметрию.
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /anticheat/report:
+    post:
+      tags:
+        - anticheat
+      operationId: reportAntiCheat
+      summary: Отчёт о нарушении античита
+      description: |
+        Находка античита на ПК (при `anticheat.reportViolations`). То же тело агент публикует как WS-событие
+        `anticheatViolation`. `pcId` тела должен совпадать с ПК из токена агента. Ошибки агент только логирует; POST без
+        `Idempotency-Key` автоматически не повторяется — отчёт теряется.
+      x-server-status: notImplemented
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:78
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:325
+        - src/ClubShell.Core/Http/ServerClient.cs:536
+        - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:338
+        - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:361
+        - docs/SERVER_API.md:403
+        - docs/SERVER_API.md:548
+        - tools/MockServer/src/routes/pcs.ts:283
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AntiCheatReport'
+      responses:
+        '204':
+          description: Отчёт принят.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "pcMismatch"` — `pcId` тела не совпадает с ПК из токена агента.'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '501':
+          $ref: '#/components/responses/NotImplemented'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'

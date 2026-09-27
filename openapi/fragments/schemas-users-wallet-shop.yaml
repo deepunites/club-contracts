@@ -1,0 +1,1304 @@
+# Группа schemas-users-wallet-shop: публичные типы из
+#   src/ClubShell.Contracts/Users/AuthRequest.cs, Users/UserProfile.cs (namespace ClubShell.Contracts.Users),
+#   Wallet/Balance.cs, Wallet/Tariff.cs, Wallet/Transaction.cs (namespace ClubShell.Contracts.Wallet),
+#   Shop/Order.cs, Shop/Product.cs (namespace ClubShell.Contracts.Shop).
+# Внешние схемы (определяют другие группы, здесь только $ref): Session, SessionEndReason (Session/*.cs),
+# PcStatus (Pc/PcStatus.cs).
+# Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter на каждом enum,
+# целые значения отвергаются), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
+# DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ, TimeOnly -> HH:mm (ClubTimeConverter). Money — собственный
+# MoneyJsonConverter (Wallet/Balance.cs:156). В этих файлах нет JsonPropertyName/JsonStringEnumMemberName/
+# JsonPolymorphic; JsonIgnore стоит только на вычисляемых свойствах (User.IsMember, Balance.Total,
+# OrderItem.LineTotal) — на провод они не попадают.
+# Мок пишет null явно (offlineHash: null, qrUrl: null …), C# null опускает: оба варианта валидны, поэтому
+# nullable-поля не в required и допускают null.
+# Статические классы без формы на проводе: MoneyJsonConverter (его правила — в Money), WeekdayExtensions и
+# OrderStatusExtensions (их семантика — расширениями x-* у Weekday/OrderStatus). Классы строковых констант
+# UserFlags и ChatRooms — открытые строковые схемы (как PeripheralKinds в schemas-pc).
+# PagedResult<T> (Ipc/IpcMessage.cs:343) -> TransactionPage/OrderPage здесь НЕ определяются (чужой файл).
+components:
+  schemas:
+
+    # ------------------------------------------------------------------ Wallet/Balance.cs
+
+    Money:
+      type: object
+      description: >-
+        Денежная сумма в целых минимальных единицах (тийины для UZS; 1 UZS = 100). Пишется всегда как
+        {"amount": <int64>, "currency": "<ISO-4217>"}. Читатель C# (MoneyJsonConverter) сравнивает имена полей
+        без учёта регистра, пропускает незнакомые поля, требует целое amount, а отсутствующий/null currency
+        трактует как UZS; писатель всегда пишет оба поля. Сервер v1 работает только с UZS (мок отвергает
+        другую валюту в запросах: 400 validation, reason = unsupported).
+      required: [amount, currency]
+      properties:
+        amount:
+          type: integer
+          format: int64
+          minimum: -9007199254740991
+          maximum: 9007199254740991
+          description: >-
+            Сумма в минимальных единицах со знаком (отрицательна для списаний, где это оговорено). Сервер
+            гарантирует |amount| ≤ 2^53−1, чтобы JS-клиенты (касса, шелл через IPC) не теряли точность; C# принимает
+            весь int64.
+          x-discrepancy: >-
+            C# Money.Amount — long (Balance.cs:15), MoneyJsonConverter читает весь int64 (Balance.cs:186). Контракт
+            сужает диапазон до ±(2^53−1): входящие Money TS-клиенты не проверяют — JSON.parse молча теряет точность,
+            а Number.isSafeInteger есть только в хелпере money() (packages/contracts-ts/src/wallet.ts:191), который
+            в приложениях вызывают лишь моки шелла (apps/shell/src/mocks/handlers.ts:382).
+        currency:
+          type: string
+          pattern: '^[A-Z]{3}$'
+          default: UZS
+          examples: [UZS]
+          description: Код валюты ISO-4217, верхний регистр (C# нормализует). В v1 — только UZS.
+      examples:
+        - amount: 1500000
+          currency: UZS
+      x-supported-currencies: [UZS]
+      x-csharp: "src/ClubShell.Contracts/Wallet/Balance.cs:15"
+      x-csharp-converter: "src/ClubShell.Contracts/Wallet/Balance.cs:156"
+
+    Balance:
+      type: object
+      description: >-
+        Баланс кошелька пользователя (IPC_PROTOCOL §6.12). Ответ GET /wallet/{userId}/balance и полезная нагрузка
+        WS-пуша walletUpdated. Вычисляемое C#-свойство Total (amount + bonus) помечено JsonIgnore и на провод
+        не попадает.
+      required: [userId, amount, bonus, currency, updatedAt]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Владелец кошелька.
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Основной (реальные деньги) баланс.
+        bonus:
+          $ref: '#/components/schemas/Money'
+          description: Бонусный баланс (промо, не выводится).
+        currency:
+          type: string
+          examples: [UZS]
+          description: Код ISO-4217 обоих балансов.
+        updatedAt:
+          type: string
+          format: date-time
+          description: Время последнего изменения (у кэша агента в офлайне — устаревшее).
+      x-csharp: "src/ClubShell.Contracts/Wallet/Balance.cs:250"
+
+    # ------------------------------------------------------------------ Wallet/Tariff.cs
+
+    Weekday:
+      type: string
+      enum: [mon, tue, wed, thu, fri, sat, sun]
+      description: День недели в окнах тарифа (пн..вс).
+      x-csharp: "src/ClubShell.Contracts/Wallet/Tariff.cs:8"
+      x-csharp-helpers: "src/ClubShell.Contracts/Wallet/Tariff.cs:33"
+
+    TariffTimeWindow:
+      type: object
+      description: >-
+        Еженедельное окно действия тарифа по местному времени клуба. from включительно, to исключительно;
+        to < from — окно переходит через полночь (хвост [00:00, to) относится к следующему дню); from = to —
+        весь день в указанные дни.
+      required: [days, from, to]
+      properties:
+        days:
+          type: array
+          items:
+            $ref: '#/components/schemas/Weekday'
+          description: Дни, к которым применяется окно.
+        from:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          description: Начало, HH:mm (читатель C# принимает также H:mm и HH:mm:ss).
+        to:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          description: Конец, HH:mm (исключительно).
+      x-csharp: "src/ClubShell.Contracts/Wallet/Tariff.cs:66"
+
+    Tariff:
+      type: object
+      description: >-
+        Тариф (IPC_PROTOCOL §6.11). Элемент ответа GET /tariffs и тарифов кассы. Цена за N минут: пакетная цена,
+        если isPackage и packagePrice задан; иначе pricePerHour × N / 60 с округлением вверх до минимальной единицы.
+        Тариф действует в зоне, если zones пуст или содержит её (без учёта регистра), и во времени, если timeWindows
+        пуст или хотя бы одно окно содержит текущий момент.
+      required: [id, name, pricePerHour, minMinutes, zones, timeWindows, isPackage]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор тарифа.
+        name:
+          type: string
+          description: Отображаемое название.
+        pricePerHour:
+          $ref: '#/components/schemas/Money'
+          description: Цена за час.
+        minMinutes:
+          type: integer
+          format: int32
+          description: Минимум покупаемых минут.
+        maxMinutes:
+          type: [integer, "null"]
+          format: int32
+          description: Максимум покупаемых минут; null — без ограничения.
+        zones:
+          type: array
+          items:
+            type: string
+          description: Зоны, где действует тариф; пустой — все зоны.
+        timeWindows:
+          type: array
+          items:
+            $ref: '#/components/schemas/TariffTimeWindow'
+          description: Окна действия; пустой — всегда.
+        isPackage:
+          type: boolean
+          description: Фиксированный пакет (packageMinutes за packagePrice) вместо почасовой оплаты.
+        packageMinutes:
+          type: [integer, "null"]
+          format: int32
+          description: Минут в пакете; обязательно при isPackage = true.
+        packagePrice:
+          oneOf:
+            - $ref: '#/components/schemas/Money'
+            - type: "null"
+          description: Цена пакета; обязательна при isPackage = true.
+      if:
+        required: [isPackage]
+        properties:
+          isPackage:
+            const: true
+      then:
+        required: [packageMinutes, packagePrice]
+        properties:
+          packageMinutes:
+            type: integer
+            format: int32
+          packagePrice:
+            $ref: '#/components/schemas/Money'
+      x-csharp: "src/ClubShell.Contracts/Wallet/Tariff.cs:106"
+
+    # ------------------------------------------------------------------ Wallet/Transaction.cs
+
+    TransactionType:
+      type: string
+      enum: [topUp, charge, refund, bonus, purchase, adjustment]
+      description: >-
+        Вид операции кошелька: topUp — пополнение (платёжная система или наличные); charge — списание за время
+        сессии; refund — возврат неиспользованного предоплаченного времени или отменённого заказа; bonus — промо-
+        начисление; purchase — покупка в магазине; adjustment — ручная корректировка администратором.
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:8"
+
+    TopupProvider:
+      type: string
+      enum: [payme, click, uzum, cash]
+      description: >-
+        Способ пополнения: payme, click — QR / deep link; uzum — Uzum Bank; cash — наличными на кассе
+        (создаёт тикет администратору).
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:31"
+
+    TopupStatus:
+      type: string
+      enum: [pending, paid, expired, cancelled]
+      description: >-
+        Состояние заявки на пополнение: pending — ждёт оплаты; paid — оплачено, баланс обновлён (следом
+        walletUpdated); expired — истекла без оплаты; cancelled — отменена пользователем или администратором.
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:48"
+
+    Transaction:
+      type: object
+      description: >-
+        Запись журнала кошелька (IPC_PROTOCOL §6.12). Элемент постраничного ответа
+        GET /wallet/{userId}/transactions (TransactionPage) и истории клиента в кассе.
+      required: [id, userId, type, amount, balanceAfter, description, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор операции.
+        userId:
+          type: string
+          format: uuid
+          description: Владелец кошелька.
+        type:
+          $ref: '#/components/schemas/TransactionType'
+          description: Вид операции.
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Сумма со знаком; отрицательна для charge и purchase.
+        balanceAfter:
+          $ref: '#/components/schemas/Money'
+          description: Основной баланс после операции.
+        description:
+          type: string
+          description: Человекочитаемое описание (локализуется по Accept-Language).
+        createdAt:
+          type: string
+          format: date-time
+          description: Время создания.
+        ref:
+          type: [string, "null"]
+          description: Внешняя ссылка — id заказа, сессии или платежа.
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:72"
+
+    TopupIntent:
+      type: object
+      description: >-
+        Заявка на пополнение, ожидающая или завершённая (IPC_PROTOCOL §6.12). Ответ
+        POST /wallet/{userId}/topup-intent (201) и GET /wallet/{userId}/topup-intent/{id}; завершение приходит
+        WS-пушем walletUpdated.
+      required: [id, provider, amount, status, expiresAt, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор заявки.
+        provider:
+          $ref: '#/components/schemas/TopupProvider'
+          description: Способ оплаты.
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Запрошенная сумма.
+        status:
+          $ref: '#/components/schemas/TopupStatus'
+          description: Текущее состояние.
+        qrUrl:
+          type: [string, "null"]
+          description: URL картинки QR для показа, если провайдер поддерживает оплату по QR.
+        deepLink:
+          type: [string, "null"]
+          description: Deep link в мобильное приложение провайдера, если есть.
+        paymentUrl:
+          type: [string, "null"]
+          description: Веб-страница оплаты, если есть.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Когда заявка истечёт без оплаты.
+        createdAt:
+          type: string
+          format: date-time
+          description: Время создания.
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:92"
+
+    TopupIntentCreateRequest:
+      type: object
+      description: Тело POST /wallet/{userId}/topup-intent (SERVER_API §4.8); отправляется с Idempotency-Key.
+      required: [amount, provider, pcId]
+      properties:
+        amount:
+          allOf:
+            - $ref: '#/components/schemas/Money'
+            - type: object
+              properties:
+                amount:
+                  minimum: 100000
+          description: >-
+            Запрошенная сумма; не меньше 1 000 UZS (100 000 минимальных единиц, TopupIntentCreateRequest.MinAmountMinor —
+            агент проверяет до отправки). Мок дополнительно ограничивает сверху 10 000 000 000 (100 млн UZS).
+        provider:
+          $ref: '#/components/schemas/TopupProvider'
+          description: Способ оплаты.
+        pcId:
+          type: string
+          format: uuid
+          description: ПК, с которого пришёл запрос (должен совпадать с ПК агента).
+      x-min-amount-minor: 100000
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:107"
+
+    # ------------------------------------------------------------------ Shop/Product.cs
+
+    ProductCategory:
+      type: string
+      enum: [food, drink, snack, service, merch, time]
+      description: >-
+        Категория товара: food — горячая еда; drink — напитки; snack — снеки; service — услуги (например, аренда
+        гарнитуры); merch — мерч; time — пакеты времени, продаваемые через магазин.
+      x-csharp: "src/ClubShell.Contracts/Shop/Product.cs:9"
+
+    Product:
+      type: object
+      description: Товар магазина (IPC_PROTOCOL §6.13). Элемент ответа GET /shop/products и склада кассы.
+      required: [id, title, category, price, imageUrl, inStock, tags]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор товара.
+        title:
+          type: string
+          description: Название (локализуется по Accept-Language).
+        category:
+          $ref: '#/components/schemas/ProductCategory'
+          description: Категория.
+        price:
+          $ref: '#/components/schemas/Money'
+          description: Цена за единицу.
+        imageUrl:
+          type: string
+          description: URL картинки.
+        inStock:
+          type: boolean
+          description: Есть в наличии (в офлайн-кэше агента неизвестно и показывается как «есть»).
+        stockQty:
+          type: [integer, "null"]
+          format: int32
+          description: Остаток, если склад ведётся.
+        tags:
+          type: array
+          items:
+            type: string
+          description: Произвольные теги (агент ищет и по ним).
+      x-csharp: "src/ClubShell.Contracts/Shop/Product.cs:39"
+
+    # ------------------------------------------------------------------ Shop/Order.cs
+
+    OrderStatus:
+      type: string
+      enum: [pending, accepted, preparing, delivering, done, cancelled]
+      description: >-
+        Жизненный цикл заказа: pending — оформлен, ждёт принятия персоналом, можно отменить; accepted — принят;
+        preparing — готовится; delivering — несут к месту; done — доставлен; cancelled — отменён пользователем или
+        персоналом, списанная сумма возвращена.
+      x-active-states: [pending, accepted, preparing, delivering]
+      x-cancellable-states: [pending]
+      x-csharp: "src/ClubShell.Contracts/Shop/Order.cs:9"
+      x-csharp-helpers: "src/ClubShell.Contracts/Shop/Order.cs:31"
+
+    OrderItem:
+      type: object
+      description: >-
+        Строка оформленного заказа; price — цена за единицу на момент заказа. Вычисляемое C#-свойство LineTotal
+        (price × qty) помечено JsonIgnore и на провод не попадает.
+      required: [productId, title, qty, price]
+      properties:
+        productId:
+          type: string
+          format: uuid
+          description: Товар.
+        title:
+          type: string
+          description: Название товара на момент заказа.
+        qty:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 99
+          description: Количество (1–99).
+        price:
+          $ref: '#/components/schemas/Money'
+          description: Цена за единицу на момент заказа.
+      x-csharp: "src/ClubShell.Contracts/Shop/Order.cs:42"
+
+    OrderLineRequest:
+      type: object
+      description: Строка создаваемого заказа (POST /shop/orders).
+      required: [productId, qty]
+      properties:
+        productId:
+          type: string
+          format: uuid
+          description: Товар (агент не отправляет пустой uuid).
+        qty:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 99
+          description: Количество (1–99, OrderLineRequest.MaxQty).
+      x-csharp: "src/ClubShell.Contracts/Shop/Order.cs:56"
+
+    Order:
+      type: object
+      description: >-
+        Заказ в магазине (IPC_PROTOCOL §6.13). Ответ POST /shop/orders (201), GET /shop/orders/{id},
+        POST /shop/orders/{id}/cancel, элемент OrderPage и полезная нагрузка WS-пуша orderUpdated.
+      required: [id, userId, pcId, items, total, status, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор заказа.
+        userId:
+          type: string
+          format: uuid
+          description: Покупатель.
+        pcId:
+          type: string
+          format: uuid
+          description: Место доставки.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/OrderItem'
+          description: Строки заказа.
+        total:
+          $ref: '#/components/schemas/Money'
+          description: Списанная сумма (Σ price × qty).
+        status:
+          $ref: '#/components/schemas/OrderStatus'
+          description: Текущее состояние.
+        createdAt:
+          type: string
+          format: date-time
+          description: Время создания.
+        updatedAt:
+          type: string
+          format: date-time
+          description: Время последней смены статуса.
+        note:
+          type: [string, "null"]
+          description: Комментарий для персонала.
+      x-csharp: "src/ClubShell.Contracts/Shop/Order.cs:77"
+
+    OrderCreateRequest:
+      type: object
+      description: Тело POST /shop/orders (SERVER_API §4.9); отправляется с Idempotency-Key.
+      required: [userId, pcId, items]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Покупатель (владелец X-User-Token).
+        pcId:
+          type: string
+          format: uuid
+          description: Место доставки (ПК агента).
+        sessionId:
+          type: [string, "null"]
+          format: uuid
+          description: Текущая сессия, если есть.
+        items:
+          type: array
+          minItems: 1
+          maxItems: 20
+          items:
+            $ref: '#/components/schemas/OrderLineRequest'
+          description: Строки заказа (1–20, OrderLineRequest.MaxLines).
+        note:
+          type: [string, "null"]
+          maxLength: 500
+          description: >-
+            Комментарий для персонала. Агент пропускает до 500 символов (SessionHandlers.cs:545); мок отвергает
+            длиннее 300 — 400 validation, reason max.
+          x-discrepancy: >-
+            Агент: note ≤ 500 (UserDomainHandlers.MaxNoteLength, SessionHandlers.cs:545, проверка :767). Мок:
+            optStr(b, 'note', 300) (tools/MockServer/src/routes/shop.ts:85) — длиннее 300 даёт 400 validation max
+            (db.ts:357), а не обрезку. По приоритету (C# агента > мок) в контракте 500.
+      x-csharp: "src/ClubShell.Contracts/Shop/Order.cs:94"
+
+    # ------------------------------------------------------------------ Users/AuthRequest.cs
+
+    AuthKind:
+      type: string
+      enum: [password, qr, guest, card, token]
+      description: >-
+        Способ входа: password — логин + пароль; qr — QR-код, отсканированный мобильным приложением клуба;
+        guest — временный гостевой аккаунт; card — NFC/RFID-карта; token — одноразовый токен админки/веба.
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:9"
+
+    QrStatus:
+      type: string
+      enum: [pending, scanned, confirmed, expired]
+      description: >-
+        Состояние QR-входа: pending — ещё не отсканирован; scanned — отсканирован, ждёт подтверждения в приложении;
+        confirmed — подтверждён, в QrLoginStatus.auth лежит AuthResponse (однократное чтение); expired — истёк или
+        уже использован.
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:29"
+
+    AuthRequest:
+      type: object
+      description: >-
+        Тело POST /auth/login (IPC_PROTOCOL §6.20). Заполняются поля, соответствующие kind. Агент шлёт сюда только
+        password, card и token: гостевой вход идёт через POST /auth/guest, QR — опросом GET /auth/qr/{token}.
+        Секреты (password, qrToken, cardId, token) нельзя логировать.
+      required: [kind, pcId, hwid]
+      properties:
+        kind:
+          $ref: '#/components/schemas/AuthKind'
+          description: Способ входа.
+          x-agent-sends: [password, card, token]
+        username:
+          type: [string, "null"]
+          minLength: 3
+          maxLength: 32
+          description: Логин (kind = password), 3–32 символа.
+        password:
+          type: [string, "null"]
+          format: password
+          maxLength: 256
+          description: Пароль (kind = password); агент пропускает до 256 символов (мок — до 128).
+          x-sensitive: true
+          x-discrepancy: >-
+            Агент отвергает пароль длиннее 256 (SessionHandlers.cs:483). Мок: str(b, 'password', 128)
+            (tools/MockServer/src/routes/auth.ts:126) — длиннее 128 даёт 400 validation max. По приоритету
+            (C# агента > мок) в контракте 256.
+        qrToken:
+          type: [string, "null"]
+          description: QR-токен (kind = qr).
+          x-sensitive: true
+        cardId:
+          type: [string, "null"]
+          description: Номер карты (kind = card).
+          x-sensitive: true
+        token:
+          type: [string, "null"]
+          description: Одноразовый токен (kind = token).
+          x-sensitive: true
+        pcId:
+          type: string
+          format: uuid
+          description: ПК, с которого выполняется вход (должен совпадать с ПК агента, иначе 403 pcMismatch).
+        hwid:
+          type: string
+          description: Hardware id ПК (sha256 hex).
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:71"
+
+    AuthResponse:
+      type: object
+      description: >-
+        Результат успешного входа (IPC_PROTOCOL §6.20, SERVER_API §4.3): ответ POST /auth/login, POST /auth/guest и
+        QrLoginStatus.auth. Токены пользователя держит агент, шеллу они не передаются.
+      required: [user, accessToken, refreshToken, expiresAt]
+      properties:
+        user:
+          $ref: '#/components/schemas/User'
+          description: Вошедший пользователь.
+        session:
+          oneOf:
+            - $ref: '#/components/schemas/Session'
+            - type: "null"
+          description: Открытая сессия этого пользователя на этом ПК (например, после перезапуска агента).
+        accessToken:
+          type: string
+          description: Access-токен пользователя (заголовок X-User-Token).
+          x-sensitive: true
+        refreshToken:
+          type: string
+          description: Refresh-токен пользователя.
+          x-sensitive: true
+        expiresAt:
+          type: string
+          format: date-time
+          description: Срок действия access-токена.
+        offlineHash:
+          type: [string, "null"]
+          pattern: '^pbkdf2\$(?:[1-9][0-9]{0,6}|10000000)\$(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)\$(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{4}|[A-Za-z0-9+/]{3}=|[A-Za-z0-9+/]{2}==)$'
+          description: >-
+            Хеш пароля для офлайн-входа, если клуб разрешает офлайн-вход (только при kind = password). Агент
+            проверяет только форму PBKDF2-SHA256 pbkdf2$<итерации 1..10000000>$<соль base64>$<хеш base64>
+            (OfflineSessionStore.VerifyPassword); любую другую строку (в т.ч. Argon2id PHC, как пишут doc-комментарий
+            C# и мок) агент сохраняет, но офлайн-вход с ней отказывает. Верификатор принимает префикс pbkdf2 в любом
+            регистре и ведущие нули в числе итераций, но сервер пишет каноническую форму: префикс строчными, итерации
+            без ведущих нулей, соль и хеш — непустой стандартный base64 с дополнением (как HashPassword агента).
+          examples:
+            - 'pbkdf2$210000$c2FsdHNhbHRzYWx0c2FsdA==$aGFzaGhhc2hoYXNoaGFzaGhhc2hoYXNoaGFzaGhhc2g='
+          x-sensitive: true
+          x-agent-verifier: "src/ClubShell.Agent/Session/OfflineSessionStore.cs:706"
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:98"
+
+    QrStartRequest:
+      type: object
+      description: Тело POST /auth/qr/start.
+      required: [pcId]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК, запрашивающий QR-вход (должен совпадать с ПК агента).
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:108"
+
+    QrLoginStart:
+      type: object
+      description: Ответ POST /auth/qr/start (и IPC auth.qrStart).
+      required: [qrToken, qrUrl, expiresAt, pollIntervalSec]
+      properties:
+        qrToken:
+          type: string
+          description: Непрозрачный токен для опроса GET /auth/qr/{token}.
+          x-sensitive: true
+        qrUrl:
+          type: string
+          description: Deep link, который рисуется QR-кодом (https://<server>/q/<qrToken>).
+        expiresAt:
+          type: string
+          format: date-time
+          description: Срок действия токена.
+        pollIntervalSec:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Рекомендуемый интервал опроса, секунд.
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:115"
+
+    QrLoginStatus:
+      type: object
+      description: Ответ GET /auth/qr/{token}.
+      required: [status]
+      properties:
+        status:
+          $ref: '#/components/schemas/QrStatus'
+          description: Состояние QR-входа.
+        auth:
+          oneOf:
+            - $ref: '#/components/schemas/AuthResponse'
+            - type: "null"
+          description: >-
+            Только при status = confirmed, однократно: следующие чтения возвращают expired.
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:124"
+
+    GuestAuthRequest:
+      type: object
+      description: Тело POST /auth/guest; ответ — AuthResponse с временным пользователем роли guest.
+      required: [pcId, hwid]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК (должен совпадать с ПК агента).
+        hwid:
+          type: string
+          description: Hardware id ПК (sha256 hex).
+        displayName:
+          type: [string, "null"]
+          description: Отображаемое имя, необязательно (агент сейчас не заполняет; мок принимает до 32 символов).
+        locale:
+          oneOf:
+            - $ref: '#/components/schemas/Locale'
+            - type: "null"
+          description: Предпочитаемый язык (агент шлёт язык из настроек шелла).
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:133"
+
+    LogoutRequest:
+      type: object
+      description: Тело POST /auth/logout; сервер завершает открытую сессию с этой причиной.
+      required: [reason]
+      properties:
+        reason:
+          $ref: '#/components/schemas/SessionEndReason'
+          description: >-
+            Причина выхода, записывается как причина завершения сессии. Агент шлёт только user, idle, admin;
+            сервер принимает любое значение SessionEndReason.
+          x-agent-sends: [user, idle, admin]
+          x-discrepancy: >-
+            Три источника расходятся. SERVER_API.md:257 — 4 значения (user | idle | admin | agentRestart). Агент —
+            3 (SessionHandlers.cs:327 отвергает всё, кроме User/Idle/Admin; единственный вызов — :346), agentRestart
+            не шлёт никогда. Мок — все 6 значений SessionEndReason, включая timeUp и error
+            (tools/MockServer/src/routes/auth.ts:42, 234). Схема по C#-типу LogoutRequest.Reason (C# > мок > документ):
+            $ref SessionEndReason.
+      x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:141"
+
+    # ------------------------------------------------------------------ Users/UserProfile.cs — User
+
+    UserRole:
+      type: string
+      enum: [guest, member, vip, admin]
+      description: >-
+        Роль пользователя, упорядочена по привилегиям: guest — временный гость; member — зарегистрированный
+        участник; vip — VIP; admin — персонал клуба.
+      x-privilege-order: [guest, member, vip, admin]
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:13"
+
+    Locale:
+      type: string
+      enum: [en, ru, uz]
+      description: Язык интерфейса — английский, русский, узбекский.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:30"
+
+    UserFlags:
+      type: string
+      description: >-
+        Флаг пользователя (элемент User.flags). В C# это статический класс строковых констант, а не enum: набор
+        открытый, клиент обязан принимать любую строку. banned — аккаунт заблокирован; noShop — магазин недоступен
+        (агент отказывает в заказе policyDenied noShop); staff — персонал клуба.
+      examples: [banned, noShop, staff]
+      x-known-values: [banned, noShop, staff]
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:43"
+
+    User:
+      type: object
+      description: >-
+        Аккаунт игрока (IPC_PROTOCOL §6.3). Ответ GET/PATCH /users/{userId}, часть AuthResponse. Вычисляемое
+        C#-свойство IsMember (role ≥ member) помечено JsonIgnore и на провод не попадает.
+      required: [id, username, displayName, role, balance, loyaltyLevel, loyaltyPoints, createdAt, locale, flags]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор пользователя.
+        username:
+          type: string
+          minLength: 3
+          maxLength: 32
+          description: Логин, 3–32 символа (у гостя — guest-<номер ПК>-<n>).
+        displayName:
+          type: string
+          description: Отображаемое имя.
+        avatarUrl:
+          type: [string, "null"]
+          description: Абсолютный URL аватара.
+        role:
+          $ref: '#/components/schemas/UserRole'
+          description: Роль.
+        balance:
+          $ref: '#/components/schemas/Money'
+          description: Основной баланс (без бонусного).
+        loyaltyLevel:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Уровень лояльности, с 0.
+        loyaltyPoints:
+          type: integer
+          format: int32
+          description: Баллы лояльности.
+        createdAt:
+          type: string
+          format: date-time
+          description: Время регистрации.
+        lastSeenAt:
+          type: [string, "null"]
+          format: date-time
+          description: Последняя активность.
+        locale:
+          $ref: '#/components/schemas/Locale'
+          description: Предпочитаемый язык.
+        flags:
+          type: array
+          items:
+            $ref: '#/components/schemas/UserFlags'
+          description: Серверные флаги (см. UserFlags); пустой массив допустим.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:68"
+
+    ProfileUpdateRequest:
+      type: object
+      description: >-
+        Тело PATCH /users/{userId} (и IPC profile.update); все поля необязательны, но агент не шлёт пустой запрос
+        (хотя бы одно поле задано). null не передаётся, поэтому очистить поле этим запросом нельзя. Гостю — 403.
+      minProperties: 1
+      properties:
+        displayName:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 64
+          description: >-
+            Новое отображаемое имя, не пустое и не из одних пробелов, до 64 символов (проверка агента). Мок: до 32
+            символов и не меньше 2 после trim.
+          x-discrepancy: >-
+            Агент: 1..64, не пустое и не из пробелов (SessionHandlers.cs:548, 963). Мок: optStr(b, 'displayName', 32)
+            и trim().length ≥ 2 (tools/MockServer/src/routes/auth.ts:255-256), сохраняет обрезанное значение (:263).
+            Имена длиной 33–64 или с одним непробельным символом агент пропускает, а мок отвергает 400 validation.
+            По приоритету (C# агента > мок) в контракте 1..64.
+        avatarUrl:
+          type: [string, "null"]
+          format: uri
+          pattern: '^[Hh][Tt][Tt][Pp][Ss]?://'
+          description: >-
+            Новый URL аватара — абсолютный http/https. Мок: "" очищает аватар; агент "" не шлёт (отвергает как
+            невалидный URI).
+          x-discrepancy: >-
+            Агент требует абсолютный URI со схемой http/https (SessionHandlers.cs:968), поэтому "" отвергает 400
+            validation format, и очистить аватар через агент нельзя. Мок (tools/MockServer/src/routes/auth.ts:257-264)
+            принимает "" как «очистить» (avatarUrl = null), ограничивает длину 512 и проверяет схему с учётом регистра
+            (/^https?:\/\//). По приоритету (C# агента > мок) "" в контракте запрещён.
+        locale:
+          oneOf:
+            - $ref: '#/components/schemas/Locale'
+            - type: "null"
+          description: Новый язык.
+        pin:
+          type: [string, "null"]
+          format: password
+          pattern: '^[0-9]{4,6}$'
+          description: Новый PIN из 4–6 цифр для session.unlock.
+          x-sensitive: true
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:95"
+
+    # ------------------------------------------------------------------ Users/UserProfile.cs — статистика, достижения, лояльность
+
+    FavoriteGame:
+      type: object
+      description: Наигранное время по одной игре для экрана статистики.
+      required: [gameId, hours]
+      properties:
+        gameId:
+          type: string
+          format: uuid
+          description: Игра.
+        hours:
+          type: number
+          format: double
+          description: Сыграно часов.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:108"
+
+    UserStats:
+      type: object
+      description: Сводная статистика пользователя (IPC_PROTOCOL §6.17); ответ GET /users/{userId}/stats.
+      required: [totalHours, sessionsCount, favoriteGames, spent, rank]
+      properties:
+        totalHours:
+          type: number
+          format: double
+          description: Всего сыграно часов.
+        sessionsCount:
+          type: integer
+          format: int32
+          description: Число сессий.
+        favoriteGames:
+          type: array
+          items:
+            $ref: '#/components/schemas/FavoriteGame'
+          description: Самые играемые игры.
+        spent:
+          $ref: '#/components/schemas/Money'
+          description: Всего потрачено.
+        rank:
+          type: integer
+          format: int32
+          description: Место в рейтинге клуба.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:118"
+
+    AchievementProgress:
+      type: object
+      description: Прогресс достижения.
+      required: [current, target]
+      properties:
+        current:
+          type: integer
+          format: int32
+          description: Текущее значение.
+        target:
+          type: integer
+          format: int32
+          description: Значение, нужное для открытия.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:128"
+
+    Achievement:
+      type: object
+      description: Достижение (IPC_PROTOCOL §6.17); элемент ответа GET /users/{userId}/achievements.
+      required: [id, title, description, iconUrl, progress]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор достижения.
+        title:
+          type: string
+          description: Название.
+        description:
+          type: string
+          description: Описание.
+        iconUrl:
+          type: string
+          description: URL иконки.
+        unlockedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Время открытия; null, пока закрыто.
+        progress:
+          $ref: '#/components/schemas/AchievementProgress'
+          description: Прогресс.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:139"
+
+    Loyalty:
+      type: object
+      description: Статус программы лояльности (IPC_PROTOCOL §6.17); ответ GET /users/{userId}/loyalty.
+      required: [level, points, nextLevelAt, perks]
+      properties:
+        level:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Текущий уровень, с 0.
+        points:
+          type: integer
+          format: int32
+          description: Текущие баллы.
+        nextLevelAt:
+          type: integer
+          format: int32
+          description: Баллов нужно для следующего уровня.
+        perks:
+          type: array
+          items:
+            type: string
+          description: Локализованные описания привилегий.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:152"
+
+    # ------------------------------------------------------------------ Users/UserProfile.cs — уведомления
+
+    NotificationLevel:
+      type: string
+      enum: [info, warning, error, success]
+      description: Важность уведомления — информация, предупреждение, ошибка, успех.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:164"
+
+    NotificationAction:
+      type: object
+      description: Необязательная кнопка действия у Notification.
+      required: [label, command]
+      properties:
+        label:
+          type: string
+          description: Надпись на кнопке.
+        command:
+          type: string
+          description: >-
+            Маршрут фронтенда (например, /shop) или имя IPC-команды AgentCommand (например, wallet.topupIntent).
+        args:
+          description: Аргументы для command — любое JSON-значение или null (в C# JsonElement?).
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:183"
+
+    Notification:
+      type: object
+      description: >-
+        Всплывающее уведомление (IPC_PROTOCOL §6.21): полезная нагрузка WS-пуша notification и IPC
+        notification.push.
+      required: [id, title, body, level]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор уведомления.
+        title:
+          type: string
+          description: Заголовок.
+        body:
+          type: string
+          description: Текст.
+        level:
+          $ref: '#/components/schemas/NotificationLevel'
+          description: Важность.
+        ttlSec:
+          type: [integer, "null"]
+          format: int32
+          description: Скрыть через столько секунд; null — висит, пока не закроют.
+        action:
+          oneOf:
+            - $ref: '#/components/schemas/NotificationAction'
+            - type: "null"
+          description: Необязательное действие.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:195"
+
+    # ------------------------------------------------------------------ Users/UserProfile.cs — чат
+
+    ChatMessageKind:
+      type: string
+      enum: [text, system, admin]
+      description: Вид сообщения чата — обычное сообщение пользователя, системное, от персонала клуба.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:209"
+
+    ChatRooms:
+      type: string
+      description: >-
+        Идентификатор комнаты чата (SERVER_API §4.10). В C# это статический класс констант и построителей:
+        club — общий чат клуба; pc:<pcId> — комната поддержки ПК (создаётся неявно); zone:<zone> — чат зоны;
+        dm:<userIdA>:<userIdB> — личная переписка, id отсортированы по возрастанию. Максимальная длина сообщения —
+        2000 символов (ChatRooms.MaxTextLength). В пути {roomId} передаётся URL-кодированным. Строка открытая:
+        в C# RoomId — обычный string, агент пересылает любой roomId от шелла (SessionHandlers.cs:1005). Известные
+        формы перечислены в x-known-patterns. Для комнаты неизвестного вида сервер отвечает 404 (SERVER_API §4.10),
+        а не 400. Для пользователя с ролью admin мок принимает и создаёт комнату с любым id (chat.ts:67, db.ts:785).
+      examples:
+        - club
+        - pc:7d2f1c3a-1111-4222-8333-444455556666
+        - zone:vip
+      x-known-patterns:
+        - '^club$'
+        - '^pc:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+        - '^zone:.+$'
+        - '^dm:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
+      x-max-text-length: 2000
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:222"
+
+    ChatMessage:
+      type: object
+      description: >-
+        Сообщение чата (IPC_PROTOCOL §6.14): элемент истории GET /chat/{roomId}/messages, ответ
+        POST /chat/{roomId}/messages (201) и полезная нагрузка WS-пуша chatMessage.
+      required: [id, roomId, senderId, senderName, senderRole, text, createdAt, kind]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор сообщения.
+        roomId:
+          $ref: '#/components/schemas/ChatRooms'
+          description: Комната.
+        senderId:
+          type: string
+          format: uuid
+          description: Отправитель.
+        senderName:
+          type: string
+          description: Отображаемое имя отправителя.
+        senderRole:
+          $ref: '#/components/schemas/UserRole'
+          description: Роль отправителя.
+        text:
+          type: string
+          maxLength: 2000
+          description: Текст, до 2000 символов.
+        createdAt:
+          type: string
+          format: date-time
+          description: Время отправки.
+        readAt:
+          type: [string, "null"]
+          format: date-time
+          description: Когда текущий пользователь прочитал сообщение (для своих — время отправки).
+        kind:
+          $ref: '#/components/schemas/ChatMessageKind'
+          description: Вид сообщения.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:258"
+
+    ChatPostRequest:
+      type: object
+      description: Тело POST /chat/{roomId}/messages; отправляется с Idempotency-Key.
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Текст сообщения; агент обрезает пробелы по краям и не шлёт пустой.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:271"
+
+    ChatReadRequest:
+      type: object
+      description: Тело POST /chat/{roomId}/read.
+      required: [upToMessageId]
+      properties:
+        upToMessageId:
+          type: string
+          format: uuid
+          description: Отметить прочитанным всё до этого сообщения включительно.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:275"
+
+    # ------------------------------------------------------------------ Users/UserProfile.cs — бронирование
+
+    BookingStatus:
+      type: string
+      enum: [reserved, confirmed, cancelled, expired]
+      description: >-
+        Жизненный цикл брони: reserved — забронировано, ждёт подтверждения/депозита; confirmed — подтверждено;
+        cancelled — отменено; expired — истекло неиспользованным.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:283"
+
+    Seat:
+      type: object
+      description: Место на карте клуба (IPC_PROTOCOL §6.15); элемент seats в GET /booking/seats.
+      required: [pcId, name, zone, x, y, status]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        name:
+          type: string
+          description: Имя ПК.
+        zone:
+          type: string
+          description: Зона.
+        x:
+          type: integer
+          format: int32
+          description: Колонка сетки карты.
+        y:
+          type: integer
+          format: int32
+          description: Строка сетки карты.
+        status:
+          $ref: '#/components/schemas/PcStatus'
+          description: Текущий статус ПК.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:305"
+
+    Booking:
+      type: object
+      description: >-
+        Бронь места (IPC_PROTOCOL §6.15): ответ POST /booking/reserve (201), DELETE /booking/{id}, элемент bookings в
+        GET /booking/seats и полезная нагрузка WS-пуша bookingUpdated. В списке GET /booking/seats userId чужих броней
+        обезличен — 00000000-0000-0000-0000-000000000000.
+      required: [id, userId, pcId, from, to, status]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор брони.
+        userId:
+          type: string
+          format: uuid
+          description: Владелец (для чужих броней — нулевой uuid).
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        from:
+          type: string
+          format: date-time
+          description: Начало.
+        to:
+          type: string
+          format: date-time
+          description: Конец.
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+          description: Состояние.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:320"
+
+    BookingCreateRequest:
+      type: object
+      description: Тело POST /booking/reserve; отправляется с Idempotency-Key.
+      required: [userId, pcId, from, to]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Владелец (владелец X-User-Token).
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        from:
+          type: string
+          format: date-time
+          description: Начало, выровненное по слоту (slotMinutes из GET /booking/seats).
+        to:
+          type: string
+          format: date-time
+          description: Конец, выровненный по слоту; позже from.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:333"
+
+    # ------------------------------------------------------------------ Users/UserProfile.cs — турниры
+
+    TournamentState:
+      type: string
+      enum: [upcoming, registration, live, finished]
+      description: >-
+        Жизненный цикл турнира: upcoming — анонсирован, регистрация закрыта; registration — идёт регистрация;
+        live — идёт; finished — завершён.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:345"
+
+    BracketMatch:
+      type: object
+      description: Матч сетки; a, b, winner — id пользователей.
+      required: [id]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор матча.
+        a:
+          type: [string, "null"]
+          format: uuid
+          description: Первый игрок.
+        b:
+          type: [string, "null"]
+          format: uuid
+          description: Второй игрок.
+        winner:
+          type: [string, "null"]
+          format: uuid
+          description: Победитель.
+        score:
+          type: [string, "null"]
+          description: Счёт, например "2-1".
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:366"
+
+    BracketRound:
+      type: object
+      description: Раунд сетки.
+      required: [matches]
+      properties:
+        matches:
+          type: array
+          items:
+            $ref: '#/components/schemas/BracketMatch'
+          description: Матчи раунда.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:375"
+
+    Bracket:
+      type: object
+      description: Турнирная сетка.
+      required: [rounds]
+      properties:
+        rounds:
+          type: array
+          items:
+            $ref: '#/components/schemas/BracketRound'
+          description: Раунды по порядку.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:379"
+
+    Tournament:
+      type: object
+      description: >-
+        Турнир (IPC_PROTOCOL §6.16): элемент GET /tournaments, ответ POST /tournaments/{id}/join и полезная нагрузка
+        WS-пуша tournamentUpdated.
+      required: [id, title, gameId, startsAt, state, prizePool, maxPlayers, players, joined]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор турнира.
+        title:
+          type: string
+          description: Название.
+        gameId:
+          type: string
+          format: uuid
+          description: Игра.
+        startsAt:
+          type: string
+          format: date-time
+          description: Время начала.
+        state:
+          $ref: '#/components/schemas/TournamentState'
+          description: Состояние.
+        prizePool:
+          $ref: '#/components/schemas/Money'
+          description: Призовой фонд.
+        maxPlayers:
+          type: integer
+          format: int32
+          description: Вместимость.
+        players:
+          type: integer
+          format: int32
+          description: Текущее число участников.
+        joined:
+          type: boolean
+          description: Участвует ли текущий пользователь (без X-User-Token — false).
+        bracket:
+          oneOf:
+            - $ref: '#/components/schemas/Bracket'
+            - type: "null"
+          description: Сетка, когда опубликована.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:392"
+
+    LeaderboardEntry:
+      type: object
+      description: Строка таблицы лидеров (IPC_PROTOCOL §6.16); entries и me в GET /tournaments/{id}/leaderboard.
+      required: [rank, userId, name, score]
+      properties:
+        rank:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Место, с 1.
+        userId:
+          type: string
+          format: uuid
+          description: Пользователь.
+        name:
+          type: string
+          description: Отображаемое имя.
+        score:
+          type: integer
+          format: int64
+          description: Очки.
+        avatarUrl:
+          type: [string, "null"]
+          description: URL аватара.
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:410"

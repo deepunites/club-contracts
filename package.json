@@ -1,0 +1,19 @@
+{
+  "name": "club-contracts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Контракт сервера клуба: OpenAPI 3.1 (REST) + AsyncAPI 3.0 (WebSocket агента).",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "bundle": "python3 scripts/bundle.py",
+    "lint:openapi": "redocly lint openapi/openapi.yaml --format=stylish",
+    "lint:asyncapi": "SUPPRESS_NO_CONFIG_WARNING=1 ASYNCAPI_METRICS_CONFIG_PATH=scripts/asyncapi-analytics.json asyncapi validate asyncapi/asyncapi.yaml",
+    "check": "python3 scripts/bundle.py --check && npm run lint:openapi && npm run lint:asyncapi"
+  },
+  "devDependencies": {
+    "@asyncapi/cli": "6.2.0",
+    "@redocly/cli": "2.54.3"
+  }
+}

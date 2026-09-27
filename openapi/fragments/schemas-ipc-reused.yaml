@@ -1,0 +1,713 @@
+# Группа schemas-ipc-reused: типы из src/ClubShell.Contracts/Ipc/IpcMessage.cs, которые ходят по REST с сервером.
+# Остальные ~73 типа файла — IPC агент <-> шелл (не наш контракт) и схемами не стали; проверено по IServerClient,
+# ServerClient и по местам, где агент кладёт IPC-тип в тело REST (TelemetryReporter.Publish -> TelemetryEvent.data).
+#
+# Включены (и почему):
+#   тела запросов / ответы IServerClient (IServerClient.cs, ServerClient.cs):
+#     SessionExtendRequest (тело POST /sessions/{id}/extend), GamesListResponse (GET /games), AppsListResponse
+#     (GET /apps), TariffsResponse (GET /tariffs), ShopProductsResponse (GET /shop/products), ChatHistoryResponse
+#     (GET /chat/{roomId}/messages), ChatMarkReadResponse (POST /chat/{roomId}/read), BookingSeatsResponse
+#     (GET /booking/seats), TournamentsListResponse (GET /tournaments), TournamentsLeaderboardResponse
+#     (GET /tournaments/{id}/leaderboard), ProfileAchievementsResponse (GET /users/{userId}/achievements),
+#     SysCallAdminResponse (POST /support/call-admin);
+#   PagedResult<T> из IServerClient -> TransactionPage (GET /wallet/{userId}/transactions), OrderPage (GET /shop/orders);
+#   поля типов других файлов Contracts: CallAdminCategory (CallAdminTicketRequest.category); payload/результаты команд
+#     сервер -> агент, которые ходят в GET /agents/{pcId}/commands и POST .../ack (ServerCommand.cs:117-141):
+#     GamesKillResponse, SetVolumeRequest, VolumeState, UpdateApplyResponse, ShowAdsArgs (+ AdItem, AdMediaType);
+#   data телеметрии (POST /agents/{pcId}/telemetry, TelemetryEvent.data): SysLogClientErrorRequest (+ ClientErrorLevel) —
+#     при kind = "shellClientError" агент кладёт в data этот IPC-тип целиком (SystemHandlers.cs:385). Для владельца
+#     schemas-commands (TelemetryEvent / TelemetryEventKinds): форма data для shellClientError — SysLogClientErrorRequest;
+#   касса /admin/*: ShellFeatures (ClubSettings.features в apps/admin/src/api.ts:271, GET/PATCH /admin/club);
+#     OkResponse ({ ok: true } изменяющих маршрутов кассы в моке).
+# Не включены: WalletHistoryRequest — по REST это только query GET /wallet/{userId}/transactions (page, pageSize, from,
+#   to, type; ServerClient.cs:395-400), не JSON — параметры описывает группа путей; IPC-двойники REST-типов
+#   (AuthLoginRequest -> AuthRequest, SessionStartRequest -> SessionCreateRequest, WalletTopupIntentRequest ->
+#   TopupIntentCreateRequest, ShopOrderRequest -> OrderCreateRequest, ChatSendRequest -> ChatPostRequest,
+#   ChatMarkReadRequest -> ChatReadRequest, BookingReserveRequest -> BookingCreateRequest, WalletTariffsResponse,
+#   WalletHistoryResponse, ShopOrdersResponse, GamesListRequest и т.д.); события и аргументы shell.command
+#   (AdminMessage, ShellCommand, ShellCommandKind, ShowMessageArgs, ShellRebootArgs, RemoteControlEvent, ...);
+#   статические классы IpcMessages, ShellCapabilities, AgentCapabilities.
+# Внешние схемы (определяют другие группы, здесь только $ref): Game, App, Tariff, Transaction, Product, Order,
+#   ChatMessage, Seat, Booking, Tournament, LeaderboardEntry, Achievement.
+# Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter, целые отвергаются),
+# null не пишется (WhenWritingNull), незнакомые поля пропускаются, DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ,
+# TimeOnly -> HH:mm (ClubTimeConverter), DateOnly -> yyyy-MM-dd. Переопределения в этих типах: только [JsonIgnore]
+# у вычисляемого PagedResult.HasMore (на провод не попадает). JsonPropertyName/JsonPolymorphic нет.
+# Открытый вопрос (openQuestions, не норма схемы): должен ли сервер v1 выключать в ShellFeatures разделы, чьи операции
+#   notImplemented. Флаг по умолчанию true (PolicyHandlers.cs:270). При true: shop/chat/booking/tournaments/topup — IPC
+#   дойдёт до сервера и получит 501 -> serverUnavailable (ErrorCode.cs:148, retryable); apps — GET
+#   /apps -> 501 (GameHandlers.cs:87 — при false пустой список без запроса); callAdmin — 501 перехватывается
+#   (SystemHandlers.cs:246), заявка уходит в телеметрию kind=callAdmin (required) и шелл получает успех, т.е. выключать
+#   callAdmin для работоспособности не обязательно.
+components:
+  schemas:
+
+    # ------------------------------------------------------------------ Common: PagedResult<T>, OkResponse
+
+    TransactionPage:
+      type: object
+      description: >-
+        Страница PagedResult<Transaction> — ответ GET /wallet/{userId}/transactions. Стандартный конверт страницы
+        (SERVER_API §1): query page (с 1, по умолчанию 1), pageSize (по умолчанию 50, максимум 200). В ответе pageSize —
+        фактически применённый размер (мок зажимает запрошенный в 1..200). Вычисляемое hasMore
+        (page * pageSize < total) в C# помечено [JsonIgnore] и по сети не передаётся.
+      required: [items, total, page, pageSize]
+      properties:
+        items:
+          type: array
+          description: Операции этой страницы (новые первыми — как хранит сервер; агент порядок не меняет).
+          items:
+            $ref: '#/components/schemas/Transaction'
+        total:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Всего операций по фильтру на всех страницах.
+        page:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Номер страницы, с 1.
+        pageSize:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Применённый размер страницы.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:343"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:241"
+        - "src/ClubShell.Core/Http/ServerClient.cs:392"
+        - "docs/SERVER_API.md:19"
+        - "docs/SERVER_API.md:355"
+        - "tools/MockServer/src/routes/wallet.ts:89"
+        - "tools/MockServer/src/db.ts:289"
+
+    OrderPage:
+      type: object
+      description: >-
+        Страница PagedResult<Order> — ответ GET /shop/orders?userId=&page=&pageSize=&activeOnly=. Конверт страницы
+        SERVER_API §1 (page с 1, по умолчанию 1; pageSize по умолчанию 50, максимум 200). Вычисляемое hasMore по сети
+        не передаётся.
+      required: [items, total, page, pageSize]
+      properties:
+        items:
+          type: array
+          description: Заказы этой страницы.
+          items:
+            $ref: '#/components/schemas/Order'
+        total:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Всего заказов по фильтру на всех страницах.
+        page:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Номер страницы, с 1.
+        pageSize:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Применённый размер страницы.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:343"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:266"
+        - "src/ClubShell.Core/Http/ServerClient.cs:439"
+        - "docs/SERVER_API.md:19"
+        - "docs/SERVER_API.md:370"
+        - "tools/MockServer/src/routes/shop.ts:140"
+        - "tools/MockServer/src/db.ts:289"
+
+    OkResponse:
+      type: object
+      description: >-
+        Тривиальный ответ { "ok": true }. В агенте — ответ IPC (sys.lockScreen, sys.logClientError,
+        sys.ackAdminMessage); по REST его отдают изменяющие маршруты кассы без содержательного результата (мок:
+        PATCH /admin/staff/{id}, PATCH /admin/club, POST /admin/notifications/test, DELETE /admin/tariffs/{id},
+        DELETE /admin/pcs/{pcId}). Касса тело не читает (apps/admin/src/api.ts типизирует его как unknown).
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          const: true
+          description: Всегда true.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:356"
+      x-source:
+        - "tools/MockServer/src/routes/club.ts:170"
+        - "tools/MockServer/src/routes/club.ts:277"
+        - "tools/MockServer/src/routes/club.ts:348"
+        - "tools/MockServer/src/routes/club.ts:377"
+        - "tools/MockServer/src/routes/club.ts:585"
+        - "apps/admin/src/api.ts:509"
+        - "apps/admin/src/api.ts:518"
+
+    # ------------------------------------------------------------------ Session payloads
+
+    SessionExtendRequest:
+      type: object
+      description: >-
+        Тело POST /sessions/{id}/extend (тот же тип — запрос IPC session.extend). Только для предоплаченной сессии в
+        состоянии active/paused/locked; стоимость списывается с баланса. Заголовок Idempotency-Key обязателен.
+      required: [minutes]
+      properties:
+        minutes:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 1440
+          description: >-
+            Сколько минут добавить. Границы 1..1440 — из мока (вне — 400 validation, details.field = minutes); сверх
+            tariff.maxMinutes с учётом уже купленного — тоже 400 validation.
+        tariffId:
+          type: [string, "null"]
+          format: uuid
+          description: Тариф для расчёта; нет/null — текущий тариф сессии.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:538"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:203"
+        - "src/ClubShell.Core/Http/ServerClient.cs:322"
+        - "docs/SERVER_API.md:295"
+        - "tools/MockServer/src/routes/session.ts:272"
+
+    # ------------------------------------------------------------------ Games / apps payloads
+
+    GamesListResponse:
+      type: object
+      description: >-
+        Ответ GET /games (ETag; тот же тип — ответ IPC games.list). Конверт страницы плюс catalogVersion. Без page и
+        pageSize сервер отдаёт весь каталог одной страницей (page = 1, pageSize = total); максимум pageSize — 1000
+        (SERVER_API §4.6, мок; общее правило §1 «максимум 200» к /games не применяется). Агент всегда запрашивает
+        page=1&pageSize=500 с If-None-Match и догружает остальные страницы уже без ETag, пока не наберёт total, —
+        поэтому ETag первой страницы и catalogVersion должны меняться при любом изменении каталога зоны, а не только
+        первой страницы. Локальные поля Game (installed, installPath) сервер не заполняет; lastPlayedAt — только при
+        X-User-Token.
+      required: [items, total, page, pageSize, catalogVersion]
+      properties:
+        items:
+          type: array
+          description: Игры этой страницы (скрытые клубом исключены, порядок — заданный владельцем).
+          items:
+            $ref: '#/components/schemas/Game'
+        total:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Всего игр в каталоге (с учётом zone).
+        page:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Номер страницы, с 1.
+        pageSize:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Применённый размер страницы (без пагинации = total, может быть 0 при пустом каталоге).
+        catalogVersion:
+          type: string
+          minLength: 1
+          description: >-
+            Версия каталога — непрозрачная строка, сравнивается только на равенство (в моке: 12 hex при сиде, затем
+            v<ms> после изменений через PATCH /admin/club).
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:602"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:213"
+        - "src/ClubShell.Core/Http/ServerClient.cs:340"
+        - "src/ClubShell.Agent/Games/GameLibrary.cs:91"
+        - "docs/SERVER_API.md:305"
+        - "tools/MockServer/src/routes/games.ts:60"
+        - "tools/MockServer/src/db.ts:1565"
+        - "tools/MockServer/src/routes/club.ts:129"
+
+    AppsListResponse:
+      type: object
+      description: >-
+        Ответ GET /apps (ETag; тот же тип — ответ IPC apps.list). allowed у App сервер вычисляет по зоне, агент
+        перепроверяет локальной политикой. При features.apps = false агент GET /apps не вызывает.
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: Приложения клуба (не игры).
+          items:
+            $ref: '#/components/schemas/App'
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:650"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:231"
+        - "src/ClubShell.Core/Http/ServerClient.cs:380"
+        - "src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:87"
+        - "docs/SERVER_API.md:350"
+        - "tools/MockServer/src/routes/games.ts:205"
+
+    GamesKillResponse:
+      type: object
+      description: >-
+        Результат команды killGame (CommandAck.result в POST /agents/{pcId}/commands/{commandId}/ack и в WS-ack);
+        тот же тип — ответ IPC games.kill.
+      required: [killed, pids]
+      properties:
+        killed:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Сколько процессов завершено.
+        pids:
+          type: array
+          description: Идентификаторы завершённых процессов.
+          items:
+            type: integer
+            format: int32
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:636"
+      x-source:
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:117"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:387"
+        - "docs/SERVER_API.md:525"
+
+    # ------------------------------------------------------------------ Wallet payloads
+
+    TariffsResponse:
+      type: object
+      description: >-
+        Ответ GET /tariffs?zone= (ETag). В отличие от IPC wallet.tariffs (WalletTariffsResponse) поля zone нет —
+        агент подставляет запрошенную зону сам.
+      required: [items, serverTime]
+      properties:
+        items:
+          type: array
+          description: Тарифы, действующие в зоне (тарифы без зон — во всех зонах).
+          items:
+            $ref: '#/components/schemas/Tariff'
+        serverTime:
+          type: string
+          format: date-time
+          description: Время сервера для оценки окон действия тарифов.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:688"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:244"
+        - "src/ClubShell.Core/Http/ServerClient.cs:405"
+        - "docs/SERVER_API.md:356"
+        - "tools/MockServer/src/routes/wallet.ts:108"
+
+    # ------------------------------------------------------------------ Shop payloads
+
+    ShopProductsResponse:
+      type: object
+      description: Ответ GET /shop/products?category= (ETag; тот же тип — ответ IPC shop.products).
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: Товары (опционально отфильтрованные по категории).
+          items:
+            $ref: '#/components/schemas/Product'
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:736"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:257"
+        - "src/ClubShell.Core/Http/ServerClient.cs:424"
+        - "docs/SERVER_API.md:365"
+        - "tools/MockServer/src/routes/shop.ts:71"
+
+    # ------------------------------------------------------------------ Chat payloads
+
+    ChatHistoryResponse:
+      type: object
+      description: >-
+        Ответ GET /chat/{roomId}/messages?before=&limit= (тот же тип — ответ IPC chat.history). limit по умолчанию 50,
+        максимум 200; before — id сообщения, старше которого вернуть.
+      required: [roomId, items, hasMore, unread]
+      properties:
+        roomId:
+          type: string
+          description: Комната (club, zone:<zone>, pc:<pcId>, dm:<a>:<b>).
+        items:
+          type: array
+          description: Сообщения, старые первыми.
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+        hasMore:
+          type: boolean
+          description: Есть более старые сообщения.
+        unread:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Непрочитанных в комнате для текущего пользователя.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:792"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:276"
+        - "src/ClubShell.Core/Http/ServerClient.cs:454"
+        - "docs/SERVER_API.md:375"
+        - "tools/MockServer/src/routes/chat.ts:145"
+
+    ChatMarkReadResponse:
+      type: object
+      description: Ответ POST /chat/{roomId}/read (тот же тип — ответ IPC chat.markRead).
+      required: [roomId, unread]
+      properties:
+        roomId:
+          type: string
+          description: Комната.
+        unread:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Сколько непрочитанных осталось.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:817"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:282"
+        - "src/ClubShell.Core/Http/ServerClient.cs:468"
+        - "docs/SERVER_API.md:377"
+        - "tools/MockServer/src/routes/chat.ts:200"
+
+    # ------------------------------------------------------------------ Booking payloads
+
+    BookingSeatsResponse:
+      type: object
+      description: >-
+        Ответ GET /booking/seats?date= (тот же тип — ответ IPC booking.seats). Чужие брони обезличены:
+        userId = 00000000-0000-0000-0000-000000000000.
+      required: [date, seats, bookings, slotMinutes]
+      properties:
+        date:
+          type: string
+          format: date
+          description: Дата (местная дата клуба), YYYY-MM-DD.
+        seats:
+          type: array
+          description: Карта мест.
+          items:
+            $ref: '#/components/schemas/Seat'
+        bookings:
+          type: array
+          description: Все брони этого дня.
+          items:
+            $ref: '#/components/schemas/Booking'
+        slotMinutes:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Шаг слотов бронирования в минутах (мок — 30).
+        openFrom:
+          type: [string, "null"]
+          pattern: '^\d{2}:\d{2}$'
+          description: Время открытия клуба, HH:mm (только REST; нет/null — неизвестно).
+        openTo:
+          type: [string, "null"]
+          pattern: '^\d{2}:\d{2}$'
+          description: Время закрытия клуба, HH:mm; openTo < openFrom — работа через полночь (мок — 10:00..02:00).
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:836"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:289"
+        - "src/ClubShell.Core/Http/ServerClient.cs:479"
+        - "docs/SERVER_API.md:383"
+        - "tools/MockServer/src/routes/chat.ts:214"
+
+    # ------------------------------------------------------------------ Tournament payloads
+
+    TournamentsListResponse:
+      type: object
+      description: >-
+        Ответ GET /tournaments?state=&gameId= (тот же тип — ответ IPC tournaments.list). Tournament.joined
+        заполняется только при X-User-Token, иначе false.
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: Турниры.
+          items:
+            $ref: '#/components/schemas/Tournament'
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:870"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:302"
+        - "src/ClubShell.Core/Http/ServerClient.cs:502"
+        - "docs/SERVER_API.md:389"
+        - "tools/MockServer/src/routes/chat.ts:287"
+
+    TournamentsLeaderboardResponse:
+      type: object
+      description: >-
+        Ответ GET /tournaments/{id}/leaderboard?limit= (тот же тип — ответ IPC tournaments.leaderboard). limit по
+        умолчанию 50, максимум 100.
+      required: [tournamentId, entries, updatedAt]
+      properties:
+        tournamentId:
+          type: string
+          format: uuid
+          description: Турнир.
+        entries:
+          type: array
+          description: Верх таблицы (не больше limit).
+          items:
+            $ref: '#/components/schemas/LeaderboardEntry'
+        updatedAt:
+          type: string
+          format: date-time
+          description: Время последнего пересчёта таблицы.
+        me:
+          oneOf:
+            - $ref: '#/components/schemas/LeaderboardEntry'
+            - type: "null"
+          description: Запись текущего пользователя, если он вне entries; без X-User-Token — нет/null.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:888"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:308"
+        - "src/ClubShell.Core/Http/ServerClient.cs:513"
+        - "docs/SERVER_API.md:391"
+        - "tools/MockServer/src/routes/chat.ts:313"
+
+    # ------------------------------------------------------------------ Profile payloads
+
+    ProfileAchievementsResponse:
+      type: object
+      description: Ответ GET /users/{userId}/achievements (тот же тип — ответ IPC profile.achievements).
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: Достижения пользователя.
+          items:
+            $ref: '#/components/schemas/Achievement'
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:900"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:178"
+        - "src/ClubShell.Core/Http/ServerClient.cs:276"
+        - "docs/SERVER_API.md:265"
+        - "tools/MockServer/src/routes/auth.ts:276"
+
+    # ------------------------------------------------------------------ Settings payloads (касса)
+
+    ShellFeatures:
+      type: object
+      description: >-
+        Флаги разделов шелла (shell.json -> features). По REST: ClubSettings.features кассы (GET/PATCH /admin/club) —
+        переключатели владельца, которые сервер переносит в AgentServerConfig.shell.features (там C# хранит частичный
+        объект как JsonElement той же формы). Агент читает ровно эти 8 ключей, отсутствующий флаг = true
+        (PolicyHandlers.cs:270). Поведение агента при false, без обращения к серверу: shop, chat, booking,
+        tournaments, topup, callAdmin — IPC-вызов отклоняется ошибкой policyDenied (features.<флаг>); не проверяют флаг
+        shop.orders, chat.markRead, booking.cancel; apps — пустой список без GET /apps; profile агент не проверяет.
+        При callAdmin = true и ошибке сервера (сеть или retryable, в т.ч. 501 -> serverUnavailable) заявка молча
+        уходит в телеметрию kind=callAdmin, шелл получает успешный SysCallAdminResponse.
+      required: [shop, chat, booking, tournaments, profile, topup, apps, callAdmin]
+      properties:
+        shop:
+          type: boolean
+          description: Магазин (shop.*).
+        chat:
+          type: boolean
+          description: Чат (chat.*).
+        booking:
+          type: boolean
+          description: Бронирование (booking.*).
+        tournaments:
+          type: boolean
+          description: Турниры (tournaments.*).
+        profile:
+          type: boolean
+          description: Профиль (агент флаг не проверяет — только UI шелла).
+        topup:
+          type: boolean
+          description: Пополнение баланса (wallet.topupIntent).
+        apps:
+          type: boolean
+          description: Приложения (apps.list; при false агент GET /apps не вызывает).
+        callAdmin:
+          type: boolean
+          description: Вызов администратора (sys.callAdmin -> POST /support/call-admin).
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:915"
+      x-source:
+        - "apps/admin/src/api.ts:271"
+        - "tools/MockServer/src/routes/club.ts:254"
+        - "tools/MockServer/src/club.ts:291"
+        - "tools/MockServer/src/db.ts:682"
+        - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:270"
+        - "src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:87"
+        - "src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:686"
+        - "src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:1021"
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:215"
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:246"
+
+    # ------------------------------------------------------------------ Sys payloads
+
+    CallAdminCategory:
+      type: string
+      enum: [help, technical, order, other]
+      description: >-
+        Категория вызова администратора (CallAdminTicketRequest.category в POST /support/call-admin): help — общая
+        помощь, technical — техническая проблема, order — проблема с заказом, other — прочее.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:981"
+      x-source:
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:864"
+        - "tools/MockServer/src/routes/pcs.ts:58"
+
+    SysCallAdminResponse:
+      type: object
+      description: >-
+        Ответ 201 POST /support/call-admin (тот же тип — ответ IPC sys.callAdmin). Если сервер недоступен (сеть или
+        retryable-ошибка, в т.ч. 501 -> serverUnavailable), агент ставит заявку в телеметрию и сам генерирует
+        ticketId, queuePosition = null.
+      required: [ticketId, createdAt]
+      properties:
+        ticketId:
+          type: string
+          format: uuid
+          description: Номер заявки.
+        createdAt:
+          type: string
+          format: date-time
+          description: Время создания заявки.
+        queuePosition:
+          type: [integer, "null"]
+          format: int32
+          description: Позиция в очереди администраторов, если известна.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1040"
+      x-source:
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:322"
+        - "src/ClubShell.Core/Http/ServerClient.cs:529"
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:243"
+        - "docs/SERVER_API.md:399"
+        - "tools/MockServer/src/routes/pcs.ts:251"
+
+    ClientErrorLevel:
+      type: string
+      enum: [warn, error]
+      description: >-
+        Уровень ошибки клиента шелла (SysLogClientErrorRequest.level): warn — предупреждение, error — ошибка.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:998"
+      x-source:
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:376"
+
+    SysLogClientErrorRequest:
+      type: object
+      description: >-
+        data события телеметрии kind = "shellClientError" в POST /agents/{pcId}/telemetry (TelemetryEvent.data; тот же
+        тип — запрос IPC sys.logClientError). Агент сериализует его через JsonDefaults, поэтому null-поля опускаются.
+        Перед отправкой агент обрезает message до 2000 символов и stack до 8000; больше 10 ошибок в секунду агент
+        молча отбрасывает.
+      required: [level, message]
+      properties:
+        level:
+          $ref: '#/components/schemas/ClientErrorLevel'
+          description: Уровень.
+        message:
+          type: string
+          maxLength: 2000
+          description: Текст ошибки (≤ 2000 символов; может быть пустым).
+        stack:
+          type: [string, "null"]
+          maxLength: 8000
+          description: Стек вызовов (≤ 8000 символов).
+        route:
+          type: [string, "null"]
+          description: Маршрут фронтенда шелла, где произошла ошибка.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1096"
+      x-source:
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:385"
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:374"
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:51"
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:294"
+
+    SetVolumeRequest:
+      type: object
+      description: Payload команды setVolume (сервер -> агент; тот же тип — запрос IPC sys.setVolume).
+      required: [level]
+      properties:
+        level:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Громкость 0–100 (агент зажимает значение в этот диапазон).
+        muted:
+          type: [boolean, "null"]
+          description: Выключить звук; нет/null — не менять.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1059"
+      x-source:
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:141"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:457"
+        - "docs/SERVER_API.md:533"
+
+    VolumeState:
+      type: object
+      description: Результат команды setVolume в CommandAck.result (тот же тип — ответ IPC sys.setVolume).
+      required: [level, muted]
+      properties:
+        level:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Применённая громкость.
+        muted:
+          type: boolean
+          description: Применённое состояние «без звука».
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1066"
+      x-source:
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:141"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:470"
+        - "docs/SERVER_API.md:533"
+
+    # ------------------------------------------------------------------ Policy / update payloads
+
+    UpdateApplyResponse:
+      type: object
+      description: Результат команды update в CommandAck.result (тот же тип — ответ IPC update.apply).
+      required: [scheduled]
+      properties:
+        scheduled:
+          type: boolean
+          description: Применение запланировано.
+        at:
+          type: [string, "null"]
+          format: date-time
+          description: Когда будет применено, если известно.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1162"
+      x-source:
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:135"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:443"
+        - "docs/SERVER_API.md:531"
+
+    # ------------------------------------------------------------------ Ads (payload команды showAds)
+
+    AdMediaType:
+      type: string
+      enum: [image, video]
+      description: Тип рекламного носителя — image (картинка) или video.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1203"
+
+    AdItem:
+      type: object
+      description: Один ролик/баннер в плейлисте ShowAdsArgs.
+      required: [url, type, durationSec]
+      properties:
+        url:
+          type: string
+          description: URL медиафайла.
+        type:
+          $ref: '#/components/schemas/AdMediaType'
+        durationSec:
+          type: integer
+          format: int32
+          description: Длительность показа, секунд.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1333"
+
+    ShowAdsArgs:
+      type: object
+      description: >-
+        Payload команды showAds (сервер -> агент); агент пересылает его в шелл как shell.command{showAds}. Результат
+        ack — null.
+      required: [items, skippable]
+      properties:
+        items:
+          type: array
+          description: Плейлист.
+          items:
+            $ref: '#/components/schemas/AdItem'
+        skippable:
+          type: boolean
+          description: Пользователь может пропустить показ.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1341"
+      x-source:
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:138"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:450"
+        - "docs/SERVER_API.md:532"

@@ -1,0 +1,862 @@
+# Группа schemas-games-session: публичные типы из
+#   src/ClubShell.Contracts/Games/GameInfo.cs, Games/LauncherType.cs, Games/LaunchRequest.cs
+#   (namespace ClubShell.Contracts.Games) и Session/SessionEvent.cs, Session/SessionState.cs
+#   (namespace ClubShell.Contracts.Sessions).
+# Внешние схемы (определяют другие группы, здесь только $ref): Money (Wallet/Balance.cs), IpcError (Ipc/IpcErrors.cs).
+# Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter на каждом enum,
+# целые значения отвергаются), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
+# DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ. В этих файлах нет JsonPropertyName/JsonStringEnumMemberName/
+# JsonPolymorphic; единственный JsonIgnore — вычисляемое Session.IsOpenEnded (на провод не попадает).
+# Статические классы-помощники без формы на проводе (SessionStateExtensions) схемами не стали — их семантика
+# записана расширениями x-*-states у SessionState. Типы только для IPC агент <-> шелл (GamesSort, GameInstallStatus,
+# RunningGame, GameState, SessionWarning) в REST/WS не передаются и в контракт не входят. Классы строковых констант
+# (AppCategories, AntiCheatChecks) — открытые строковые схемы с x-known-values (как PeripheralKinds в schemas-pc).
+# Пул аккаунтов клуба (AccountLease и всё, что с ним связано) помечен x-prohibited-note.
+components:
+  schemas:
+
+    # ------------------------------------------------------------------ LauncherType.cs
+
+    LauncherType:
+      type: string
+      enum: [steam, epic, battleNet, riot, ea, ubisoft, exe]
+      description: >-
+        Лаунчер/магазин, которым запускается игра: steam (steam://rungameid/<appid>), epic (Epic Games Launcher),
+        battleNet, riot (Riot Client), ea (EA app), ubisoft (Ubisoft Connect), exe (прямой исполняемый файл без лаунчера).
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:9"
+
+    AntiCheatKind:
+      type: string
+      enum: [none, eac, battlEye, vanguard, faceit, ricochet]
+      description: >-
+        Античит, от которого зависит игра: none — нет, eac — Easy Anti-Cheat, battlEye — BattlEye,
+        vanguard — Riot Vanguard (драйвер ядра, нужны Secure Boot/TPM), faceit — клиент FACEIT,
+        ricochet — Activision Ricochet.
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:35"
+
+    AntiCheatSeverity:
+      type: string
+      enum: [info, warning, critical]
+      description: >-
+        Серьёзность находки античит-проверки: info — информационно; warning — мягкое нарушение (запуск разрешён,
+        если политика не запрещает); critical — жёсткое нарушение.
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:58"
+
+    AntiCheatAction:
+      type: string
+      enum: [none, blockedLaunch, killedGame, lockedSession]
+      description: >-
+        Действие агента в ответ на находку: none — только отчёт; blockedLaunch — запуск отклонён (antiCheatBlocked);
+        killedGame — запущенная игра убита; lockedSession — сессия заблокирована до решения администратора.
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:72"
+
+    AntiCheatChecks:
+      type: string
+      description: >-
+        Идентификатор античит-проверки (AntiCheatReport.check, AntiCheatCheckResult.reason). В C# это статический
+        класс строковых констант, а не enum: набор открытый, сервер обязан принимать любую строку (мок — до 64 символов).
+        driverMissing — нет драйвера античита; serviceStopped — служба остановлена; secureBootOff — UEFI Secure Boot
+        выключен; tpmOff — TPM отсутствует/выключен; hvciOff — HVCI выключен; testSigningOn — включён test-signing;
+        codeIntegrityOff — проверка подписи драйверов отключена в BCD; kernelDebugOn — включена отладка ядра;
+        blockedProcess — найден запрещённый процесс; injectedModule — чужой модуль в процессе игры;
+        vmDetected — обнаружена виртуальная машина; debuggerAttached — к процессу игры подключён отладчик.
+      x-discrepancy: >-
+        docs/SERVER_API.md:414 (§4.14) перечисляет 10 значений — нет codeIntegrityOff и kernelDebugOn. Источник
+        истины — C# src/ClubShell.Contracts/Games/LauncherType.cs:88-125 (12 констант, в т.ч. :109 codeIntegrityOff
+        и :112 kernelDebugOn).
+      examples: [driverMissing, secureBootOff, blockedProcess]
+      x-known-values:
+        - driverMissing
+        - serviceStopped
+        - secureBootOff
+        - tpmOff
+        - hvciOff
+        - testSigningOn
+        - codeIntegrityOff
+        - kernelDebugOn
+        - blockedProcess
+        - injectedModule
+        - vmDetected
+        - debuggerAttached
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:88"
+
+    AntiCheatCheckResult:
+      type: object
+      description: Результат предзапусковой античит-проверки; входит в LaunchReport.
+      required: [kind, ok]
+      properties:
+        kind:
+          $ref: '#/components/schemas/AntiCheatKind'
+          description: Проверенная подсистема.
+        ok:
+          type: boolean
+          description: Предусловия выполнены.
+        reason:
+          oneOf:
+            - $ref: '#/components/schemas/AntiCheatChecks'
+            - type: "null"
+          description: Проваленная проверка (см. AntiCheatChecks), когда ok = false.
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:131"
+
+    AntiCheatReport:
+      type: object
+      description: >-
+        Тело POST /anticheat/report и полезная нагрузка события агента anticheatViolation (SERVER_API §4.14).
+      required: [pcId, kind, check, severity, details, at, actionTaken]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК, сообщивший о находке (должен совпадать с ПК из JWT, иначе 403 pcMismatch в моке).
+        sessionId:
+          type: [string, "null"]
+          format: uuid
+          description: Сессия, во время которой сделана находка, если есть.
+        userId:
+          type: [string, "null"]
+          format: uuid
+          description: Вошедший пользователь, если есть.
+        gameId:
+          type: [string, "null"]
+          format: uuid
+          description: Затронутая игра, если есть.
+        kind:
+          $ref: '#/components/schemas/AntiCheatKind'
+          description: Подсистема.
+        check:
+          $ref: '#/components/schemas/AntiCheatChecks'
+          description: Идентификатор проверки (набор открытый).
+        severity:
+          $ref: '#/components/schemas/AntiCheatSeverity'
+          description: Серьёзность находки.
+        details:
+          description: >-
+            Структурированные улики (имена процессов, пути модулей, значения реестра); в C# — JsonElement (любое
+            значение), на практике объект. Мок принимает только объект. Учётных данных не содержит никогда.
+        at:
+          type: string
+          format: date-time
+          description: Время находки (UTC, yyyy-MM-ddTHH:mm:ss.fffZ).
+        actionTaken:
+          $ref: '#/components/schemas/AntiCheatAction'
+          description: Действие, предпринятое агентом.
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:147"
+
+    # ------------------------------------------------------------------ GameInfo.cs
+
+    GameMinSpec:
+      type: object
+      description: Минимальные системные требования игры.
+      required: [cpu, gpu, ramMb]
+      properties:
+        cpu:
+          type: string
+          description: Описание процессора.
+        gpu:
+          type: string
+          description: Описание видеокарты.
+        ramMb:
+          type: integer
+          format: int32
+          description: ОЗУ, МиБ.
+      x-csharp: "src/ClubShell.Contracts/Games/GameInfo.cs:24"
+
+    Game:
+      type: object
+      description: >-
+        Игра каталога (IPC_PROTOCOL §6.8); ответ GET /games/{id} и элемент GET /games. Локальные поля (installed,
+        installPath) агент перезаписывает по результатам своего сканирования; по контракту (C#) сервер присылает
+        installed (не-nullable в C#; мок шлёт false; SERVER_API.md говорит обратное — см. x-discrepancy) и может
+        прислать installPath: null. lastPlayedAt сервер
+        заполняет только при наличии X-User-Token.
+      x-discrepancy: >-
+        docs/SERVER_API.md:305 — сервер опускает installed и installPath; по приоритету C#
+        (src/ClubShell.Contracts/Games/GameInfo.cs:60, не-nullable bool Installed) поле installed обязательно.
+        Для агента требование формальное: System.Text.Json без RespectRequiredConstructorParameters
+        (src/ClubShell.Contracts/Serialization/JsonDefaults.cs:85-99) примет отсутствующее installed как false, а
+        GameLibrary.Merge (src/ClubShell.Agent/Games/GameLibrary.cs:247) всё равно перезаписывает его своим сканом.
+      required:
+        - id
+        - title
+        - launcher
+        - installed
+        - category
+        - tags
+        - coverUrl
+        - description
+        - ageRating
+        - popularity
+        - requiresAccount
+        - antiCheat
+        - sizeGb
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор игры.
+        title:
+          type: string
+          description: Локализованное название.
+        launcher:
+          $ref: '#/components/schemas/LauncherType'
+          description: Лаунчер, которым запускается игра.
+        launcherAppId:
+          type: [string, "null"]
+          description: Идентификатор в лаунчере — Steam appid, Epic namespace:item, код Battle.net и т.п.
+        exePath:
+          type: [string, "null"]
+          description: Исполняемый файл; обязателен для launcher = exe; может быть относительным к installPath.
+        args:
+          type: [string, "null"]
+          description: Дополнительная командная строка.
+        installPath:
+          type: [string, "null"]
+          description: Локальный каталог установки (заполняет агент).
+        installed:
+          type: boolean
+          description: Результат локального сканирования (заполняет агент; сервер шлёт false).
+        category:
+          type: array
+          items:
+            type: string
+          description: Категории (имя свойства в единственном числе, как в C#).
+        tags:
+          type: array
+          items:
+            type: string
+          description: Теги.
+        coverUrl:
+          type: string
+          description: Обложка (2:3).
+        heroUrl:
+          type: [string, "null"]
+          description: Широкое hero-изображение.
+        videoUrl:
+          type: [string, "null"]
+          description: Трейлер / фоновое видео.
+        description:
+          type: string
+          description: Локализованное описание; может быть пустой строкой.
+        ageRating:
+          type: integer
+          format: int32
+          description: Минимальный возраст; 0 — без ограничения.
+        popularity:
+          type: integer
+          format: int32
+          description: Ранг популярности по данным сервера.
+        lastPlayedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Последний запуск текущим пользователем (только при X-User-Token).
+        requiresAccount:
+          type: boolean
+          description: >-
+            Нужна аренда аккаунта из пула клуба. true — агент перед запуском берёт аренду из пула
+            (GET /games/{id}/accounts/lease, если нет живой локальной аренды; при выключенном пуле — ошибка
+            accountPoolExhausted); src/ClubShell.Agent/Games/GameLaunchService.cs:202,
+            src/ClubShell.Agent/Games/Accounts/AccountPool.cs:138-157.
+          x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+        antiCheat:
+          $ref: '#/components/schemas/AntiCheatKind'
+          description: Античит игры.
+        minSpec:
+          oneOf:
+            - $ref: '#/components/schemas/GameMinSpec'
+            - type: "null"
+          description: Минимальные требования.
+        sizeGb:
+          type: number
+          format: double
+          description: Размер установки, ГБ (1 знак после запятой).
+        version:
+          type: [string, "null"]
+          description: Версия (установленная / каталожная).
+      x-csharp: "src/ClubShell.Contracts/Games/GameInfo.cs:52"
+
+    AppCategories:
+      type: string
+      description: >-
+        Известные значения App.category. В C# это статический класс строковых констант, а не enum: набор открытый,
+        сервер обязан принимать любую строку. browser — браузер, voice — голосовой чат, media — медиаплеер,
+        tool — утилита.
+      examples: [browser, voice, media, tool]
+      x-known-values: [browser, voice, media, tool]
+      x-csharp: "src/ClubShell.Contracts/Games/GameInfo.cs:94"
+
+    App:
+      type: object
+      description: >-
+        Разрешённое на киоске неигровое приложение (IPC_PROTOCOL §6.10); элемент ответа GET /apps.
+      required: [id, title, exePath, iconUrl, category, allowed]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор приложения.
+        title:
+          type: string
+          description: Название.
+        exePath:
+          type: string
+          description: Путь к исполняемому файлу (агент сверяет с allow-list).
+        iconUrl:
+          type: string
+          description: URL иконки.
+        category:
+          $ref: '#/components/schemas/AppCategories'
+          description: Категория (см. AppCategories; набор открытый).
+        allowed:
+          type: boolean
+          description: Разрешено после применения политики (сервер считает по зоне, агент перепроверяет локально).
+      x-csharp: "src/ClubShell.Contracts/Games/GameInfo.cs:116"
+
+    # ------------------------------------------------------------------ LaunchRequest.cs
+
+    Resolution:
+      type: object
+      description: Разрешение экрана, запрошенное для запуска.
+      required: [width, height]
+      properties:
+        width:
+          type: integer
+          format: int32
+          description: Ширина, px.
+        height:
+          type: integer
+          format: int32
+          description: Высота, px.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:38"
+
+    LaunchRequest:
+      type: object
+      description: >-
+        Полный запрос запуска в том виде, в каком его исполняет агент (IPC_PROTOCOL §6.9); также payload
+        серверной команды launchGame (WS).
+      required: [gameId, sessionId, userId, useAccountPool, launchTimeoutSec]
+      properties:
+        gameId:
+          type: string
+          format: uuid
+          description: Игра.
+        sessionId:
+          type: string
+          format: uuid
+          description: Активная сессия.
+        userId:
+          type: string
+          format: uuid
+          description: Игрок.
+        useAccountPool:
+          type: boolean
+          description: Арендовать аккаунт из пула и подставить учётные данные.
+          x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+        accountLeaseId:
+          type: [string, "null"]
+          format: uuid
+          description: Переиспользовать существующую аренду.
+          x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+        extraArgs:
+          type: [string, "null"]
+          description: Дополнительная командная строка (агент чистит по политике).
+        resolution:
+          oneOf:
+            - $ref: '#/components/schemas/Resolution'
+            - type: "null"
+          description: Запрошенное разрешение.
+        launchTimeoutSec:
+          type: integer
+          format: int32
+          description: >-
+            Сколько секунд ждать процесс/окно игры до ошибки; значение <= 0 агент заменяет своим
+            games.launchTimeoutSec (src/ClubShell.Agent/Games/GameLaunchService.cs:228).
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:51"
+
+    LaunchResult:
+      type: object
+      description: >-
+        Итог запуска (IPC_PROTOCOL §6.9); результат команды launchGame и поле LaunchReport.result. По IPC ошибки
+        возвращаются как ошибки IPC, поэтому там ok всегда true; в LaunchReport при неудаче ok = false и есть error.
+      required: [ok, startedAt]
+      properties:
+        ok:
+          type: boolean
+          description: Признак успеха.
+        pid:
+          type: [integer, "null"]
+          format: int32
+          description: Идентификатор процесса игры, если запущен.
+        startedAt:
+          type: string
+          format: date-time
+          description: Время запуска.
+        accountLeaseId:
+          type: [string, "null"]
+          format: uuid
+          description: Использованная аренда аккаунта из пула, если была.
+          x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/IpcError'
+            - type: "null"
+          description: Подробности ошибки, когда ok = false.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:67"
+
+    CloudSaveDownload:
+      type: object
+      description: >-
+        Pre-signed загрузка пакета облачных сохранений пользователя; приходит только внутри AccountLease.cloudSave
+        (облачные сохранения в клиенте привязаны к аренде аккаунта из пула).
+      required: [url, sha256, sizeBytes]
+      properties:
+        url:
+          type: string
+          description: Pre-signed HTTPS URL.
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 пакета, hex в нижнем регистре.
+        sizeBytes:
+          type: integer
+          format: int64
+          description: Размер пакета, байт.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:105"
+      x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+
+    AccountLease:
+      type: object
+      description: >-
+        Аренда аккаунта из пула клуба (GET /games/{id}/accounts/lease, SERVER_API §4.6). secret зашифрован
+        AES-256-GCM ключом агента, выведенным из signingSecret (HKDF-SHA256, info "account-pool"), base64
+        nonce||ciphertext||tag. Никогда не логируется.
+      required: [leaseId, launcher, username, secret, expiresAt]
+      properties:
+        leaseId:
+          type: string
+          format: uuid
+          description: Идентификатор аренды.
+        launcher:
+          $ref: '#/components/schemas/LauncherType'
+          description: Лаунчер, к которому относятся учётные данные.
+        username:
+          type: string
+          description: Логин аккаунта.
+        secret:
+          type: string
+          contentEncoding: base64
+          description: Зашифрованный пароль или токен (base64 nonce||ciphertext||tag).
+        extra:
+          description: >-
+            Специфичные для лаунчера дополнительные данные (steamGuardSecret, authenticatorSeed, region); в C# —
+            JsonElement? (любое значение или null/отсутствует).
+        expiresAt:
+          type: string
+          format: date-time
+          description: Срок действия аренды (TTL).
+        cloudSave:
+          oneOf:
+            - $ref: '#/components/schemas/CloudSaveDownload'
+            - type: "null"
+          description: Пакет сохранений, который нужно восстановить перед запуском, если есть.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:122"
+      x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+
+    AccountLeaseReleaseReason:
+      type: string
+      enum: [exit, sessionEnd, launchFailed, manual]
+      description: >-
+        Причина возврата аренды аккаунта: exit — игра завершилась; sessionEnd — сессия закончилась;
+        launchFailed — запуск не удался; manual — вручную / администратором.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:133"
+      x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+
+    CloudSaveUpload:
+      type: object
+      description: >-
+        Пакет облачных сохранений, который агент выгрузил (PUT на SaveUploadTarget.uploadUrl) перед возвратом аренды.
+      required: [sha256, sizeBytes]
+      properties:
+        uploadUrl:
+          type: [string, "null"]
+          description: Pre-signed URL, на который выполнен PUT (из SaveUploadTarget).
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 пакета, hex в нижнем регистре.
+        sizeBytes:
+          type: integer
+          format: int64
+          description: Размер пакета, байт.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:152"
+      x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+
+    AccountLeaseRelease:
+      type: object
+      description: Тело POST /games/{id}/accounts/{leaseId}/release.
+      required: [reason]
+      properties:
+        reason:
+          $ref: '#/components/schemas/AccountLeaseReleaseReason'
+          description: Причина возврата.
+        cloudSave:
+          oneOf:
+            - $ref: '#/components/schemas/CloudSaveUpload'
+            - type: "null"
+          description: Выгруженный пакет сохранений, если облачные сохранения включены.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:160"
+      x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+
+    SaveUploadTarget:
+      type: object
+      description: Ответ GET /games/{id}/accounts/{leaseId}/save-upload — куда выгрузить пакет сохранений.
+      required: [uploadUrl, expiresAt, maxBytes]
+      properties:
+        uploadUrl:
+          type: string
+          description: Pre-signed URL для PUT.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Срок действия URL.
+        maxBytes:
+          type: integer
+          format: int64
+          description: Максимальный принимаемый размер пакета, байт.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:168"
+      x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+
+    LaunchReportPhase:
+      type: string
+      enum: [launch, exit]
+      description: >-
+        Точка жизненного цикла, которую описывает LaunchReport: launch — сразу после запуска (успех или неудача);
+        exit — при завершении игры.
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:175"
+
+    LaunchReport:
+      type: object
+      description: Тело POST /games/{id}/launch-report (SERVER_API §4.6).
+      required: [sessionId, userId, result, durationMs, launcher, antiCheat, phase]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: Сессия.
+        userId:
+          type: string
+          format: uuid
+          description: Игрок.
+        result:
+          $ref: '#/components/schemas/LaunchResult'
+          description: Итог запуска.
+        durationMs:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Задержка запуска, мс (мок требует >= 0).
+        launcher:
+          $ref: '#/components/schemas/LauncherType'
+          description: Использованный лаунчер.
+        antiCheat:
+          $ref: '#/components/schemas/AntiCheatCheckResult'
+          description: Предзапусковая античит-проверка.
+        phase:
+          $ref: '#/components/schemas/LaunchReportPhase'
+          description: Точка жизненного цикла.
+        exitCode:
+          type: [integer, "null"]
+          format: int32
+          description: Код завершения процесса (phase = exit).
+        playedSec:
+          type: [integer, "null"]
+          format: int32
+          minimum: 0
+          description: Сыграно секунд (phase = exit; мок требует >= 0).
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:194"
+
+    # ------------------------------------------------------------------ SessionState.cs
+
+    SessionState:
+      type: string
+      enum: [idle, starting, active, paused, locked, ending, ended]
+      description: >-
+        Машина состояний сессии (IPC_PROTOCOL §6.1, §9.2): idle — сессии нет; starting — создаётся на сервере /
+        в офлайн-хранилище; active — таймер идёт; paused — пауза пользователем, таймер стоит; locked — заблокирована
+        (пользователь отошёл / администратор), таймер идёт, если тариф не ставит на паузу при блокировке;
+        ending — время вышло, льготный период до принудительного завершения; ended — завершена и рассчитана.
+      x-open-states: [starting, active, paused, locked, ending]
+      x-session-requests-states: [active, paused]
+      x-timer-running-states: [active, locked, ending]
+      x-csharp: "src/ClubShell.Contracts/Session/SessionState.cs:9"
+      x-csharp-helpers: "src/ClubShell.Contracts/Session/SessionState.cs:34"
+
+    Session:
+      type: object
+      description: >-
+        Игровая сессия (IPC_PROTOCOL §6.4). Вычисляемое C#-свойство IsOpenEnded помечено JsonIgnore и на провод
+        не попадает (эквивалент — secondsLeft = -1).
+      required: [id, userId, pcId, state, startedAt, tariffId, secondsLeft, secondsUsed, cost, isPrepaid, warningsSent]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор сессии (при создании офлайн генерирует агент).
+        userId:
+          type: string
+          format: uuid
+          description: Игрок.
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        state:
+          $ref: '#/components/schemas/SessionState'
+          description: Состояние.
+        startedAt:
+          type: string
+          format: date-time
+          description: Время начала.
+        endsAt:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            Плановое окончание; null в состояниях idle/starting и для бессрочной постоплаты (у завершённой сессии
+            мок отдаёт фактическое время окончания).
+        pausedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Заполнено, пока сессия на паузе/заблокирована.
+        tariffId:
+          type: string
+          format: uuid
+          description: Действующий тариф.
+        secondsLeft:
+          type: integer
+          format: int32
+          minimum: -1
+          description: Осталось секунд; -1 — бессрочная постоплата (Session.OpenEnded).
+        secondsUsed:
+          type: integer
+          format: int32
+          description: Израсходовано секунд.
+        cost:
+          $ref: '#/components/schemas/Money'
+          description: Начислено на текущий момент.
+        isPrepaid:
+          type: boolean
+          description: Предоплата (списано сразу) или постоплата.
+        warningsSent:
+          type: array
+          items:
+            type: integer
+            format: int32
+          description: Минутные отметки, по которым уже отправлено session.warning, например [10, 5].
+      x-csharp: "src/ClubShell.Contracts/Session/SessionState.cs:60"
+
+    # ------------------------------------------------------------------ SessionEvent.cs
+
+    SessionEventType:
+      type: string
+      enum: [started, paused, resumed, extended, warning, locked, unlocked, ended, charged]
+      description: >-
+        Вид SessionEvent: started — начата; paused — пауза; resumed — продолжена; extended — продлена
+        (data = SessionExtendedData); warning — предупреждение о времени (data = SessionWarningData);
+        locked — заблокирована; unlocked — разблокирована; ended — завершена (data = SessionEndedData);
+        charged — списание (data = SessionChargedData).
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:10"
+
+    SessionEndReason:
+      type: string
+      enum: [user, timeUp, admin, idle, agentRestart, error]
+      description: >-
+        Почему сессия завершилась: user — пользователем; timeUp — кончилось предоплаченное время; admin —
+        администратором; idle — по простою; agentRestart — агент перезапустился и не смог продолжить;
+        error — внутренняя ошибка.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:42"
+
+    SessionEvent:
+      type: object
+      description: >-
+        Событие аудита/воспроизведения сессии (IPC_PROTOCOL §6.21); форма data зависит от type
+        (см. x-data-by-type; у остальных типов data отсутствует/null).
+      required: [sessionId, type, at]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: Сессия.
+        type:
+          $ref: '#/components/schemas/SessionEventType'
+          description: Вид события.
+        at:
+          type: string
+          format: date-time
+          description: Время события.
+        data:
+          description: >-
+            Типизированные доп. данные или null/отсутствует; в C# — JsonElement? (любое значение). Агент пишет
+            объект нужной формы (x-data-by-type); мок сохраняет data, только если это объект.
+          x-data-by-type:
+            extended: SessionExtendedData
+            warning: SessionWarningData
+            charged: SessionChargedData
+            ended: SessionEndedData
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:68"
+
+    SessionExtendedData:
+      type: object
+      description: data события extended.
+      required: [minutes, cost]
+      properties:
+        minutes:
+          type: integer
+          format: int32
+          description: Добавлено минут.
+        cost:
+          $ref: '#/components/schemas/Money'
+          description: Списано за продление.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:101"
+
+    SessionWarningData:
+      type: object
+      description: data события warning.
+      required: [minutesLeft]
+      properties:
+        minutesLeft:
+          type: integer
+          format: int32
+          description: Осталось минут в момент предупреждения.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:105"
+
+    SessionChargedData:
+      type: object
+      description: data события charged.
+      required: [amount]
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+          description: Списанная сумма.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:109"
+
+    SessionEndedData:
+      type: object
+      description: data события ended.
+      required: [reason]
+      properties:
+        reason:
+          $ref: '#/components/schemas/SessionEndReason'
+          description: Причина завершения.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:113"
+
+    SessionEndResult:
+      type: object
+      description: Расчёт, возвращаемый IPC session.end и POST /sessions/{id}/end.
+      required: [session, charged, refunded]
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+          description: Итоговая сессия (state = ended).
+        charged:
+          $ref: '#/components/schemas/Money'
+          description: Списано при расчёте (постоплата).
+        refunded:
+          $ref: '#/components/schemas/Money'
+          description: Возвращено за неиспользованное предоплаченное время.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:119"
+
+    SessionEndedEvent:
+      type: object
+      description: Полезная нагрузка IPC-события session.ended и события агента sessionEnded (WS).
+      required: [session, reason, charged]
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+          description: Итоговая сессия.
+        reason:
+          $ref: '#/components/schemas/SessionEndReason'
+          description: Причина завершения.
+        charged:
+          $ref: '#/components/schemas/Money'
+          description: Списано при расчёте.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:128"
+
+    SessionStartedEvent:
+      type: object
+      description: Полезная нагрузка события агента sessionStarted (WS).
+      required: [session]
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+          description: Новая сессия.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:135"
+
+    SessionCreateRequest:
+      type: object
+      description: Тело POST /sessions (SERVER_API §4.5); отправляется с Idempotency-Key.
+      required: [pcId, userId, tariffId, prepaid]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК (должен совпадать с ПК из JWT агента).
+        userId:
+          type: string
+          format: uuid
+          description: Игрок (должен совпадать с владельцем X-User-Token).
+        tariffId:
+          type: string
+          format: uuid
+          description: Тариф.
+        minutes:
+          type: [integer, "null"]
+          format: int32
+          minimum: 1
+          description: Сколько минут купить; обязательно, если тариф не пакетный (мок требует >= 1).
+        prepaid:
+          type: boolean
+          description: Списать сразу (предоплата) или открыть бессрочную постоплату.
+        startedAt:
+          type: [string, "null"]
+          format: date-time
+          description: >-
+            Фактическое начало для сессий, созданных офлайн (не раньше maxOfflineMinutes назад; мок — 240 мин,
+            иначе 400 validation startedAt/tooOld).
+        clientSessionId:
+          type: [string, "null"]
+          format: uuid
+          description: Идентификатор, сгенерированный агентом офлайн; сервер принимает его как id, если он свободен.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:145"
+
+    SessionEndReport:
+      type: object
+      description: Тело POST /sessions/{id}/end.
+      required: [reason, secondsUsed]
+      properties:
+        reason:
+          $ref: '#/components/schemas/SessionEndReason'
+          description: Причина завершения.
+        secondsUsed:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Израсходовано секунд по измерению агента (мок требует >= 0).
+        endedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Фактическое время окончания (офлайн-воспроизведение).
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:158"
+
+    SessionEventsBatch:
+      type: object
+      description: >-
+        Тело POST /sessions/{id}/events: офлайн-воспроизведение и аудит lock/unlock/warning; не более 100 событий
+        (SessionEventsBatch.MaxEvents).
+      required: [events]
+      properties:
+        events:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/SessionEvent'
+          description: События в хронологическом порядке.
+      x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:165"

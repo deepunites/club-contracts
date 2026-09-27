@@ -1,0 +1,3539 @@
+# Группа schemas-admin: схемы кассы и настройки клуба (`apps/admin`, маршруты `/admin/*`).
+# Источники: apps/admin/src/api.ts (потребитель — приоритет), tools/MockServer/src/routes/{admin,club}.ts,
+# tools/MockServer/src/{club,health,control}.ts. C#-аналогов нет, поэтому у схем x-source вместо x-csharp.
+# Общие типы (Money, Tariff, TariffTimeWindow, Session, Pc, PcStatus, PcMetrics, HardwareInfo, Product, Transaction,
+# ShellFeatures, UserRole, LauncherType, CommandAck, OkResponse) — по C#-именам из других групп, не дублируются.
+#
+# Обязательность в схемах кассы (типы TypeScript, а не C#):
+# - ответ: ключ TS без `?` -> required; `T | null` -> required + null (касса сравнивает строго `=== null`,
+#   например MapPage.tsx:91, ControlPage.tsx:305, IntegrationsPage.tsx:238, ShiftPage.tsx:254 — пропуск ключа ломает
+#   экран, поэтому null надо отдавать явно); `x?: T` -> не required.
+# - запрос: required только то, что и касса шлёт всегда, и мок требует (str/int без opt*); остальное необязательно.
+#   Тела PATCH с приведением к границам/слиянием в моке — отдельные схемы *Patch/*Input без required и без
+#   minimum/maximum (границы — `x-clamp`), а не схемы ответа.
+# Деньги в схемах кассы — либо Money, либо целое int64 в минимальных единицах (тийины), как в api.ts.
+#
+# Открытый вопрос (openQuestions, не норма схемы): отступление от общего правила формата «nullable -> НЕ в required».
+# Для Admin-схем принято «TS `T | null` (без `?`) -> required + допускает null», потому что касса проверяет строго
+# `=== null`/`!== null`, и пропущенный ключ (undefined) проходит мимо проверки: apps/admin/src/pages/ShiftPage.tsx:254
+# (`s.closingCash === null`), MapPage.tsx:91 (`seat.session !== null` — без ключа свободное место выглядит занятым),
+# IntegrationsPage.tsx:238 (`h.lastStatus === null`), ControlPage.tsx:305 (`e.shiftId === null`). Нужно явное утверждение владельца; альтернатива — общее правило + требование к серверу
+# всегда сериализовать null (тогда касса работает, но схема этого не гарантирует).
+components:
+  schemas:
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Персонал, вход по PIN
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminStaffRole:
+      type: string
+      enum:
+        - owner
+        - cashier
+      description: >-
+        Роль сотрудника кассы. owner — владелец: все разделы, настройки клуба, тарифы, зал, отчёты, контроль кассиров;
+        cashier — кассир: касса, смена, клиенты (без чёрного списка), приёмка товара, тикеты ремонта. Какие маршруты
+        требуют какую роль — `x-roles` операций.
+      x-source:
+        - apps/admin/src/api.ts:156
+        - tools/MockServer/src/club.ts:33
+        - tools/MockServer/src/routes/club.ts:63
+
+    AdminStaffMember:
+      type: object
+      description: Сотрудник кассы (без PIN).
+      required:
+        - id
+        - name
+        - role
+        - active
+      properties:
+        id:
+          type: string
+          description: >-
+            Идентификатор сотрудника, непрозрачная строка (в моке у демо-записей `owner`, `cashier-1`, у новых — UUID).
+        name:
+          type: string
+          maxLength: 64
+          description: Имя для экрана и журнала.
+        role:
+          $ref: '#/components/schemas/AdminStaffRole'
+        active:
+          type: boolean
+          description: >-
+            Может входить по PIN. У отключённого сотрудника все выданные токены перестают действовать (мок проверяет
+            `active` на каждом запросе). В ответах `POST /admin/login` и `GET /admin/me` мок поле не отдаёт — сервер
+            отдаёт `true`.
+      x-source:
+        - apps/admin/src/api.ts:157
+        - tools/MockServer/src/club.ts:35
+        - tools/MockServer/src/routes/club.ts:144
+        - tools/MockServer/src/routes/club.ts:154
+
+    AdminLoginRequest:
+      type: object
+      description: Вход персонала по PIN.
+      required:
+        - pin
+      properties:
+        pin:
+          type: string
+          minLength: 1
+          maxLength: 12
+          description: PIN активного сотрудника (у сотрудников — 4–8 цифр).
+      x-source:
+        - apps/admin/src/api.ts:502
+        - tools/MockServer/src/routes/club.ts:137
+
+    AdminLoginResponse:
+      type: object
+      description: Токен персонала, сотрудник и открытая смена клуба (если есть).
+      required:
+        - token
+        - staff
+        - shift
+      properties:
+        token:
+          type: string
+          description: >-
+            Непрозрачный токен персонала (мок: `st_<32 hex>`), далее `Authorization: Bearer <token>` на `/admin/*`.
+            В моке срока действия нет, отзывается отключением сотрудника.
+        staff:
+          $ref: '#/components/schemas/AdminStaffMember'
+        shift:
+          oneOf:
+            - $ref: '#/components/schemas/AdminShift'
+            - type: 'null'
+          description: Открытая смена клуба (одна на клуб, не обязательно этого сотрудника); null — смена не открыта.
+      x-source:
+        - apps/admin/src/api.ts:502
+        - tools/MockServer/src/routes/club.ts:144
+
+    AdminMeResponse:
+      type: object
+      description: Текущий сотрудник по токену и открытая смена клуба.
+      required:
+        - staff
+        - shift
+      properties:
+        staff:
+          $ref: '#/components/schemas/AdminStaffMember'
+        shift:
+          oneOf:
+            - $ref: '#/components/schemas/AdminShift'
+            - type: 'null'
+          description: Открытая смена клуба; null — не открыта.
+      x-source:
+        - apps/admin/src/api.ts:504
+        - tools/MockServer/src/routes/club.ts:149
+
+    AdminStaffList:
+      type: object
+      description: Все сотрудники клуба, включая отключённых (PIN не отдаётся).
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminStaffMember'
+      x-source:
+        - apps/admin/src/api.ts:506
+        - tools/MockServer/src/routes/club.ts:154
+
+    AdminStaffCreateRequest:
+      type: object
+      description: Новый сотрудник.
+      required:
+        - name
+        - role
+        - pin
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Имя.
+        role:
+          $ref: '#/components/schemas/AdminStaffRole'
+          description: Роль; мок любое значение, кроме `owner`, трактует как `cashier`.
+        pin:
+          type: string
+          pattern: '^\d{4,8}$'
+          description: PIN, 4–8 цифр, уникальный в клубе (иначе 400 `validation`, `reason` = `digits4to8` | `taken`).
+      x-source:
+        - apps/admin/src/api.ts:507
+        - tools/MockServer/src/routes/club.ts:157
+
+    AdminStaffCreateResponse:
+      type: object
+      description: Идентификатор созданного сотрудника.
+      required:
+        - id
+      properties:
+        id:
+          type: string
+          description: Идентификатор сотрудника.
+      x-source:
+        - apps/admin/src/api.ts:507
+        - tools/MockServer/src/routes/club.ts:167
+
+    AdminStaffUpdateRequest:
+      type: object
+      description: Частичное изменение сотрудника; отсутствующие поля не меняются.
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Новое имя.
+        active:
+          type: boolean
+          description: Включить/отключить; отключить самого себя нельзя (400 `validation`, `reason = self`).
+        pin:
+          type: string
+          pattern: '^\d{4,8}$'
+          description: >-
+            Новый PIN, 4–8 цифр (иначе 400 `reason = digits4to8`). Уникальность при изменении — открытый вопрос
+            (см. `x-open-question` у `PATCH /admin/staff/{id}`).
+      x-source:
+        - apps/admin/src/api.ts:509
+        - tools/MockServer/src/routes/club.ts:170
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Смены
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminShiftTotals:
+      type: object
+      description: >-
+        Движение денег за период (X-отчёт открытой смены, Z-отчёт закрытой), минимальные единицы (тийины). Считается по
+        журналу кошельков всех клиентов с `openedAt` до `closedAt` (или до сейчас).
+      required:
+        - topUpCash
+        - topUpOther
+        - sessions
+        - shop
+        - refunds
+        - bonuses
+        - count
+      properties:
+        topUpCash:
+          type: integer
+          format: int64
+          description: Пополнения наличными (в моке — пополнения с `method = cash`).
+        topUpOther:
+          type: integer
+          format: int64
+          description: Прочие пополнения (карта, онлайн).
+        sessions:
+          type: integer
+          format: int64
+          description: Списано за время (положительное число).
+        shop:
+          type: integer
+          format: int64
+          description: Покупки в магазине (положительное число).
+        refunds:
+          type: integer
+          format: int64
+          description: Возвраты.
+        bonuses:
+          type: integer
+          format: int64
+          description: Начислено бонусов.
+        count:
+          type: integer
+          format: int32
+          description: Число операций.
+      x-source:
+        - apps/admin/src/api.ts:164
+        - tools/MockServer/src/club.ts:43
+        - tools/MockServer/src/club.ts:722
+
+    AdminShift:
+      type: object
+      description: Кассовая смена. Открыта не более одной смены на клуб.
+      required:
+        - id
+        - staffId
+        - staffName
+        - openedAt
+        - closedAt
+        - openingCash
+        - closingCash
+        - totals
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор смены.
+        staffId:
+          type: string
+          description: Кто открыл.
+        staffName:
+          type: string
+          description: Имя открывшего на момент открытия.
+        openedAt:
+          type: string
+          format: date-time
+          description: Время открытия.
+        closedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Время закрытия; null — смена открыта.
+        openingCash:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Наличные в кассе при открытии, тийины.
+        closingCash:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          description: Пересчитанные наличные при закрытии, тийины; null — смена открыта.
+        totals:
+          oneOf:
+            - $ref: '#/components/schemas/AdminShiftTotals'
+            - type: 'null'
+          description: Z-отчёт; null — смена открыта (X-отчёт — в `GET /admin/shift`, поле `x`).
+      x-source:
+        - apps/admin/src/api.ts:173
+        - tools/MockServer/src/club.ts:53
+        - tools/MockServer/src/routes/club.ts:206
+
+    AdminShiftState:
+      type: object
+      description: Текущая смена, её X-отчёт и история закрытых смен.
+      required:
+        - shift
+        - x
+        - history
+      properties:
+        shift:
+          oneOf:
+            - $ref: '#/components/schemas/AdminShift'
+            - type: 'null'
+          description: Открытая смена; null — нет.
+        x:
+          oneOf:
+            - $ref: '#/components/schemas/AdminShiftTotals'
+            - type: 'null'
+          description: X-отчёт открытой смены (с открытия до сейчас); null — смены нет.
+        history:
+          type: array
+          maxItems: 30
+          items:
+            $ref: '#/components/schemas/AdminShift'
+          description: Последние закрытые смены, новые первыми (мок — до 30).
+      x-source:
+        - apps/admin/src/api.ts:512
+        - tools/MockServer/src/routes/club.ts:190
+
+    AdminShiftOpenRequest:
+      type: object
+      description: Открытие смены.
+      required:
+        - openingCash
+      properties:
+        openingCash:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000000000
+          description: Наличные в кассе, тийины.
+      x-source:
+        - apps/admin/src/api.ts:513
+        - tools/MockServer/src/routes/club.ts:212
+
+    AdminShiftOpenResponse:
+      type: object
+      description: Открытая смена.
+      required:
+        - shift
+      properties:
+        shift:
+          $ref: '#/components/schemas/AdminShift'
+      x-source:
+        - apps/admin/src/api.ts:513
+        - tools/MockServer/src/routes/club.ts:219
+
+    AdminShiftCloseRequest:
+      type: object
+      description: Закрытие смены с пересчётом кассы.
+      required:
+        - closingCash
+      properties:
+        closingCash:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 10000000000
+          description: Пересчитанные наличные, тийины.
+      x-source:
+        - apps/admin/src/api.ts:514
+        - tools/MockServer/src/routes/club.ts:227
+
+    AdminShiftCloseResponse:
+      type: object
+      description: Закрытая смена с Z-отчётом и ожидаемой суммой в кассе.
+      required:
+        - shift
+        - expectedCash
+      properties:
+        shift:
+          $ref: '#/components/schemas/AdminShift'
+        expectedCash:
+          type: integer
+          format: int64
+          description: Ожидалось наличных = openingCash + totals.topUpCash, тийины. Недостача — флаг контроля `shortfall`.
+      x-source:
+        - apps/admin/src/api.ts:514
+        - tools/MockServer/src/routes/club.ts:230
+        - tools/MockServer/src/routes/club.ts:244
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Касса: карта зала, сеансы, пополнение, команды ПК
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminZone:
+      type: object
+      description: Зона зала.
+      required:
+        - name
+        - color
+      properties:
+        name:
+          type: string
+          description: Имя зоны; совпадает с `Pc.zone` и `Tariff.zones` (сравнение без учёта регистра).
+        color:
+          type: string
+          description: Цвет на карте, `#RRGGBB`.
+          examples:
+            - '#22C55E'
+      x-source:
+        - apps/admin/src/api.ts:184
+        - tools/MockServer/src/club.ts:148
+
+    AdminSeatUser:
+      type: object
+      description: Игрок на месте.
+      required:
+        - id
+        - displayName
+        - role
+        - balance
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор пользователя.
+        displayName:
+          type: string
+          description: Отображаемое имя.
+        role:
+          $ref: '#/components/schemas/UserRole'
+          description: Роль пользователя (касса типизирует строкой).
+        balance:
+          $ref: '#/components/schemas/Money'
+          description: Основной баланс.
+      x-source:
+        - apps/admin/src/api.ts:43
+        - tools/MockServer/src/routes/admin.ts:55
+        - tools/MockServer/src/routes/admin.ts:65
+
+    AdminMember:
+      description: Клиент в списке выбора на кассе (игрок + логин).
+      allOf:
+        - $ref: '#/components/schemas/AdminSeatUser'
+        - type: object
+          required:
+            - username
+          properties:
+            username:
+              type: string
+              description: Логин.
+      x-source:
+        - apps/admin/src/api.ts:62
+        - tools/MockServer/src/routes/admin.ts:69
+
+    AdminSeat:
+      type: object
+      description: Одно место на карте зала — ПК, его открытая сессия и игрок.
+      required:
+        - pc
+        - session
+        - user
+      properties:
+        pc:
+          $ref: '#/components/schemas/Pc'
+          description: >-
+            ПК (мок отдаёт полный `Pc`, `hwid = null`; касса читает `id`, `name`, `zone`, `number`, `status`).
+        session:
+          oneOf:
+            - $ref: '#/components/schemas/Session'
+            - type: 'null'
+          description: Открытая сессия на ПК; null — нет.
+        user:
+          oneOf:
+            - $ref: '#/components/schemas/AdminSeatUser'
+            - type: 'null'
+          description: Игрок открытой сессии; null — нет сессии.
+      x-source:
+        - apps/admin/src/api.ts:50
+        - tools/MockServer/src/routes/admin.ts:52
+        - tools/MockServer/src/routes/admin.ts:58
+
+    AdminOccupancy:
+      type: object
+      description: Загрузка зала.
+      required:
+        - free
+        - total
+      properties:
+        free:
+          type: integer
+          format: int32
+          description: Мест со статусом free.
+        total:
+          type: integer
+          format: int32
+          description: Всего мест.
+      x-source:
+        - apps/admin/src/api.ts:68
+        - tools/MockServer/src/routes/admin.ts:88
+
+    AdminRepairMark:
+      type: object
+      description: ПК с незакрытым тикетом ремонта и его худшая серьёзность (метка на карте).
+      required:
+        - pcId
+        - severity
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        severity:
+          $ref: '#/components/schemas/AdminHealthSeverity'
+      x-source:
+        - apps/admin/src/api.ts:74
+        - tools/MockServer/src/health.ts:315
+
+    AdminOverview:
+      type: object
+      description: Всё, что рисует экран кассы (касса опрашивает каждые 2 с).
+      required:
+        - at
+        - club
+        - seats
+        - tariffs
+        - users
+        - zones
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: Время снимка.
+        club:
+          $ref: '#/components/schemas/AdminOccupancy'
+        seats:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminSeat'
+          description: Все ПК клуба.
+        tariffs:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tariff'
+          description: Все тарифы.
+        users:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminMember'
+          description: Клиенты для выбора (без гостей, персонала и чёрного списка).
+        zones:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminZone'
+          description: Зоны зала.
+        repairs:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminRepairMark'
+          description: ПК с открытыми тикетами ремонта (касса считает поле необязательным; мок отдаёт всегда).
+      x-source:
+        - apps/admin/src/api.ts:66
+        - tools/MockServer/src/routes/admin.ts:83
+
+    AdminOpenSessionRequest:
+      type: object
+      description: >-
+        Открыть предоплаченную сессию клиенту на месте. Цена — по правилам клуба (`POST /admin/quote`); для пакетного
+        тарифа минуты берутся из тарифа, `minutes` игнорируется.
+      required:
+        - pcId
+        - userId
+        - tariffId
+        - minutes
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        userId:
+          type: string
+          format: uuid
+          description: Клиент.
+        tariffId:
+          type: string
+          format: uuid
+          description: Тариф.
+        minutes:
+          type: integer
+          format: int32
+          minimum: 5
+          maximum: 1440
+          description: Минуты.
+      x-source:
+        - apps/admin/src/api.ts:132
+        - tools/MockServer/src/routes/admin.ts:101
+
+    AdminExtendSessionRequest:
+      type: object
+      description: >-
+        Добавить оплаченные минуты к открытой предоплаченной сессии — по месту (`pcId`, так шлёт касса) или по
+        `sessionId` (мок; при наличии имеет приоритет).
+      required:
+        - minutes
+      anyOf:
+        - required:
+            - pcId
+        - required:
+            - sessionId
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК, на котором открыта сессия.
+        sessionId:
+          type: string
+          format: uuid
+          description: Сессия (альтернатива `pcId`; касса не шлёт).
+        minutes:
+          type: integer
+          format: int32
+          minimum: 5
+          maximum: 1440
+          description: Сколько минут добавить.
+        tariffId:
+          type: string
+          format: uuid
+          description: Тариф продления; по умолчанию — тариф сессии. Становится тарифом сессии.
+      x-source:
+        - apps/admin/src/api.ts:134
+        - tools/MockServer/src/routes/admin.ts:74
+        - tools/MockServer/src/routes/admin.ts:169
+
+    AdminEndSessionRequest:
+      type: object
+      description: Завершить сессию с кассы — по месту (`pcId`) или по `sessionId` (мок; приоритетнее).
+      anyOf:
+        - required:
+            - pcId
+        - required:
+            - sessionId
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК, на котором открыта сессия.
+        sessionId:
+          type: string
+          format: uuid
+          description: Сессия (альтернатива `pcId`; касса не шлёт).
+      x-source:
+        - apps/admin/src/api.ts:136
+        - tools/MockServer/src/routes/admin.ts:74
+
+    AdminSessionResult:
+      type: object
+      description: >-
+        Итог действия кассы над сессией. Открытие/продление: `session`, `charged`, `balance`; завершение: `session`
+        (state = ended), `charged` (постоплата), `refunded` (возврат неиспользованного предоплаченного времени).
+      required:
+        - session
+        - charged
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+        charged:
+          $ref: '#/components/schemas/Money'
+          description: Списано этим действием.
+        balance:
+          $ref: '#/components/schemas/Money'
+          description: Основной баланс клиента после списания (открытие/продление).
+        refunded:
+          $ref: '#/components/schemas/Money'
+          description: Возвращено (завершение); касса показывает его, если amount > 0.
+      x-source:
+        - apps/admin/src/api.ts:123
+        - tools/MockServer/src/routes/admin.ts:161
+        - tools/MockServer/src/routes/admin.ts:193
+        - tools/MockServer/src/routes/admin.ts:211
+
+    AdminTopUpRequest:
+      type: object
+      description: Пополнение кошелька клиента на кассе; бонус по шкале `bonusTiers` начисляется отдельной операцией.
+      required:
+        - userId
+        - amount
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Клиент.
+        amount:
+          type: integer
+          format: int64
+          minimum: 1
+          maximum: 100000000
+          description: Сумма, тийины.
+        method:
+          type: string
+          maxLength: 16
+          default: cash
+          examples:
+            - cash
+            - card
+          description: >-
+            Способ оплаты; `cash` попадает в `topUpCash` смены (ожидаемая наличность), остальное — в `topUpOther`.
+            Касса не шлёт (= cash).
+      x-source:
+        - apps/admin/src/api.ts:137
+        - tools/MockServer/src/routes/admin.ts:218
+        - tools/MockServer/src/routes/club.ts:796
+
+    AdminTopUpResponse:
+      type: object
+      description: Баланс после пополнения.
+      required:
+        - balance
+        - transaction
+      properties:
+        balance:
+          $ref: '#/components/schemas/Money'
+          description: Основной баланс после пополнения и бонуса.
+        transaction:
+          $ref: '#/components/schemas/Transaction'
+          description: Операция пополнения (`type = topUp`). Объявлена кассой; мок не отдаёт.
+        bonus:
+          $ref: '#/components/schemas/Money'
+          description: Начисленный бонус по шкале (0, если нет). Отдаёт мок; касса не объявляет.
+      x-source:
+        - apps/admin/src/api.ts:141
+        - tools/MockServer/src/routes/admin.ts:229
+
+    AdminPcCommandKind:
+      type: string
+      enum:
+        - message
+        - lock
+        - unlock
+        - reboot
+        - shutdown
+      description: >-
+        Команда с кассы и соответствующая `ServerCommand` агенту. message — `message` {from = "Администратор"
+        (фиксированная строка; имя сотрудника не передаётся), text, level = info, requiresAck = true}; lock — `lock`
+        {reason = staff, message = text}; unlock — `unlock`; reboot/shutdown — `reboot`/`shutdown` {delaySec = 5,
+        force = false, message = text}.
+      x-source:
+        - apps/admin/src/api.ts:147
+        - tools/MockServer/src/routes/admin.ts:45
+        - tools/MockServer/src/routes/admin.ts:242
+
+    AdminPcCommandRequest:
+      type: object
+      description: Команда ПК с кассы.
+      required:
+        - kind
+      properties:
+        kind:
+          $ref: '#/components/schemas/AdminPcCommandKind'
+        text:
+          type: string
+          maxLength: 500
+          description: Текст сообщения (обязателен для `message`, иначе 400 `reason = required`) или подпись экрана.
+      x-source:
+        - apps/admin/src/api.ts:147
+        - tools/MockServer/src/routes/admin.ts:239
+
+    AdminPcCommandResponse:
+      type: object
+      description: >-
+        Подтверждение агента. Сервер ждёт ack до 30 с; ПК не на связи — `ok = false`, `error.code = agentOffline`
+        (команда остаётся в очереди); нет ack за 30 с — `ok = false`, `error.code = timeout`. Это ответ 200, не ошибка.
+      required:
+        - ack
+      properties:
+        ack:
+          $ref: '#/components/schemas/CommandAck'
+      x-source:
+        - apps/admin/src/api.ts:148
+        - tools/MockServer/src/routes/admin.ts:252
+        - tools/MockServer/src/ws.ts:153
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Документ настроек клуба (GET/PATCH /admin/club)
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminBranding:
+      type: object
+      description: Брендинг экрана игрока (уходит в `AgentServerConfig.shell.club`).
+      required:
+        - clubName
+        - accent
+        - logoUrl
+        - wallpaperUrl
+      properties:
+        clubName:
+          type: string
+          description: Название клуба.
+        accent:
+          type: string
+          description: Акцентный цвет `#RRGGBB`.
+        logoUrl:
+          type:
+            - string
+            - 'null'
+          description: URL логотипа; null — нет.
+        wallpaperUrl:
+          type:
+            - string
+            - 'null'
+          description: URL обоев; null — нет.
+      x-source:
+        - apps/admin/src/api.ts:270
+        - tools/MockServer/src/club.ts:234
+        - tools/MockServer/src/db.ts:641
+
+    AdminPricing:
+      type: object
+      description: Цена дня — процент от базовой цены тарифа.
+      required:
+        - weekdayPct
+        - holidays
+        - holidayPct
+      properties:
+        weekdayPct:
+          type: array
+          minItems: 7
+          maxItems: 7
+          items:
+            type: integer
+            format: int32
+            minimum: 0
+          description: Процент по дням недели, индекс 0 = воскресенье … 6 = суббота (100 = без изменения).
+        holidays:
+          type: array
+          items:
+            type: string
+            format: date
+          description: Праздничные даты `YYYY-MM-DD` (мок сверяет с UTC-датой).
+        holidayPct:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Процент в праздник (вместо процента дня недели).
+      x-source:
+        - apps/admin/src/api.ts:273
+        - tools/MockServer/src/club.ts:238
+        - tools/MockServer/src/club.ts:521
+
+    AdminClientGroup:
+      type: object
+      description: Группа клиентов со скидкой.
+      required:
+        - id
+        - name
+        - discountPct
+        - color
+      properties:
+        id:
+          type: string
+          description: Идентификатор (создаёт касса, 8 символов base36; у демо-групп мока — слаги `guest`, `regular`…).
+        name:
+          type: string
+          description: Название.
+        discountPct:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Скидка на время, %.
+        color:
+          type: string
+          description: Цвет `#RRGGBB`.
+      x-source:
+        - apps/admin/src/api.ts:188
+        - tools/MockServer/src/club.ts:64
+        - apps/admin/src/pages/PricingPage.tsx:61
+
+    AdminBonusTier:
+      type: object
+      description: Ступень бонуса за пополнение (действует наибольшая подходящая).
+      required:
+        - minAmount
+        - bonusPct
+      properties:
+        minAmount:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Минимальное пополнение, тийины.
+        bonusPct:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Бонус, % от суммы (округление до 100 тийинов).
+      x-source:
+        - apps/admin/src/api.ts:194
+        - tools/MockServer/src/club.ts:80
+        - tools/MockServer/src/club.ts:540
+
+    AdminPromoCodeKind:
+      type: string
+      enum:
+        - bonus
+        - discountPct
+      description: >-
+        bonus — начисляет `value` тийинов на баланс (`POST /admin/promo/redeem`); discountPct — скидка `value` % при
+        оплате (в моке путь применения не реализован: redeem отвечает 400 `reason = discountAtCheckout`).
+      x-source:
+        - apps/admin/src/api.ts:200
+        - tools/MockServer/src/club.ts:88
+
+    AdminPromoCode:
+      type: object
+      description: Промокод клуба.
+      required:
+        - code
+        - kind
+        - value
+        - usesLeft
+        - expiresAt
+        - used
+      properties:
+        code:
+          type: string
+          description: Код (сравнение без учёта регистра).
+        kind:
+          $ref: '#/components/schemas/AdminPromoCodeKind'
+        value:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Бонус в тийинах или процент скидки.
+        usesLeft:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          minimum: 0
+          description: Осталось применений; null — без ограничения.
+        expiresAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Срок действия (касса ставит `<дата>T23:59:59.999Z`); null — бессрочно.
+        used:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Сколько раз применён.
+      x-source:
+        - apps/admin/src/api.ts:198
+        - tools/MockServer/src/club.ts:86
+        - apps/admin/src/pages/PricingPage.tsx:809
+
+    AdminHappyHour:
+      type: object
+      description: Счастливые часы — скидка по времени суток.
+      required:
+        - id
+        - name
+        - days
+        - from
+        - to
+        - discountPct
+        - zones
+      properties:
+        id:
+          type: string
+          description: Идентификатор (создаёт касса, 8 символов base36).
+        name:
+          type: string
+          description: Название (показывается как причина скидки).
+        days:
+          type: array
+          items:
+            type: integer
+            format: int32
+            minimum: 0
+            maximum: 6
+          description: Дни недели, 0 = воскресенье … 6 = суббота (не `Weekday` тарифов).
+        from:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          description: Начало HH:mm (включительно), время клуба.
+        to:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          description: Конец HH:mm (исключительно); to < from — через полночь.
+        discountPct:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Скидка, %.
+        zones:
+          type: array
+          items:
+            type: string
+          description: Зоны; пустой — все.
+      x-source:
+        - apps/admin/src/api.ts:206
+        - tools/MockServer/src/club.ts:96
+        - tools/MockServer/src/club.ts:485
+
+    AdminLoyaltyLevel:
+      type: object
+      description: Уровень лояльности по сумме трат за всё время.
+      required:
+        - level
+        - name
+        - minSpent
+        - discountPct
+      properties:
+        level:
+          type: integer
+          format: int32
+          minimum: 1
+          description: Номер уровня.
+        name:
+          type: string
+          description: Название.
+        minSpent:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Порог трат (время + магазин), тийины.
+        discountPct:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Скидка на время, %.
+      x-source:
+        - apps/admin/src/api.ts:215
+        - tools/MockServer/src/club.ts:107
+
+    AdminLimits:
+      type: object
+      description: Ограничения для несовершеннолетних.
+      required:
+        - minorAge
+        - minorCurfew
+      properties:
+        minorAge:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Возраст совершеннолетия (по `birthYear` клиента).
+        minorCurfew:
+          type: string
+          pattern: '^\d{2}:\d{2}$'
+          description: С этого времени (HH:mm) до 06:00 несовершеннолетним нельзя открыть сессию (403 `policyDenied`, `rule = minorCurfew`).
+      x-source:
+        - apps/admin/src/api.ts:279
+        - tools/MockServer/src/club.ts:250
+        - tools/MockServer/src/club.ts:470
+
+    AdminCatalogSettings:
+      type: object
+      description: Каталог игр экрана игрока (применяется к `GET /games` агента).
+      required:
+        - order
+        - hidden
+        - featured
+      properties:
+        order:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Порядок игр (id); не упомянутые идут следом в порядке сервера.
+        hidden:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Скрытые игры (не отдаются агенту).
+        featured:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: Рекомендуемые игры.
+      x-source:
+        - apps/admin/src/api.ts:280
+        - tools/MockServer/src/club.ts:251
+        - tools/MockServer/src/routes/games.ts:63
+
+    AdminBanner:
+      type: object
+      description: Баннер экрана игрока; живые баннеры уходят в `AgentServerConfig.shell.club.banners`.
+      required:
+        - id
+        - title
+        - imageUrl
+        - from
+        - to
+        - enabled
+      properties:
+        id:
+          type: string
+          description: Идентификатор (касса создаёт UUID).
+        title:
+          type: string
+          description: Заголовок.
+        imageUrl:
+          type: string
+          description: URL картинки; пустой — баннер не показывается.
+        from:
+          type:
+            - string
+            - 'null'
+          format: date
+          description: Показ с даты (включительно); null — сразу.
+        to:
+          type:
+            - string
+            - 'null'
+          format: date
+          description: Показ по дату (включительно); null — бессрочно.
+        enabled:
+          type: boolean
+          description: Включён.
+      x-source:
+        - apps/admin/src/api.ts:242
+        - tools/MockServer/src/club.ts:139
+        - tools/MockServer/src/db.ts:645
+        - apps/admin/src/pages/ClubPage.tsx:208
+
+    AdminRulesText:
+      type: object
+      description: Правила клуба на трёх языках (уходят в `AgentServerConfig.shell.club.rules`).
+      required:
+        - ru
+        - uz
+        - en
+      properties:
+        ru:
+          type: string
+          description: Русский.
+        uz:
+          type: string
+          description: Узбекский.
+        en:
+          type: string
+          description: Английский.
+      x-source:
+        - apps/admin/src/api.ts:282
+        - tools/MockServer/src/club.ts:253
+
+    AdminStockSettings:
+      type: object
+      description: Пороги склада.
+      required:
+        - lowAt
+      properties:
+        lowAt:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Остаток, при котором товар считается заканчивающимся (событие `lowStock`).
+      x-source:
+        - apps/admin/src/api.ts:283
+        - tools/MockServer/src/club.ts:254
+
+    AdminRuleTriggerThreshold:
+      type: object
+      description: >-
+        Условие с порогом. minutesLeft — у сессии осталось ≤ value минут (один раз на сессию); pcIdleMinutes — ПК
+        свободен ≥ value минут; visitCount — каждый value-й визит клиента (при открытии сессии); topupAtLeast —
+        пополнение ≥ value тийинов.
+      required:
+        - kind
+        - value
+      properties:
+        kind:
+          type: string
+          enum:
+            - minutesLeft
+            - pcIdleMinutes
+            - visitCount
+            - topupAtLeast
+        value:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Порог (минуты, визиты или тийины — по kind).
+      x-source:
+        - apps/admin/src/api.ts:221
+        - tools/MockServer/src/club.ts:115
+        - tools/MockServer/src/club.ts:641
+        - tools/MockServer/src/club.ts:685
+
+    AdminRuleTriggerSessionStarted:
+      type: object
+      description: Условие «открыта сессия».
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum:
+            - sessionStarted
+      x-source:
+        - apps/admin/src/api.ts:226
+        - tools/MockServer/src/club.ts:120
+
+    AdminRuleTrigger:
+      description: Условие правила автоматизации «если».
+      oneOf:
+        - $ref: '#/components/schemas/AdminRuleTriggerThreshold'
+        - $ref: '#/components/schemas/AdminRuleTriggerSessionStarted'
+      discriminator:
+        propertyName: kind
+        mapping:
+          minutesLeft: '#/components/schemas/AdminRuleTriggerThreshold'
+          pcIdleMinutes: '#/components/schemas/AdminRuleTriggerThreshold'
+          visitCount: '#/components/schemas/AdminRuleTriggerThreshold'
+          topupAtLeast: '#/components/schemas/AdminRuleTriggerThreshold'
+          sessionStarted: '#/components/schemas/AdminRuleTriggerSessionStarted'
+      x-source:
+        - apps/admin/src/api.ts:221
+        - tools/MockServer/src/club.ts:115
+
+    AdminRuleActionText:
+      type: object
+      description: >-
+        message — сообщение на экран ПК (`ServerCommand message`, requiresAck = false); notifyOwner — уведомление
+        владельцу событием `ruleFired` (Telegram запрещён, поэтому доходит только через вебхуки, подписанные на ruleFired).
+      required:
+        - kind
+        - text
+      properties:
+        kind:
+          type: string
+          enum:
+            - message
+            - notifyOwner
+        text:
+          type: string
+          description: Текст.
+      x-source:
+        - apps/admin/src/api.ts:228
+        - tools/MockServer/src/club.ts:122
+        - tools/MockServer/src/club.ts:600
+
+    AdminRuleActionBonus:
+      type: object
+      description: Начислить клиенту бонус (операция `bonus`).
+      required:
+        - kind
+        - amount
+      properties:
+        kind:
+          type: string
+          enum:
+            - bonus
+        amount:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Сумма, тийины.
+      x-source:
+        - apps/admin/src/api.ts:229
+        - tools/MockServer/src/club.ts:610
+
+    AdminRuleActionPc:
+      type: object
+      description: >-
+        lockPc — `ServerCommand lock` {reason = staff}; shutdownPc — `ServerCommand shutdown` {delaySec = 30, force = false}.
+      required:
+        - kind
+      properties:
+        kind:
+          type: string
+          enum:
+            - lockPc
+            - shutdownPc
+      x-source:
+        - apps/admin/src/api.ts:230
+        - tools/MockServer/src/club.ts:616
+
+    AdminRuleAction:
+      description: Действие правила автоматизации «то».
+      oneOf:
+        - $ref: '#/components/schemas/AdminRuleActionText'
+        - $ref: '#/components/schemas/AdminRuleActionBonus'
+        - $ref: '#/components/schemas/AdminRuleActionPc'
+      discriminator:
+        propertyName: kind
+        mapping:
+          message: '#/components/schemas/AdminRuleActionText'
+          notifyOwner: '#/components/schemas/AdminRuleActionText'
+          bonus: '#/components/schemas/AdminRuleActionBonus'
+          lockPc: '#/components/schemas/AdminRuleActionPc'
+          shutdownPc: '#/components/schemas/AdminRuleActionPc'
+      x-source:
+        - apps/admin/src/api.ts:227
+        - tools/MockServer/src/club.ts:122
+
+    AdminAutomationRule:
+      type: object
+      description: Правило «если → то». Каждое срабатывание также порождает событие `ruleFired`.
+      required:
+        - id
+        - name
+        - enabled
+        - trigger
+        - action
+        - fired
+        - lastFiredAt
+      properties:
+        id:
+          type: string
+          description: Идентификатор (касса создаёт UUID; сервер присваивает, если в PATCH пришёл пустой).
+        name:
+          type: string
+          description: Название.
+        enabled:
+          type: boolean
+          description: Включено.
+        trigger:
+          $ref: '#/components/schemas/AdminRuleTrigger'
+        action:
+          $ref: '#/components/schemas/AdminRuleAction'
+        fired:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Сколько раз сработало (ведёт сервер).
+        lastFiredAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Последнее срабатывание; null — не срабатывало.
+      x-source:
+        - apps/admin/src/api.ts:233
+        - tools/MockServer/src/club.ts:129
+        - tools/MockServer/src/routes/club.ts:315
+
+    AdminAutomationRuleInput:
+      type: object
+      description: >-
+        Правило в теле `PATCH /admin/club` (массив `automation` целиком заменяет сохранённый). Касса шлёт правило целиком,
+        как `AdminAutomationRule`; служебные поля необязательны: пустой или отсутствующий `id` — сервер присваивает UUID,
+        отсутствующие `fired`/`lastFiredAt` — 0/null (присланные значения сохраняются как есть).
+      required:
+        - name
+        - enabled
+        - trigger
+        - action
+      properties:
+        id:
+          type: string
+          description: Идентификатор; пустой или отсутствует — сервер присваивает UUID.
+        name:
+          type: string
+          description: Название.
+        enabled:
+          type: boolean
+          description: Включено.
+        trigger:
+          $ref: '#/components/schemas/AdminRuleTrigger'
+        action:
+          $ref: '#/components/schemas/AdminRuleAction'
+        fired:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Счётчик срабатываний; отсутствует — 0.
+        lastFiredAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Последнее срабатывание; отсутствует — null.
+      x-discrepancy: >-
+        Мок (tools/MockServer/src/routes/club.ts:315-321) поля `name`/`enabled`/`trigger`/`action` не проверяет и
+        сохраняет правило как есть, но движок правил читает `r.enabled`, `r.trigger.kind` (tools/MockServer/src/club.ts:646,
+        647, 699) и `rule.action`/`rule.name` (club.ts:596, 612) — правило без них ломает обработку. Касса шлёт их всегда
+        (apps/admin/src/api.ts:233), поэтому в контракте они обязательны.
+      x-source:
+        - apps/admin/src/api.ts:233
+        - tools/MockServer/src/routes/club.ts:315
+
+    AdminClubEvent:
+      type: string
+      enum:
+        - shiftClosed
+        - pcOffline
+        - bigTopup
+        - lowStock
+        - ruleFired
+        - sessionOpened
+        - suspicious
+        - hardware
+      description: >-
+        Событие клуба для вебхуков: shiftClosed — смена закрыта; pcOffline — ПК пропал из сети; bigTopup — пополнение
+        ≥ `notifications.bigTopupAt`; lowStock — остаток ≤ `stock.lowAt`; ruleFired — сработало правило автоматизации;
+        sessionOpened — открыта сессия; suspicious — подозрительная операция кассира; hardware — открыт тикет ремонта.
+      x-source:
+        - apps/admin/src/api.ts:250
+        - tools/MockServer/src/club.ts:155
+        - tools/MockServer/src/club.ts:165
+
+    AdminNotifications:
+      type: object
+      description: >-
+        Уведомления владельцу. В моке — Telegram-бот; Telegram в продукте запрещён, поэтому `telegramBotToken`,
+        `telegramChatId` и `events` сервер не хранит и не использует: на входе игнорирует, в ответе отдаёт `""` и все
+        ключи `events` = false (касса объявляет поля обязательными). Работает только `bigTopupAt`.
+      required:
+        - telegramBotToken
+        - telegramChatId
+        - events
+        - bigTopupAt
+      properties:
+        telegramBotToken:
+          type: string
+          x-prohibited: telegram
+          description: >-
+            Токен Telegram-бота. Запрещено: всегда `""`. (Мок хранит, в GET отдаёт `••••`, а `••••` в PATCH сохраняет
+            прежний токен.)
+        telegramChatId:
+          type: string
+          x-prohibited: telegram
+          description: Chat id Telegram. Запрещено — всегда `""`.
+        events:
+          type: object
+          propertyNames:
+            $ref: '#/components/schemas/AdminClubEvent'
+          additionalProperties:
+            type: boolean
+          x-prohibited: telegram
+          description: >-
+            Какие события слать в Telegram, ключи — `AdminClubEvent` (в моке гейтят только отправку в Telegram; вебхуки
+            подписываются своими `events`). Запрещено — сервер отдаёт все ключи = false.
+        bigTopupAt:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Порог «крупного пополнения», тийины (событие `bigTopup` и флаг контроля `bigCash`).
+      x-source:
+        - apps/admin/src/api.ts:285
+        - tools/MockServer/src/club.ts:256
+        - tools/MockServer/src/club.ts:561
+        - tools/MockServer/src/routes/club.ts:268
+        - tools/MockServer/src/routes/club.ts:323
+
+    AdminNotificationsInput:
+      type: object
+      description: >-
+        `notifications` в теле `PATCH /admin/club`. Все поля необязательны. Telegram-поля сервер игнорирует (Telegram
+        запрещён); отсутствующий или нечисловой `bigTopupAt` оставляет прежнее значение. Касса шлёт объект целиком, как
+        `AdminNotifications`.
+      properties:
+        telegramBotToken:
+          type: string
+          x-prohibited: telegram
+          description: Игнорируется. (Мок сохраняет; `••••` — оставить прежний токен.)
+        telegramChatId:
+          type: string
+          x-prohibited: telegram
+          description: Игнорируется.
+        events:
+          type: object
+          propertyNames:
+            $ref: '#/components/schemas/AdminClubEvent'
+          additionalProperties:
+            type: boolean
+          x-prohibited: telegram
+          description: Игнорируется. (Мок сливает с сохранёнными ключами.)
+        bigTopupAt:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Новый порог «крупного пополнения», тийины; отсутствует — прежний. Мок знак не проверяет.
+      x-source:
+        - apps/admin/src/api.ts:285
+        - tools/MockServer/src/routes/club.ts:323
+
+    AdminWebhook:
+      type: object
+      description: >-
+        Исходящий вебхук: на подписанное событие сервер шлёт `POST url` с телом `AdminWebhookPayload` и заголовком
+        `X-ClubShell-Event: <event>`, затем обновляет `lastStatus`/`lastAt`.
+      required:
+        - id
+        - url
+        - events
+        - enabled
+        - lastStatus
+        - lastAt
+      properties:
+        id:
+          type: string
+          description: Идентификатор (касса создаёт UUID).
+        url:
+          type: string
+          format: uri
+          pattern: '^https?://\S+$'
+          description: Адрес получателя (http/https).
+        events:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/AdminClubEvent'
+          description: Подписанные события.
+        enabled:
+          type: boolean
+          description: Включён.
+        lastStatus:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: HTTP-статус последней доставки; 0 — сетевая ошибка; null — не доставлялся (ведёт сервер).
+        lastAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Время последней доставки; null — не было (ведёт сервер).
+      x-source:
+        - apps/admin/src/api.ts:259
+        - tools/MockServer/src/club.ts:223
+        - tools/MockServer/src/club.ts:571
+        - apps/admin/src/pages/IntegrationsPage.tsx:120
+
+    AdminWebhookPayload:
+      type: object
+      description: Тело исходящего вебхука (сервер -> внешний получатель), заголовок `X-ClubShell-Event` = `event`.
+      required:
+        - event
+        - at
+        - text
+        - data
+      properties:
+        event:
+          $ref: '#/components/schemas/AdminClubEvent'
+        at:
+          type: string
+          format: date-time
+          description: Время события.
+        text:
+          type: string
+          description: Человекочитаемый текст (по-русски).
+        data:
+          type: object
+          description: Данные события (`shiftId`, `pcId`, `userId`, `amount`, `ticketId`, `ruleId`… — по событию).
+      x-source:
+        - tools/MockServer/src/club.ts:573
+
+    AdminControlSettings:
+      type: object
+      description: >-
+        Пороги правил контроля кассиров (сохранённые значения всегда в указанных диапазонах; тело запроса —
+        `AdminControlSettingsPatch`).
+      required:
+        - earlyEndMinutes
+        - earlyEndsPerShift
+        - discountPct
+        - sameClientTopups
+        - shortfallFrom
+      properties:
+        earlyEndMinutes:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 120
+          description: Сессия, завершённая с возвратом в первые N минут, — «ранний возврат».
+        earlyEndsPerShift:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 50
+          description: Столько ранних возвратов одного кассира за смену — красный флаг.
+        discountPct:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+          description: Перевод клиента в группу со скидкой ≥ N % отмечается флагом.
+        sameClientTopups:
+          type: integer
+          format: int32
+          minimum: 2
+          maximum: 50
+          description: Столько пополнений одного клиента за смену — флаг.
+        shortfallFrom:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1000000000
+          description: Недостача при закрытии смены больше N тийинов — красный флаг.
+      x-source:
+        - apps/admin/src/api.ts:298
+        - tools/MockServer/src/club.ts:210
+        - tools/MockServer/src/routes/club.ts:301
+
+    AdminControlSettingsPatch:
+      type: object
+      description: >-
+        `control` в теле `PATCH /admin/club`. Все поля необязательны: отсутствующее значение остаётся прежним (мок так
+        же молча игнорирует нечисловые), дробное округляется до целого, выходящее за диапазон приводится к границам
+        `x-clamp` (не ошибка). Касса шлёт объект целиком и в границах.
+      properties:
+        earlyEndMinutes:
+          type: number
+          x-clamp:
+            minimum: 1
+            maximum: 120
+          description: Порог «раннего возврата», минуты.
+        earlyEndsPerShift:
+          type: number
+          x-clamp:
+            minimum: 1
+            maximum: 50
+          description: Ранних возвратов одного кассира за смену до красного флага.
+        discountPct:
+          type: number
+          x-clamp:
+            minimum: 1
+            maximum: 100
+          description: Скидка группы, %, с которой перевод клиента отмечается флагом.
+        sameClientTopups:
+          type: number
+          x-clamp:
+            minimum: 2
+            maximum: 50
+          description: Пополнений одного клиента за смену до флага.
+        shortfallFrom:
+          type: number
+          x-clamp:
+            minimum: 0
+            maximum: 1000000000
+          description: Недостача при закрытии смены, тийины, выше которой — красный флаг.
+      x-open-question: >-
+        Тела PATCH описаны толерантно, как в моке (приведение к границам и слияние с текущими значениями,
+        tools/MockServer/src/routes/club.ts:303-313, :693-703). Альтернатива — строгая валидация (полный объект и
+        400 `validation` вне диапазона); тогда касса не ломается (шлёт объекты целиком и в границах), но интеграции
+        с ключом `ck_` получат ошибки там, где мок принимал. Выбор за владельцем.
+      x-source:
+        - apps/admin/src/api.ts:298
+        - tools/MockServer/src/routes/club.ts:301
+
+    AdminClubSettings:
+      type: object
+      description: >-
+        Документ настроек клуба, который редактирует владелец. Читать может любой сотрудник (кассе нужны группы клиентов),
+        менять — владелец (`PATCH /admin/club`). Деньги — тийины.
+      required:
+        - branding
+        - features
+        - zones
+        - pricing
+        - groups
+        - bonusTiers
+        - promoCodes
+        - happyHours
+        - loyalty
+        - limits
+        - catalog
+        - banners
+        - rulesText
+        - stock
+        - automation
+        - notifications
+        - webhooks
+        - control
+        - apiKey
+        - events
+      properties:
+        branding:
+          $ref: '#/components/schemas/AdminBranding'
+        features:
+          $ref: '#/components/schemas/ShellFeatures'
+        zones:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminZone'
+        pricing:
+          $ref: '#/components/schemas/AdminPricing'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminClientGroup'
+        bonusTiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminBonusTier'
+        promoCodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminPromoCode'
+        happyHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminHappyHour'
+        loyalty:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminLoyaltyLevel'
+        limits:
+          $ref: '#/components/schemas/AdminLimits'
+        catalog:
+          $ref: '#/components/schemas/AdminCatalogSettings'
+        banners:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminBanner'
+        rulesText:
+          $ref: '#/components/schemas/AdminRulesText'
+        stock:
+          $ref: '#/components/schemas/AdminStockSettings'
+        automation:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminAutomationRule'
+        notifications:
+          $ref: '#/components/schemas/AdminNotifications'
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminWebhook'
+        control:
+          $ref: '#/components/schemas/AdminControlSettings'
+        apiKey:
+          type: string
+          readOnly: true
+          description: >-
+            Ключ API клуба `ck_<32 hex>` для интеграций: принимается как токен владельца (`Authorization: Bearer ck_…`)
+            на `/admin/*`. Меняется только `POST /admin/club/api-key`. Отдаётся любому сотруднику, как в моке
+            (см. `x-open-question`).
+          x-open-question: >-
+            `GET /admin/club` доступен любому сотруднику (tools/MockServer/src/routes/club.ts:250 `requireStaff(req)`),
+            а мок кладёт в ответ `apiKey: c.apiKey` (routes/club.ts:271). Ключ действует как токен владельца, то есть
+            кассир может повысить себя до владельца. Предложение: кассиру отдавать `""` (касса показывает ключ только
+            на странице «Интеграции», которая ownerOnly — apps/admin/src/App.tsx:138, pages/IntegrationsPage.tsx:88).
+            Норма контракта не меняется до решения владельца.
+        events:
+          type: array
+          readOnly: true
+          items:
+            $ref: '#/components/schemas/AdminClubEvent'
+          description: Справочник всех событий клуба (для выбора подписок вебхука).
+      x-source:
+        - apps/admin/src/api.ts:269
+        - tools/MockServer/src/club.ts:232
+        - tools/MockServer/src/routes/club.ts:249
+
+    AdminClubSettingsPatch:
+      type: object
+      description: >-
+        Частичное изменение документа настроек: каждый присутствующий ключ верхнего уровня целиком заменяет сохранённый
+        (касса шлёт только изменённые ключи). Особые случаи со своими схемами запроса: `control`
+        (`AdminControlSettingsPatch`) — значения приводятся к диапазонам, отсутствующие берутся из текущих;
+        `automation` (`AdminAutomationRuleInput`) — пустой `id` получает UUID, отсутствующие `fired`/`lastFiredAt` —
+        0/null; `notifications` (`AdminNotificationsInput`) — Telegram-поля игнорируются (x-prohibited), отсутствующий
+        `bigTopupAt` остаётся прежним. `apiKey` и `events` верхнего уровня игнорируются. Изменение `features`,
+        `branding`, `catalog`, `rulesText`, `banners` повышает версию конфигурации агента и каталога (агенты получают
+        новый `AgentServerConfig`).
+      properties:
+        branding:
+          $ref: '#/components/schemas/AdminBranding'
+        features:
+          $ref: '#/components/schemas/ShellFeatures'
+        zones:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminZone'
+        pricing:
+          $ref: '#/components/schemas/AdminPricing'
+        groups:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminClientGroup'
+        bonusTiers:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminBonusTier'
+        promoCodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminPromoCode'
+        happyHours:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminHappyHour'
+        loyalty:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminLoyaltyLevel'
+        limits:
+          $ref: '#/components/schemas/AdminLimits'
+        catalog:
+          $ref: '#/components/schemas/AdminCatalogSettings'
+        banners:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminBanner'
+        rulesText:
+          $ref: '#/components/schemas/AdminRulesText'
+        stock:
+          $ref: '#/components/schemas/AdminStockSettings'
+        automation:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminAutomationRuleInput'
+        notifications:
+          $ref: '#/components/schemas/AdminNotificationsInput'
+        webhooks:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminWebhook'
+        control:
+          $ref: '#/components/schemas/AdminControlSettingsPatch'
+        apiKey:
+          type: string
+          description: Игнорируется (только чтение).
+        events:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminClubEvent'
+          description: Игнорируется (только чтение).
+      x-source:
+        - apps/admin/src/api.ts:518
+        - apps/admin/src/settings.ts:46
+        - tools/MockServer/src/routes/club.ts:277
+
+    AdminApiKeyResponse:
+      type: object
+      description: Новый ключ API клуба; прежний перестаёт действовать сразу.
+      required:
+        - apiKey
+      properties:
+        apiKey:
+          type: string
+          description: Ключ `ck_<32 hex>`.
+      x-source:
+        - apps/admin/src/api.ts:519
+        - tools/MockServer/src/routes/club.ts:343
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Тарифы и цена
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminTariffList:
+      type: object
+      description: Все тарифы клуба.
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tariff'
+      x-source:
+        - apps/admin/src/api.ts:522
+        - tools/MockServer/src/routes/club.ts:357
+
+    AdminTariffInput:
+      type: object
+      description: >-
+        Тариф на создание/замену. В отличие от `Tariff` цены — целые тийины (не Money); `id` задаёт сервер (POST) или
+        путь (PUT). Сервер заворачивает цены в Money (UZS).
+      required:
+        - name
+        - pricePerHour
+        - zones
+        - isPackage
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Название.
+        pricePerHour:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1000000000
+          description: Цена за час, тийины.
+        minMinutes:
+          type: integer
+          format: int32
+          minimum: 5
+          maximum: 1440
+          default: 30
+          description: Минимум минут (касса шлёт всегда; мок по умолчанию 30).
+        maxMinutes:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          minimum: 5
+          maximum: 10080
+          description: Максимум минут; null — без ограничения.
+        zones:
+          type: array
+          maxItems: 20
+          items:
+            type: string
+          description: Зоны; пустой — все.
+        timeWindows:
+          type: array
+          items:
+            $ref: '#/components/schemas/TariffTimeWindow'
+          description: Окна действия; пустой/отсутствует — всегда (мок молча отбрасывает неизвестные дни).
+        isPackage:
+          type: boolean
+          description: Пакет.
+        packageMinutes:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          minimum: 5
+          maximum: 10080
+          description: Минут в пакете; обязательно при isPackage = true, иначе игнорируется.
+        packagePrice:
+          type:
+            - integer
+            - 'null'
+          format: int64
+          minimum: 0
+          maximum: 1000000000
+          description: Цена пакета, тийины; обязательно при isPackage = true, иначе игнорируется (касса шлёт null).
+      if:
+        required:
+          - isPackage
+        properties:
+          isPackage:
+            const: true
+      then:
+        required:
+          - packageMinutes
+          - packagePrice
+        properties:
+          packageMinutes:
+            type: integer
+          packagePrice:
+            type: integer
+      x-source:
+        - apps/admin/src/api.ts:495
+        - apps/admin/src/pages/PricingPage.tsx:144
+        - tools/MockServer/src/routes/club.ts:112
+
+    AdminTariffResponse:
+      type: object
+      description: Сохранённый тариф.
+      required:
+        - tariff
+      properties:
+        tariff:
+          $ref: '#/components/schemas/Tariff'
+      x-source:
+        - apps/admin/src/api.ts:523
+        - tools/MockServer/src/routes/club.ts:365
+
+    AdminQuoteRequest:
+      type: object
+      description: Предпросмотр цены перед открытием сессии.
+      required:
+        - tariffId
+        - pcId
+      properties:
+        tariffId:
+          type: string
+          format: uuid
+          description: Тариф.
+        pcId:
+          type: string
+          format: uuid
+          description: ПК (зона — для счастливых часов).
+        minutes:
+          type: integer
+          format: int32
+          minimum: 5
+          maximum: 1440
+          description: >-
+            Минуты. Обязателен для почасового тарифа (нет — 400 `validation`, `reason = required`); для пакетного
+            игнорируется (минуты берутся из тарифа). Касса шлёт всегда.
+        userId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Клиент (скидки группы и уровня лояльности); null — без персональных скидок.
+      x-source:
+        - apps/admin/src/api.ts:526
+        - tools/MockServer/src/routes/club.ts:385
+
+    AdminPriceQuote:
+      type: object
+      description: >-
+        Цена = base × dayPct/100 × (100 − discountPct)/100, округление до 100 тийинов. Скидки не суммируются: берётся
+        наибольшая из группы клиента, уровня лояльности и счастливых часов.
+      required:
+        - base
+        - dayPct
+        - discountPct
+        - discountReason
+        - total
+      properties:
+        base:
+          $ref: '#/components/schemas/Money'
+          description: Базовая цена по тарифу.
+        dayPct:
+          type: integer
+          format: int32
+          description: Процент дня недели или праздника.
+        discountPct:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Применённая скидка, %.
+        discountReason:
+          type:
+            - string
+            - 'null'
+          description: Название группы, уровня или счастливых часов; null — скидки нет.
+        total:
+          $ref: '#/components/schemas/Money'
+          description: К оплате.
+      x-source:
+        - apps/admin/src/api.ts:476
+        - tools/MockServer/src/club.ts:498
+        - tools/MockServer/src/club.ts:511
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Клиенты и промокоды
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminClient:
+      type: object
+      description: Карточка клиента в кассе (пользователь + профиль клуба + лояльность).
+      required:
+        - id
+        - username
+        - displayName
+        - role
+        - balance
+        - bonus
+        - groupId
+        - note
+        - blacklisted
+        - phone
+        - birthYear
+        - telegram
+        - spent
+        - visits
+        - level
+        - levelName
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор пользователя.
+        username:
+          type: string
+          description: Логин.
+        displayName:
+          type: string
+          description: Отображаемое имя.
+        role:
+          $ref: '#/components/schemas/UserRole'
+          description: Роль (касса типизирует строкой).
+        balance:
+          $ref: '#/components/schemas/Money'
+          description: Основной баланс.
+        bonus:
+          $ref: '#/components/schemas/Money'
+          description: Бонусный баланс.
+        groupId:
+          type:
+            - string
+            - 'null'
+          description: Группа клиента (`AdminClientGroup.id`); null — без группы.
+        note:
+          type: string
+          description: Заметка персонала.
+        blacklisted:
+          type: boolean
+          description: В чёрном списке (сессию на кассе не открыть — 403 `policyDenied`, `rule = blacklisted`).
+        phone:
+          type: string
+          description: Телефон; пустая строка — нет.
+        birthYear:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          minimum: 1900
+          maximum: 2100
+          description: Год рождения (для ограничений несовершеннолетних); null — неизвестен.
+        telegram:
+          type: string
+          x-prohibited: telegram
+          description: Telegram клиента. Запрещено — сервер не хранит, всегда `""`.
+        spent:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Потрачено за всё время (время + магазин), тийины.
+        visits:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Число сессий.
+        level:
+          type: integer
+          format: int32
+          description: Уровень лояльности.
+        levelName:
+          type: string
+          description: Название уровня.
+      x-source:
+        - apps/admin/src/api.ts:425
+        - tools/MockServer/src/routes/club.ts:79
+        - tools/MockServer/src/club.ts:71
+
+    AdminClientList:
+      type: object
+      description: Найденные клиенты (без гостей и персонала), без пагинации.
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminClient'
+      x-source:
+        - apps/admin/src/api.ts:529
+        - tools/MockServer/src/routes/club.ts:397
+
+    AdminClientCreateRequest:
+      type: object
+      description: Регистрация клиента на кассе (роль member, нулевой баланс).
+      required:
+        - displayName
+        - username
+      properties:
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Имя.
+        username:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Логин, уникальный без учёта регистра (хранится в нижнем регистре; занят — 400 `reason = taken`).
+        phone:
+          type: string
+          maxLength: 32
+          description: Телефон.
+        birthYear:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          minimum: 1900
+          maximum: 2100
+          description: Год рождения.
+        groupId:
+          type:
+            - string
+            - 'null'
+          maxLength: 64
+          description: Группа клиента.
+        telegram:
+          type: string
+          maxLength: 64
+          x-prohibited: telegram
+          description: Telegram клиента. Запрещено — сервер принимает и игнорирует.
+        password:
+          type: string
+          maxLength: 64
+          description: >-
+            Пароль входа на ПК. Касса не шлёт; мок принимает и по умолчанию ставит `demo`. Как клиент, созданный на
+            кассе, получает учётные данные, — открытый вопрос.
+      x-source:
+        - apps/admin/src/api.ts:530
+        - tools/MockServer/src/routes/club.ts:413
+
+    AdminClientUpdateRequest:
+      type: object
+      description: >-
+        Частичное изменение клиента; касса шлёт `Partial<AdminClient>`, сервер применяет только перечисленные поля,
+        остальные ключи игнорирует. `blacklisted` может менять только владелец (кассир — 403 `forbidden`,
+        `reason = ownerOnly`). Смена группы и чёрного списка пишется в журнал контроля.
+      properties:
+        displayName:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: Имя.
+        groupId:
+          type:
+            - string
+            - 'null'
+          maxLength: 64
+          description: Группа; null — снять.
+        note:
+          type:
+            - string
+            - 'null'
+          maxLength: 2000
+          description: Заметка; null — очистить.
+        phone:
+          type:
+            - string
+            - 'null'
+          maxLength: 32
+          description: Телефон; null — очистить.
+        telegram:
+          type:
+            - string
+            - 'null'
+          maxLength: 64
+          x-prohibited: telegram
+          description: Telegram клиента. Запрещено — сервер принимает и игнорирует.
+        birthYear:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          minimum: 1900
+          maximum: 2100
+          description: Год рождения; null — очистить.
+        blacklisted:
+          type: boolean
+          x-roles:
+            - owner
+          description: Чёрный список (только владелец).
+      x-source:
+        - apps/admin/src/api.ts:538
+        - apps/admin/src/pages/ClientsPage.tsx:120
+        - tools/MockServer/src/routes/club.ts:449
+
+    AdminClientResponse:
+      type: object
+      description: Карточка клиента после изменения.
+      required:
+        - client
+      properties:
+        client:
+          $ref: '#/components/schemas/AdminClient'
+      x-source:
+        - apps/admin/src/api.ts:537
+        - tools/MockServer/src/routes/club.ts:446
+
+    AdminTransactionList:
+      type: object
+      description: Последние операции кошелька клиента, новые первыми, до 100, без пагинации (не `TransactionPage`).
+      required:
+        - items
+      properties:
+        items:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/Transaction'
+      x-source:
+        - apps/admin/src/api.ts:540
+        - tools/MockServer/src/routes/club.ts:490
+
+    AdminPromoRedeemRequest:
+      type: object
+      description: Применить бонусный промокод к клиенту.
+      required:
+        - userId
+        - code
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Клиент.
+        code:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Промокод (без учёта регистра).
+      x-source:
+        - apps/admin/src/api.ts:541
+        - tools/MockServer/src/routes/club.ts:495
+
+    AdminPromoRedeemResponse:
+      type: object
+      description: Баланс после начисления.
+      required:
+        - balance
+      properties:
+        balance:
+          $ref: '#/components/schemas/Money'
+          description: >-
+            Основной баланс клиента после начисления (мок начисляет промо-бонус операцией `bonus` на основной баланс).
+      x-source:
+        - apps/admin/src/api.ts:541
+        - tools/MockServer/src/routes/club.ts:516
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Зал (редактор карты)
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminDeviceKind:
+      type: string
+      enum:
+        - pc
+        - console
+        - vr
+        - other
+      description: Вид места в зале.
+      x-source:
+        - apps/admin/src/api.ts:444
+        - tools/MockServer/src/club.ts:153
+
+    AdminHallPc:
+      description: Место на карте зала — `Pc` плюс координаты, вид устройства, железо и последняя телеметрия.
+      allOf:
+        - $ref: '#/components/schemas/Pc'
+        - type: object
+          required:
+            - x
+            - y
+            - device
+            - hardware
+            - metrics
+          properties:
+            x:
+              type: integer
+              format: int32
+              minimum: 0
+              maximum: 200
+              description: Колонка на сетке карты.
+            y:
+              type: integer
+              format: int32
+              minimum: 0
+              maximum: 200
+              description: Ряд на сетке карты.
+            device:
+              $ref: '#/components/schemas/AdminDeviceKind'
+            hardware:
+              oneOf:
+                - $ref: '#/components/schemas/HardwareInfo'
+                - type: 'null'
+              description: Железо из регистрации агента; null — агент не регистрировался.
+            metrics:
+              oneOf:
+                - $ref: '#/components/schemas/PcMetrics'
+                - type: 'null'
+              description: Последняя выборка телеметрии; null — нет.
+      x-source:
+        - apps/admin/src/api.ts:445
+        - tools/MockServer/src/routes/club.ts:524
+
+    AdminHallPcList:
+      type: object
+      description: Все места зала и зоны.
+      required:
+        - items
+        - zones
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminHallPc'
+        zones:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminZone'
+      x-source:
+        - apps/admin/src/api.ts:544
+        - tools/MockServer/src/routes/club.ts:520
+
+    AdminPcUpdateRequest:
+      type: object
+      description: Частичное изменение места; отсутствующие поля не меняются.
+      properties:
+        zone:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Зона.
+        name:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Имя.
+        number:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 9999
+          description: Номер места.
+        x:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 200
+          description: Колонка.
+        y:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 200
+          description: Ряд.
+        device:
+          $ref: '#/components/schemas/AdminDeviceKind'
+        maintenance:
+          type: boolean
+          description: >-
+            true — вывести на обслуживание (status = maintenance); false — вернуть в работу (мок ставит free независимо
+            от фактического состояния). Рассылается `pcStatusChanged`.
+      x-source:
+        - apps/admin/src/api.ts:545
+        - tools/MockServer/src/routes/club.ts:536
+
+    AdminPcCreateRequest:
+      type: object
+      description: >-
+        Новое место (ПК, консоль, VR). Создаётся со status = offline и без hwid; первый зарегистрировавшийся агент без
+        привязки занимает свободное место (мок).
+      required:
+        - zone
+        - number
+      properties:
+        zone:
+          type: string
+          minLength: 1
+          maxLength: 32
+          description: Зона.
+        number:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 9999
+          description: Номер места.
+        device:
+          $ref: '#/components/schemas/AdminDeviceKind'
+          description: Вид (касса шлёт всегда; по умолчанию pc).
+        name:
+          type: string
+          maxLength: 32
+          description: Имя; по умолчанию `PC-07` / `CONSOLE-07` и т.п.
+        x:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 200
+          description: Колонка (по умолчанию 0).
+        y:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 200
+          description: Ряд (по умолчанию 0).
+      x-source:
+        - apps/admin/src/api.ts:557
+        - tools/MockServer/src/routes/club.ts:554
+
+    AdminPcResponse:
+      type: object
+      description: Место после изменения/создания (касса читает только `pc.id`).
+      required:
+        - pc
+      properties:
+        pc:
+          $ref: '#/components/schemas/Pc'
+      x-source:
+        - apps/admin/src/pages/HallPage.tsx:261
+        - tools/MockServer/src/routes/club.ts:550
+        - tools/MockServer/src/routes/club.ts:582
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Склад и каталог игр
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminProductList:
+      type: object
+      description: Все товары и порог «заканчивается».
+      required:
+        - items
+        - lowAt
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Product'
+        lowAt:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Порог остатка (`stock.lowAt`).
+      x-source:
+        - apps/admin/src/api.ts:567
+        - tools/MockServer/src/routes/club.ts:598
+
+    AdminProductUpdateRequest:
+      type: object
+      description: Частичное изменение товара; изменение остатка пишется в журнал контроля (`stockEdit`).
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 80
+          description: Название.
+        price:
+          type: integer
+          format: int64
+          minimum: 0
+          maximum: 1000000000
+          description: Цена, тийины (целое, не Money).
+        inStock:
+          type: boolean
+          description: Есть в наличии.
+        stockQty:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          minimum: 0
+          maximum: 1000000
+          description: Остаток; null — склад не ведётся.
+      x-source:
+        - apps/admin/src/api.ts:568
+        - tools/MockServer/src/routes/club.ts:601
+
+    AdminProductReceiveRequest:
+      type: object
+      description: Приёмка товара — прибавить к остатку; товар становится «в наличии».
+      required:
+        - qty
+      properties:
+        qty:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100000
+          description: Принято штук.
+      x-source:
+        - apps/admin/src/api.ts:572
+        - tools/MockServer/src/routes/club.ts:626
+
+    AdminProductResponse:
+      type: object
+      description: Товар после изменения (касса ответ не читает).
+      required:
+        - product
+      properties:
+        product:
+          $ref: '#/components/schemas/Product'
+      x-source:
+        - tools/MockServer/src/routes/club.ts:618
+        - tools/MockServer/src/routes/club.ts:631
+
+    AdminGame:
+      type: object
+      description: Игра в редакторе каталога.
+      required:
+        - id
+        - title
+        - coverUrl
+        - installed
+        - launcher
+        - category
+        - hidden
+        - featured
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор игры.
+        title:
+          type: string
+          description: Название.
+        coverUrl:
+          type:
+            - string
+            - 'null'
+          description: Обложка; null — нет.
+        installed:
+          type: boolean
+          description: Установлена (по данным сервера).
+        launcher:
+          $ref: '#/components/schemas/LauncherType'
+          description: Лаунчер (касса типизирует строкой).
+        category:
+          type: array
+          items:
+            type: string
+          description: Категории.
+        hidden:
+          type: boolean
+          description: Скрыта (`catalog.hidden`).
+        featured:
+          type: boolean
+          description: Рекомендуемая (`catalog.featured`).
+      x-source:
+        - apps/admin/src/api.ts:465
+        - tools/MockServer/src/routes/club.ts:639
+
+    AdminGameList:
+      type: object
+      description: Все игры сервера (включая скрытые) и сохранённый порядок.
+      required:
+        - items
+        - order
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminGame'
+        order:
+          type: array
+          items:
+            type: string
+            format: uuid
+          description: '`catalog.order`.'
+      x-source:
+        - apps/admin/src/api.ts:574
+        - tools/MockServer/src/routes/club.ts:635
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Состояние ПК (телеметрия, тикеты ремонта)
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminHealthKind:
+      type: string
+      enum:
+        - cpuHot
+        - gpuHot
+        - cpuTrend
+        - gpuTrend
+        - fpsDrop
+        - unstable
+      description: >-
+        Проблема ПК: cpuHot/gpuHot — живая температура ≥ порога (medium — в пределах 5 °C до порога); cpuTrend/gpuTrend —
+        средняя за сутки выше средней за неделю на `trendC`; fpsDrop — FPS за сутки ниже недельного на `fpsDropPct` %;
+        unstable — ≥ `offlinePerDay` выпадений из сети за сутки.
+      x-source:
+        - apps/admin/src/api.ts:363
+        - tools/MockServer/src/health.ts:17
+        - tools/MockServer/src/health.ts:154
+
+    AdminHealthSeverity:
+      type: string
+      enum:
+        - high
+        - medium
+      description: Серьёзность проблемы ПК.
+      x-source:
+        - apps/admin/src/api.ts:364
+        - tools/MockServer/src/health.ts:18
+
+    AdminTicketStatus:
+      type: string
+      enum:
+        - open
+        - inWork
+        - resolved
+      description: Статус тикета ремонта.
+      x-source:
+        - apps/admin/src/api.ts:365
+        - tools/MockServer/src/health.ts:19
+
+    AdminHealthIssue:
+      type: object
+      description: Обнаруженная проблема ПК.
+      required:
+        - kind
+        - severity
+        - params
+      properties:
+        kind:
+          $ref: '#/components/schemas/AdminHealthKind'
+        severity:
+          $ref: '#/components/schemas/AdminHealthSeverity'
+        params:
+          type: object
+          additionalProperties:
+            type: number
+          description: >-
+            Числа для текста: cpuHot/gpuHot — {temp, limit}; cpuTrend/gpuTrend — {rise, today, before};
+            fpsDrop — {drop, today, before}; unstable — {drops}.
+      x-source:
+        - apps/admin/src/api.ts:367
+        - tools/MockServer/src/health.ts:34
+
+    AdminHealthTicket:
+      type: object
+      description: >-
+        Тикет ремонта. Открывается автоматически по проблеме (один на ПК и вид), событие `hardware`; решённый тикет той
+        же проблемы 6 ч не переоткрывается.
+      required:
+        - id
+        - pcId
+        - pcName
+        - kind
+        - severity
+        - params
+        - status
+        - openedAt
+        - updatedAt
+        - resolvedAt
+        - note
+        - autoMaintenance
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор тикета.
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        pcName:
+          type: string
+          description: Имя ПК на момент открытия.
+        kind:
+          $ref: '#/components/schemas/AdminHealthKind'
+        severity:
+          $ref: '#/components/schemas/AdminHealthSeverity'
+        params:
+          type: object
+          additionalProperties:
+            type: number
+          description: Как в `AdminHealthIssue.params`.
+        status:
+          $ref: '#/components/schemas/AdminTicketStatus'
+        openedAt:
+          type: string
+          format: date-time
+          description: Открыт.
+        updatedAt:
+          type: string
+          format: date-time
+          description: Последнее изменение.
+        resolvedAt:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Решён; null — не решён.
+        note:
+          type: string
+          description: Заметка персонала.
+        autoMaintenance:
+          type: boolean
+          description: Система сама вывела ПК на обслуживание по этому тикету (при решении ПК возвращается в работу).
+      x-source:
+        - apps/admin/src/api.ts:373
+        - tools/MockServer/src/health.ts:40
+
+    AdminHealthSettings:
+      type: object
+      description: >-
+        Пороги диагностики ПК (сохранённые значения всегда в указанных диапазонах; тело запроса —
+        `AdminHealthSettingsPatch`).
+      required:
+        - cpuHotC
+        - gpuHotC
+        - trendC
+        - fpsDropPct
+        - offlinePerDay
+        - autoMaintenance
+      properties:
+        cpuHotC:
+          type: integer
+          format: int32
+          minimum: 50
+          maximum: 110
+          description: Перегрев CPU, °C.
+        gpuHotC:
+          type: integer
+          format: int32
+          minimum: 50
+          maximum: 110
+          description: Перегрев GPU, °C.
+        trendC:
+          type: integer
+          format: int32
+          minimum: 2
+          maximum: 40
+          description: Рост средней за сутки над недельной, °C.
+        fpsDropPct:
+          type: integer
+          format: int32
+          minimum: 5
+          maximum: 90
+          description: Падение FPS против недели, %.
+        offlinePerDay:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 50
+          description: Выпадений из сети за сутки — «нестабилен».
+        autoMaintenance:
+          type: boolean
+          description: Выводить ПК с серьёзной проблемой на обслуживание, как только он освободится.
+      x-source:
+        - apps/admin/src/api.ts:388
+        - tools/MockServer/src/health.ts:56
+        - tools/MockServer/src/routes/club.ts:696
+
+    AdminHealthSettingsPatch:
+      type: object
+      description: >-
+        Тело `PATCH /admin/health/settings`. Все поля необязательны: отсутствующее значение остаётся прежним (мок так
+        же молча игнорирует нечисловые/небулевы), дробное округляется до целого, выходящее за диапазон приводится к
+        границам `x-clamp` (не ошибка). Касса шлёт объект целиком и в границах. См. `x-open-question` у
+        `AdminControlSettingsPatch` (толерантная или строгая валидация).
+      properties:
+        cpuHotC:
+          type: number
+          x-clamp:
+            minimum: 50
+            maximum: 110
+          description: Перегрев CPU, °C.
+        gpuHotC:
+          type: number
+          x-clamp:
+            minimum: 50
+            maximum: 110
+          description: Перегрев GPU, °C.
+        trendC:
+          type: number
+          x-clamp:
+            minimum: 2
+            maximum: 40
+          description: Рост средней за сутки над недельной, °C.
+        fpsDropPct:
+          type: number
+          x-clamp:
+            minimum: 5
+            maximum: 90
+          description: Падение FPS против недели, %.
+        offlinePerDay:
+          type: number
+          x-clamp:
+            minimum: 1
+            maximum: 50
+          description: Выпадений из сети за сутки — «нестабилен».
+        autoMaintenance:
+          type: boolean
+          description: Выводить ПК с серьёзной проблемой на обслуживание, как только он освободится.
+      x-source:
+        - apps/admin/src/api.ts:580
+        - tools/MockServer/src/routes/club.ts:689
+
+    AdminHealthReading:
+      type: object
+      description: Температуры CPU/GPU (°C) и FPS, округлены; null — нет данных.
+      required:
+        - cpu
+        - gpu
+        - fps
+      properties:
+        cpu:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: CPU, °C.
+        gpu:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: GPU, °C.
+        fps:
+          type:
+            - integer
+            - 'null'
+          format: int32
+          description: FPS (только пока шла игра).
+      x-source:
+        - apps/admin/src/api.ts:403
+        - tools/MockServer/src/health.ts:147
+
+    AdminHealthHourly:
+      type: object
+      description: Последние 24 часа по часам, старые первыми; null — час без данных.
+      required:
+        - cpu
+        - gpu
+        - fps
+      properties:
+        cpu:
+          type: array
+          minItems: 24
+          maxItems: 24
+          items:
+            type:
+              - integer
+              - 'null'
+            format: int32
+        gpu:
+          type: array
+          minItems: 24
+          maxItems: 24
+          items:
+            type:
+              - integer
+              - 'null'
+            format: int32
+        fps:
+          type: array
+          minItems: 24
+          maxItems: 24
+          items:
+            type:
+              - integer
+              - 'null'
+            format: int32
+      x-source:
+        - apps/admin/src/api.ts:405
+        - tools/MockServer/src/health.ts:150
+        - tools/MockServer/src/health.ts:206
+
+    AdminPcHealth:
+      type: object
+      description: Состояние одного ПК.
+      required:
+        - id
+        - name
+        - zone
+        - status
+        - score
+        - live
+        - baseline
+        - hourly
+        - issues
+        - ticket
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: ПК.
+        name:
+          type: string
+          description: Имя ПК.
+        zone:
+          type: string
+          description: Зона.
+        status:
+          $ref: '#/components/schemas/PcStatus'
+        score:
+          type: integer
+          format: int32
+          minimum: 0
+          maximum: 100
+          description: Оценка здоровья, 100 − 35 за каждую high − 15 за каждую medium.
+        live:
+          $ref: '#/components/schemas/AdminHealthReading'
+          description: Последние 15 минут (или последний час с данными).
+        baseline:
+          $ref: '#/components/schemas/AdminHealthReading'
+          description: Обычные значения этого ПК за неделю до последних суток.
+        hourly:
+          $ref: '#/components/schemas/AdminHealthHourly'
+        issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminHealthIssue'
+          description: Текущие проблемы.
+        ticket:
+          oneOf:
+            - $ref: '#/components/schemas/AdminHealthTicket'
+            - type: 'null'
+          description: Незакрытый тикет ПК; null — нет.
+      x-source:
+        - apps/admin/src/api.ts:397
+        - tools/MockServer/src/health.ts:145
+        - tools/MockServer/src/routes/club.ts:662
+
+    AdminHealthReport:
+      type: object
+      description: Состояние всех ПК, пороги и тикеты ремонта.
+      required:
+        - settings
+        - pcs
+        - tickets
+      properties:
+        settings:
+          $ref: '#/components/schemas/AdminHealthSettings'
+        pcs:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminPcHealth'
+        tickets:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/AdminHealthTicket'
+          description: Последние тикеты, новые первыми (до 100).
+      x-source:
+        - apps/admin/src/api.ts:410
+        - tools/MockServer/src/routes/club.ts:656
+
+    AdminTicketUpdateRequest:
+      type: object
+      description: Перевести тикет ремонта; решение тикета, который вывел ПК на обслуживание, возвращает ПК в работу.
+      required:
+        - status
+      properties:
+        status:
+          $ref: '#/components/schemas/AdminTicketStatus'
+        note:
+          type:
+            - string
+            - 'null'
+          maxLength: 500
+          description: Заметка; null/отсутствует — не менять.
+      x-source:
+        - apps/admin/src/api.ts:578
+        - tools/MockServer/src/routes/club.ts:674
+        - tools/MockServer/src/health.ts:295
+
+    AdminTicketResponse:
+      type: object
+      description: Тикет после изменения.
+      required:
+        - ticket
+      properties:
+        ticket:
+          $ref: '#/components/schemas/AdminHealthTicket'
+      x-source:
+        - apps/admin/src/api.ts:578
+        - tools/MockServer/src/routes/club.ts:686
+
+    AdminHealthSettingsResponse:
+      type: object
+      description: Сохранённые пороги.
+      required:
+        - settings
+      properties:
+        settings:
+          $ref: '#/components/schemas/AdminHealthSettings'
+      x-source:
+        - apps/admin/src/api.ts:580
+        - tools/MockServer/src/routes/club.ts:705
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Контроль кассиров
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminAuditAction:
+      type: string
+      enum:
+        - shiftOpen
+        - shiftClose
+        - topUp
+        - sessionOpen
+        - sessionExtend
+        - sessionEnd
+        - promoRedeem
+        - clientGroup
+        - blacklist
+        - stockReceive
+        - stockEdit
+        - pcCommand
+      description: >-
+        Действие персонала в журнале. pcCommand — команда ПК с кассы и перевод тикета ремонта (`meta.kind = repair`).
+      x-source:
+        - apps/admin/src/api.ts:306
+        - tools/MockServer/src/club.ts:177
+
+    AdminAuditEntry:
+      type: object
+      description: Запись журнала действий персонала (сервер пишет её сам при каждом действии кассы).
+      required:
+        - id
+        - at
+        - staffId
+        - staffName
+        - shiftId
+        - action
+        - userId
+        - pcId
+        - amount
+        - detail
+        - meta
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор записи.
+        at:
+          type: string
+          format: date-time
+          description: Время.
+        staffId:
+          type: string
+          description: Сотрудник.
+        staffName:
+          type: string
+          description: Имя сотрудника.
+        shiftId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Открытая в тот момент смена; null — смены не было (флаг `noShift`).
+        action:
+          $ref: '#/components/schemas/AdminAuditAction'
+        userId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Клиент; null — не относится.
+        pcId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: ПК; null — не относится.
+        amount:
+          type: integer
+          format: int64
+          description: Сумма, тийины (возвраты и пополнения положительны); 0 — без денег.
+        detail:
+          type: string
+          description: Краткое описание по-русски (касса переводит постоянные части).
+        meta:
+          type: object
+          additionalProperties:
+            type:
+              - string
+              - number
+              - boolean
+              - 'null'
+          description: Факты для правил (`sessionMinutes`, `discountPct`, `method`, `expected`, `diff`, `kind`…).
+      x-source:
+        - apps/admin/src/api.ts:320
+        - tools/MockServer/src/club.ts:191
+        - tools/MockServer/src/control.ts:59
+
+    AdminFlagKind:
+      type: string
+      enum:
+        - shortfall
+        - earlyEnds
+        - earlyEnd
+        - discount
+        - sameClient
+        - noShift
+        - bigCash
+      description: >-
+        Флаг контроля: shortfall — недостача при закрытии смены; earlyEnds — много ранних возвратов за смену; earlyEnd —
+        один ранний возврат; discount — клиент переведён в группу с большой скидкой; sameClient — много пополнений
+        одного клиента за смену; noShift — деньги без открытой смены; bigCash — крупное пополнение наличными.
+      x-source:
+        - apps/admin/src/api.ts:334
+        - tools/MockServer/src/control.ts:13
+        - tools/MockServer/src/control.ts:113
+
+    AdminFlagSeverity:
+      type: string
+      enum:
+        - high
+        - medium
+        - low
+      description: Серьёзность флага контроля.
+      x-source:
+        - apps/admin/src/api.ts:335
+        - tools/MockServer/src/control.ts:14
+
+    AdminControlFlag:
+      type: object
+      description: Флаг контроля (вычисляется из журнала за период, самые серьёзные и новые первыми).
+      required:
+        - id
+        - kind
+        - severity
+        - at
+        - staffId
+        - staffName
+        - shiftId
+        - userId
+        - pcId
+        - amount
+        - params
+      properties:
+        id:
+          type: string
+          description: '`<kind>:<id записи журнала>` (не UUID).'
+        kind:
+          $ref: '#/components/schemas/AdminFlagKind'
+        severity:
+          $ref: '#/components/schemas/AdminFlagSeverity'
+        at:
+          type: string
+          format: date-time
+          description: Время записи журнала.
+        staffId:
+          type: string
+          description: Сотрудник.
+        staffName:
+          type: string
+          description: Имя сотрудника.
+        shiftId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Смена; null — не было.
+        userId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: Клиент; null — не относится.
+        pcId:
+          type:
+            - string
+            - 'null'
+          format: uuid
+          description: ПК; null — не относится.
+        amount:
+          type: integer
+          format: int64
+          description: Сумма, тийины.
+        params:
+          type: object
+          additionalProperties:
+            type:
+              - string
+              - number
+          description: Факты для текста (`short`, `count`, `minutes`, `pct`, `group`, `detail`, `action`).
+      x-source:
+        - apps/admin/src/api.ts:337
+        - tools/MockServer/src/control.ts:16
+
+    AdminFlagCounts:
+      type: object
+      description: Число флагов по серьёзности.
+      required:
+        - high
+        - medium
+        - low
+      properties:
+        high:
+          type: integer
+          format: int32
+          minimum: 0
+        medium:
+          type: integer
+          format: int32
+          minimum: 0
+        low:
+          type: integer
+          format: int32
+          minimum: 0
+      x-source:
+        - apps/admin/src/api.ts:360
+        - tools/MockServer/src/control.ts:41
+
+    AdminStaffSummary:
+      type: object
+      description: Итоги сотрудника за период.
+      required:
+        - staffId
+        - staffName
+        - operations
+        - topUps
+        - refunds
+        - earlyEnds
+        - discounts
+        - shortfall
+        - flags
+      properties:
+        staffId:
+          type: string
+          description: Сотрудник.
+        staffName:
+          type: string
+          description: Имя.
+        operations:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Записей в журнале.
+        topUps:
+          type: integer
+          format: int64
+          description: Пополнено, тийины.
+        refunds:
+          type: integer
+          format: int64
+          description: Возвращено при завершении сессий, тийины.
+        earlyEnds:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Ранних возвратов.
+        discounts:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Переводов в группы с большой скидкой.
+        shortfall:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Суммарная недостача, тийины.
+        flags:
+          $ref: '#/components/schemas/AdminFlagCounts'
+      x-source:
+        - apps/admin/src/api.ts:351
+        - tools/MockServer/src/control.ts:32
+        - tools/MockServer/src/control.ts:172
+
+    AdminControlReport:
+      type: object
+      description: Контроль кассиров за период.
+      required:
+        - from
+        - to
+        - settings
+        - staff
+        - flags
+        - log
+      properties:
+        from:
+          type: string
+          format: date-time
+          description: Начало периода (сейчас − days суток).
+        to:
+          type: string
+          format: date-time
+          description: Конец периода (сейчас).
+        settings:
+          $ref: '#/components/schemas/AdminControlSettings'
+        staff:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminStaffSummary'
+          description: Итоги по сотрудникам (всегда по всем, фильтр `staffId` не применяется).
+        flags:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminControlFlag'
+          description: Флаги (с учётом фильтра `staffId`).
+        log:
+          type: array
+          maxItems: 300
+          items:
+            $ref: '#/components/schemas/AdminAuditEntry'
+          description: Журнал, новые первыми, до 300 (с учётом фильтра `staffId`).
+      x-source:
+        - apps/admin/src/api.ts:416
+        - tools/MockServer/src/routes/club.ts:710
+
+    # ----------------------------------------------------------------------------------------------------------------
+    # Отчёты
+    # ----------------------------------------------------------------------------------------------------------------
+
+    AdminReportsTotals:
+      type: object
+      description: Итоги периода.
+      required:
+        - sessions
+        - shop
+        - topUps
+        - sessionsCount
+      properties:
+        sessions:
+          type: integer
+          format: int64
+          description: Выручка за время, тийины.
+        shop:
+          type: integer
+          format: int64
+          description: Выручка магазина, тийины.
+        topUps:
+          type: integer
+          format: int64
+          description: Пополнения, тийины.
+        sessionsCount:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Число сессий.
+      x-source:
+        - apps/admin/src/api.ts:486
+        - tools/MockServer/src/routes/club.ts:775
+
+    AdminReportsDay:
+      type: object
+      description: Выручка за день.
+      required:
+        - date
+        - sessions
+        - shop
+        - topUps
+      properties:
+        date:
+          type: string
+          format: date
+          description: Дата `YYYY-MM-DD` (мок — дата UTC).
+        sessions:
+          type: integer
+          format: int64
+          description: Время, тийины.
+        shop:
+          type: integer
+          format: int64
+          description: Магазин, тийины.
+        topUps:
+          type: integer
+          format: int64
+          description: Пополнения, тийины.
+      x-source:
+        - apps/admin/src/api.ts:487
+        - tools/MockServer/src/routes/club.ts:734
+
+    AdminTopGame:
+      type: object
+      description: Популярная игра.
+      required:
+        - id
+        - title
+        - players
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Игра.
+        title:
+          type: string
+          description: Название.
+        players:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Сколько клиентов в неё играли (мок считает за всё время, а не за период).
+      x-source:
+        - apps/admin/src/api.ts:490
+        - tools/MockServer/src/routes/club.ts:783
+
+    AdminTopProduct:
+      type: object
+      description: Популярный товар за период.
+      required:
+        - title
+        - qty
+        - amount
+      properties:
+        title:
+          type: string
+          description: Название.
+        qty:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Продано штук.
+        amount:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Выручка, тийины.
+      x-source:
+        - apps/admin/src/api.ts:491
+        - tools/MockServer/src/routes/club.ts:762
+
+    AdminReports:
+      type: object
+      description: Отчёты владельца за последние `days` суток.
+      required:
+        - days
+        - totals
+        - byDay
+        - heat
+        - topGames
+        - topProducts
+        - shifts
+      properties:
+        days:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 90
+          description: Период, суток.
+        totals:
+          $ref: '#/components/schemas/AdminReportsTotals'
+        byDay:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminReportsDay'
+          description: По дням, старые первыми (`days` элементов).
+        heat:
+          type: array
+          minItems: 7
+          maxItems: 7
+          items:
+            type: array
+            minItems: 24
+            maxItems: 24
+            items:
+              type: integer
+              format: int32
+              minimum: 0
+          description: Тепловая карта загрузки — место-часы, [день недели 0 = вс … 6 = сб][час 0–23], время клуба.
+        topGames:
+          type: array
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/AdminTopGame'
+          description: До 8 игр.
+        topProducts:
+          type: array
+          maxItems: 8
+          items:
+            $ref: '#/components/schemas/AdminTopProduct'
+          description: До 8 товаров по выручке.
+        shifts:
+          type: array
+          items:
+            $ref: '#/components/schemas/AdminShift'
+          description: Смены, открытые в периоде, новые первыми.
+      x-source:
+        - apps/admin/src/api.ts:484
+        - tools/MockServer/src/routes/club.ts:728

@@ -1,0 +1,3641 @@
+asyncapi: 3.0.0
+info:
+  title: Club agent WebSocket
+  version: 1.0.0
+  description: |
+    WebSocket-канал между сервером клуба (это приложение, `application`) и агентом на ПК клуба
+    (`club-shell/src/ClubShell.Core/Realtime/RealtimeClient.cs`). Все направления описаны с точки зрения сервера:
+    `send` — сервер отправляет агенту, `receive` — сервер принимает от агента.
+    Источник формы данных — код агента (C# `ClubShell.Contracts` > MockServer > `docs/SERVER_API.md` §6).
+    Схемы payload не дублируются: они берутся из собранного REST-контракта `../openapi/openapi.yaml`
+    (имена = имена C#-типов). Сериализация — как в REST-контракте (openapi `info.description` §1): camelCase,
+    enum — camelCase-строки, `null` агент опускает (кроме ключа `payload` кадра и `details` в `IpcError` — они
+    пишутся всегда), время `yyyy-MM-ddTHH:mm:ss.fffZ`, UUID строчными.
+
+    ## 1. Подключение
+
+    - Адрес: `wss://{host}/ws/agent` — НЕ под `/api/v1`. Агент берёт его из `agent.json → server.wsUrl` (по умолчанию
+      `wss://club.example.uz/ws/agent`) или из `AgentServerConfig.wsUrl` ответа `GET /agents/{pcId}/config`;
+      допускаются схемы `wss` и `ws` (`ws` — только для мока/разработки).
+    - Рукопожатие: `GET` с `Sec-WebSocket-Protocol: clubshell.v1`, `Authorization: Bearer <JWT агента>` и query
+      `token=<тот же JWT>` (агент шлёт оба способа одновременно, см. §2).
+    - Одно соединение на ПК: новое соединение того же `pcId` вытесняет старое (мок закрывает старое кодом 1000).
+      Факт подключения сервер может использовать как признак «ПК онлайн» (мок переводит `offline` → `free`).
+    - Сразу после подключения сервер переотправляет все неподтверждённые и неистёкшие команды ПК (старые первыми).
+    - Для агента состояние «онлайн» = открытое WS-соединение (`ServerConnection.IsOnline`): без WS агент считает себя
+      офлайн, не сбрасывает outbox, не сверяет сессию и отвечает шеллу `agentOffline` на онлайн-операции.
+
+    ## 2. Аутентификация
+
+    - JWT агента (тот же `accessToken`, что для REST; RS256, `exp` ≈ 1 ч). Подпись HMAC (`X-Timestamp`/`X-Signature`)
+      на WS НЕ используется.
+    - Агент передаёт токен и в заголовке `Authorization: Bearer`, и в query `token` — всегда один и тот же JWT
+      (`RealtimeClient.cs:107,111`). Мок и SERVER_API.md §6 знают только query `token` (`ws.ts:248`). Сервер принимает
+      любой из двух. **Решение сервера (нет ни в клиенте, ни в моке, ни в SERVER_API.md):** заголовок приоритетнее
+      query; если заданы оба и они различаются — закрыть 4401. Агент такой ситуации не создаёт.
+    - Токен проверяется при рукопожатии. Неверный/истёкший/отозванный токен — либо HTTP 401/403 на рукопожатии,
+      либо принять апгрейд и закрыть кодом 4401 (так делает мок). Агент обрабатывает оба варианта одинаково:
+      `POST /agents/refresh` (при отказе — `POST /agents/register`) и переподключение.
+    - Агент сам НЕ переподключается после обновления токена: открытое соединение живёт дольше `exp`. При отзыве
+      ПК/токенов сервер закрывает соединение кодом 4401 (мок: `POST /mock/reset-tokens`).
+
+    ## 3. Сабпротокол `clubshell.v1`
+
+    Агент всегда предлагает `clubshell.v1`; сервер обязан выбрать его и вернуть
+    `Sec-WebSocket-Protocol: clubshell.v1`. Если клиент предложил только другие сабпротоколы — закрыть 4426
+    (мок). Агент .NET не падает, если сервер не вернул заголовок, но падает, если сервер выбрал другой сабпротокол.
+
+    ## 4. Коды закрытия
+
+    | Код | Когда (сервер) | Реакция агента |
+    |-----|----------------|----------------|
+    | 4401 | токен неверен, истёк или отозван (при подключении или позже) | refresh/повторная регистрация, переподключение через 1 с |
+    | 4426 | неподдерживаемый сабпротокол/версия протокола | `versionMismatch` в логе, переподключение через 1 с (попытки не прекращаются, задержка не растёт) |
+    | 1000 | соединение вытеснено новым соединением того же ПК (мок) | переподключение через 1 с |
+    | 1001 | остановка сервера | переподключение через 1 с |
+    | 1009 | кадр больше 1 МиБ (мок) | переподключение через 1 с |
+
+    Все коды закрытия приходят ПОСЛЕ успешного апгрейда: агент уже вызвал `Reconnector.MarkConnected`
+    (`RealtimeClient.cs:140` → `ServerConnection.cs:282`), поэтому счётчик попыток обнуляется и следующая задержка —
+    ровно `MinDelay` = 1 с (`Reconnector.cs:201-207`, `ComputeDelay(attempt = 1)`). Экспоненциального роста при
+    повторяющихся закрытиях установленного соединения НЕТ: сервер, который закрывает 4426/1009/4401 сразу после
+    апгрейда, будет получать переподключение от каждого ПК раз в секунду. То же после тайм-аута простоя (§6) и
+    слишком большого входящего кадра.
+
+    Экспоненциальный backoff действует только при отказе на этапе рукопожатия (HTTP-статус вместо 101 или сетевая
+    ошибка): равномерно случайная задержка в `[1 с, min(60 с, 1 с · 2^(n−1))]` (`Reconnector.ComputeDelay`), попытки
+    бесконечны. HTTP 401/403 на рукопожатии агент трактует как 4401 (refresh, затем backoff); прочие HTTP-статусы
+    рукопожатия (404, 426, 5xx) — как сетевую ошибку. Поэтому отказывать по версии/сабпротоколу и при перегрузке
+    лучше HTTP-статусом на рукопожатии (426 / 503), а не кодом закрытия после апгрейда.
+
+    ## 5. Кадры
+
+    - Только текстовые кадры, один JSON `WsFrame` на кадр, не больше 1 048 576 байт в обе стороны. Бинарные кадры
+      агент игнорирует. Входящий кадр > 1 МиБ агент считает ошибкой и рвёт соединение; исходящий > 1 МиБ молча
+      отбрасывает (в т.ч. ack — поэтому результат ack должен быть небольшим).
+    - Кадр с невалидным JSON или неизвестным `type` агент отбрасывает целиком (лог). Входящие от сервера
+      `ack`/`event`/`pong` агент игнорирует.
+    - Поля: `type`, `id`, `ts` обязательны; ключ `payload` сервер пишет всегда (`null`, если тела нет) — агент
+      пишет его всегда; `name` — для `command`/`event`/`push`; `ack` — для `ack`; `supersedes`/`expiresAt` — только
+      у `command`. `issuedBy` в WS-кадре нет (есть только в REST-конверте `ServerCommandEnvelope`).
+    - `ts` — часы отправителя; у кадров агента это часы ПК (могут расходиться с сервером).
+
+    ## 6. Keepalive
+
+    - Сервер шлёт кадр `ping` (WsFrame, текстовый кадр) каждые 20 с и ждёт `pong` с тем же `id` 10 с; нет ответа —
+      рвёт соединение (мок: `terminate`). Пока ждёт `pong`, новый `ping` не шлёт.
+    - Агент отвечает `pong` немедленно. Если агент 75 с не получил ни одного кадра данных (текстового или бинарного;
+      таймер создаётся заново на каждое сообщение, `RealtimeClient.cs:279`, бинарный кадр тоже его сбрасывает —
+      `:308-312`), он считает соединение мёртвым и переподключается. Управляющие кадры WebSocket (opcode Ping/Pong)
+      этот таймер НЕ сбрасывают. `ping` сервер обязан слать именно как WsFrame в текстовом кадре (бинарные кадры агент
+      не обрабатывает и `pong` на них не отвечает); интервал — меньше 75 с.
+    - Агент дополнительно каждые 30 с шлёт управляющий кадр WebSocket Pong без запроса (.NET 8
+      `ClientWebSocket.KeepAliveInterval`, RFC 6455 §5.5.3 — односторонний heartbeat). Сервер не должен считать
+      это ошибкой.
+
+    ## 7. Команды сервер → агент
+
+    - Доставка at-least-once. Сервер хранит команду в очереди ПК до первого ack или до `expiresAt`; подключённому
+      ПК шлёт сразу, при подключении переотправляет неподтверждённые. Истёкшие команды сервер не отправляет.
+    - Та же очередь доступна по REST: `heartbeat.pendingCommands` = число неподтверждённых неистёкших команд
+      (включая уже отправленные по WS, но ещё без ack); при > 0 агент забирает их `GET /agents/{pcId}/commands` и
+      подтверждает `POST /agents/{pcId}/commands/{commandId}/ack` — даже при живом WS. Поэтому одна команда может
+      прийти обоими путями: агент выполнит её один раз, но ack может прийти дважды (WS и REST). Сервер принимает
+      повторные ack идемпотентно (последний перезаписывает; у `message` второй ack по REST несёт `ackedAt`).
+    - Дедупликация на агенте — по `id` команды, только в памяти процесса (24 ч, с ограничением числа записей), после
+      перезапуска агента не сохраняется. Повтор по WS агент молча игнорирует БЕЗ повторного ack; потерянный ack
+      вернётся только через REST-путь (кэш ack в `CommandReceiver`). Отсюда: команды с побочным эффектом
+      (`reboot`, `shutdown`, `update`, `launchGame`) сервер отправляет с `expiresAt`.
+    - `expiresAt`: агент сравнивает со своими часами; просроченную команду не выполняет и отвечает
+      `ack { ok: false, error.code: timeout }`. Запас `expiresAt` — не меньше допустимого расхождения часов.
+    - `supersedes`: агент отменяет выполняемую (in-flight) более раннюю команду с этим id; отменённая получает
+      `ack { ok: false, error: { code: conflict, details.reason: superseded } }` (по WS) или `timeout` (по REST-пути).
+      Ещё не доставленную вытесненную команду сервер сам убирает из очереди (агент о ней не знает).
+    - Выполнение параллельное: агент не ждёт завершения предыдущей команды, ack приходят в порядке завершения, а не
+      отправки. Зависимые команды (например, `lock` → `unlock`) сервер отправляет после ack предыдущей или через
+      `supersedes`. Тайм-аут выполнения одной команды на агенте — 5 мин (затем `ack` с `timeout`).
+    - Ack: кадр `ack`, `ack.id` = id команды, `ack.ok`; при `ok = false` — `ack.error` (`IpcError`); при `ok = true` —
+      `ack.result` по типу команды (у команд без результата поле отсутствует). Коды ошибок, которые ставит сам агент:
+      `notFound` (неизвестное имя команды — ack всё равно приходит; чужой `sessionId`), `validation` (нет
+      обязательного payload, невалидная политика), `timeout` (истекла / 5 мин / вытеснена по REST-пути),
+      `conflict` + `details.reason = superseded`, `policyDenied` (запрещено локальными настройками агента),
+      `serverUnavailable` (WoL/релей недоступны), `sessionNotActive`, `internal` (`details.traceId` = id команды);
+      плюс коды, проброшенные из REST-вызовов, которые агент делает при выполнении (например, `insufficientFunds`).
+    - ВНИМАНИЕ: `ack.ok = true` не всегда значит «действие выполнено». У `launchGame` провал запуска приходит как
+      `ack.ok = true` + `ack.result.ok = false` + `ack.result.error` (см. `ackLaunchGame`); у `update` сбой
+      скачивания/проверки/подготовки/применения — как `ack.ok = true` + `ack.result.scheduled = false` (см. `ackUpdate`).
+      Сервер обязан смотреть и на `ack.result`.
+    - Payload неизвестной формы (новые значения enum и т.п.) агент не десериализует — ack `internal`.
+
+    ## 8. События агент → сервер
+
+    Без подтверждения и без повторов (fire-and-forget). Если WS не подключён или буфер (1024 кадра) полон, событие
+    теряется — оно НЕ копится в outbox; данные доходят через REST-аналоги (`/sessions/{id}/events`,
+    `/games/{id}/launch-report`, `/agents/{pcId}/telemetry`, `/anticheat/report`). Сейчас агент реально шлёт только
+    `anticheatViolation`, `hardwareChanged`, `offlineQueueFlushed` (`x-agent-emits`). `ts` кадра — время отправки;
+    время события — в payload, где оно есть. `id` кадра случаен — сервер может дедуплицировать по нему.
+
+    ## 9. Push сервер → агент
+
+    Без ack и без повторов (at-most-once); сервер не копит push для офлайн-ПК — агент сам сверяет состояние по REST
+    после переподключения. Адресация (мок): пользовательские push — на все ПК, где у пользователя действующий
+    `X-User-Token`; `pcStatusChanged` — всем подключённым ПК; `chatMessage` — по комнате (`club` — всем, `zone:<z>` —
+    ПК зоны, `pc:<id>` — этому ПК, `dm:<a>:<b>` — ПК участников, кроме отправителя). Неизвестный `name` агент
+    игнорирует.
+
+    ## 10. Совместимость
+
+    Добавлять поля в payload можно всегда. Новые имена команд безопасны (агент ответит `notFound`), новые имена push и
+    событий — тоже (игнорируются). Новый `type` кадра или новые значения enum внутри payload ломают обработку
+    кадра у текущего агента — только согласованно с релизом агента.
+  x-source:
+    - docs/SERVER_API.md:487
+    - src/ClubShell.Core/Realtime/RealtimeClient.cs:29
+    - src/ClubShell.Core/Realtime/RealtimeClient.cs:104
+    - src/ClubShell.Core/Realtime/Reconnector.cs:87
+    - src/ClubShell.Contracts/Commands/ServerCommand.cs:642
+    - src/ClubShell.Agent/Server/CommandReceiver.cs:157
+    - src/ClubShell.Agent/Server/Heartbeat.cs:261
+    - src/ClubShell.Agent/Server/ServerConnection.cs:137
+    - src/ClubShell.Core/Configuration/AppSettings.cs:209
+    - src/ClubShell.Core/Configuration/AppSettings.cs:744
+    - tools/MockServer/src/ws.ts:246
+
+defaultContentType: application/json
+
+servers:
+  production:
+    host: '{host}'
+    protocol: wss
+    title: Сервер клуба
+    description: Центральный сервер клуба. Тот же хост, что у REST (`https://{host}/api/v1`), но путь WS — `/ws/agent` без `/api/v1`.
+    variables:
+      host:
+        default: club.example.uz
+        description: Хост (и при необходимости порт) сервера клуба.
+    security:
+      - $ref: '#/components/securitySchemes/agentBearer'
+      - $ref: '#/components/securitySchemes/agentTokenQuery'
+  mock:
+    host: 'localhost:8080'
+    protocol: ws
+    title: MockServer
+    description: Мок из `club-shell/tools/MockServer` (только разработка; `MOCK_SERVER_PORT`, по умолчанию 8080).
+    security:
+      - $ref: '#/components/securitySchemes/agentTokenQuery'
+
+channels:
+  agent:
+    address: /ws/agent
+    title: Канал агента
+    summary: Двунаправленный канал сервер ↔ агент ПК (кадры WsFrame, сабпротокол clubshell.v1).
+    description: |
+      Одно соединение на ПК. Кадры: `command` (сервер → агент, требует `ack`), `ack` (агент → сервер), `event`
+      (агент → сервер, без подтверждения), `push` (сервер → агент, без подтверждения), `ping`/`pong` (keepalive).
+      Общая форма кадра — `WsFrame` (`../openapi/openapi.yaml#/components/schemas/WsFrame`); сообщения ниже сужают
+      её по `type` и `name`. Коды закрытия — `x-close-codes`, лимиты — `x-limits`.
+    servers:
+      - $ref: '#/servers/production'
+      - $ref: '#/servers/mock'
+    messages:
+      commandLock:
+        $ref: '#/components/messages/commandLock'
+      ackLock:
+        $ref: '#/components/messages/ackLock'
+      commandUnlock:
+        $ref: '#/components/messages/commandUnlock'
+      ackUnlock:
+        $ref: '#/components/messages/ackUnlock'
+      commandMessage:
+        $ref: '#/components/messages/commandMessage'
+      ackMessage:
+        $ref: '#/components/messages/ackMessage'
+      commandReboot:
+        $ref: '#/components/messages/commandReboot'
+      ackReboot:
+        $ref: '#/components/messages/ackReboot'
+      commandShutdown:
+        $ref: '#/components/messages/commandShutdown'
+      ackShutdown:
+        $ref: '#/components/messages/ackShutdown'
+      commandWake:
+        $ref: '#/components/messages/commandWake'
+      ackWake:
+        $ref: '#/components/messages/ackWake'
+      commandEndSession:
+        $ref: '#/components/messages/commandEndSession'
+      ackEndSession:
+        $ref: '#/components/messages/ackEndSession'
+      commandExtendSession:
+        $ref: '#/components/messages/commandExtendSession'
+      ackExtendSession:
+        $ref: '#/components/messages/ackExtendSession'
+      commandLaunchGame:
+        $ref: '#/components/messages/commandLaunchGame'
+      ackLaunchGame:
+        $ref: '#/components/messages/ackLaunchGame'
+      commandKillGame:
+        $ref: '#/components/messages/commandKillGame'
+      ackKillGame:
+        $ref: '#/components/messages/ackKillGame'
+      commandSetPolicy:
+        $ref: '#/components/messages/commandSetPolicy'
+      ackSetPolicy:
+        $ref: '#/components/messages/ackSetPolicy'
+      commandReloadPolicy:
+        $ref: '#/components/messages/commandReloadPolicy'
+      ackReloadPolicy:
+        $ref: '#/components/messages/ackReloadPolicy'
+      commandScreenshot:
+        $ref: '#/components/messages/commandScreenshot'
+      ackScreenshot:
+        $ref: '#/components/messages/ackScreenshot'
+      commandRemoteControlStart:
+        $ref: '#/components/messages/commandRemoteControlStart'
+      ackRemoteControlStart:
+        $ref: '#/components/messages/ackRemoteControlStart'
+      commandRemoteControlStop:
+        $ref: '#/components/messages/commandRemoteControlStop'
+      ackRemoteControlStop:
+        $ref: '#/components/messages/ackRemoteControlStop'
+      commandUpdate:
+        $ref: '#/components/messages/commandUpdate'
+      ackUpdate:
+        $ref: '#/components/messages/ackUpdate'
+      commandShowAds:
+        $ref: '#/components/messages/commandShowAds'
+      ackShowAds:
+        $ref: '#/components/messages/ackShowAds'
+      commandSetVolume:
+        $ref: '#/components/messages/commandSetVolume'
+      ackSetVolume:
+        $ref: '#/components/messages/ackSetVolume'
+      commandRefreshConfig:
+        $ref: '#/components/messages/commandRefreshConfig'
+      ackRefreshConfig:
+        $ref: '#/components/messages/ackRefreshConfig'
+      eventSessionStarted:
+        $ref: '#/components/messages/eventSessionStarted'
+      eventSessionEnded:
+        $ref: '#/components/messages/eventSessionEnded'
+      eventGameLaunched:
+        $ref: '#/components/messages/eventGameLaunched'
+      eventGameExited:
+        $ref: '#/components/messages/eventGameExited'
+      eventAnticheatViolation:
+        $ref: '#/components/messages/eventAnticheatViolation'
+      eventHardwareChanged:
+        $ref: '#/components/messages/eventHardwareChanged'
+      eventOfflineQueueFlushed:
+        $ref: '#/components/messages/eventOfflineQueueFlushed'
+      pushWalletUpdated:
+        $ref: '#/components/messages/pushWalletUpdated'
+      pushChatMessage:
+        $ref: '#/components/messages/pushChatMessage'
+      pushNotification:
+        $ref: '#/components/messages/pushNotification'
+      pushOrderUpdated:
+        $ref: '#/components/messages/pushOrderUpdated'
+      pushBookingUpdated:
+        $ref: '#/components/messages/pushBookingUpdated'
+      pushTournamentUpdated:
+        $ref: '#/components/messages/pushTournamentUpdated'
+      pushSessionUpdated:
+        $ref: '#/components/messages/pushSessionUpdated'
+      pushPcStatusChanged:
+        $ref: '#/components/messages/pushPcStatusChanged'
+      pushUserRevoked:
+        $ref: '#/components/messages/pushUserRevoked'
+      ping:
+        $ref: '#/components/messages/ping'
+      pong:
+        $ref: '#/components/messages/pong'
+      agentPing:
+        $ref: '#/components/messages/agentPing'
+      serverPong:
+        $ref: '#/components/messages/serverPong'
+    bindings:
+      ws:
+        method: GET
+        query:
+          type: object
+          description: Query рукопожатия. Агент добавляет `token` к query, уже заданной в `server.wsUrl`.
+          properties:
+            token:
+              type: string
+              description: JWT агента (тот же accessToken, что в `Authorization`). Обязателен, если нет заголовка `Authorization`.
+              x-note: >-
+                Риск: токен в URL попадает в access-логи reverse-proxy/балансировщика/сервера и в метрики URL. На
+                прокси и сервере маскировать параметр `token` в логах (или не логировать query у `/ws/agent`),
+                предпочитать заголовок `Authorization`. На WS подписи нет, поэтому утёкший JWT (≈ 1 ч) позволяет
+                подключиться от имени ПК: получать команды и пользовательские push, слать ack и события. Для REST
+                нужен ещё `signingSecret`.
+              x-source:
+                - src/ClubShell.Core/Realtime/RealtimeClient.cs:267
+                - tools/MockServer/src/ws.ts:248
+                - docs/SERVER_API.md:492
+        headers:
+          type: object
+          description: Заголовки рукопожатия, которые шлёт агент.
+          required:
+            - Sec-WebSocket-Protocol
+          properties:
+            Sec-WebSocket-Protocol:
+              type: string
+              const: clubshell.v1
+              description: Сабпротокол; сервер обязан выбрать и вернуть `clubshell.v1`, иначе (предложен только другой) — закрыть 4426.
+              x-source:
+                - src/ClubShell.Core/Realtime/RealtimeClient.cs:110
+                - src/ClubShell.Contracts/Commands/ServerCommand.cs:656
+                - tools/MockServer/src/ws.ts:254
+            Authorization:
+              type: string
+              pattern: '^Bearer \S+$'
+              description: '`Bearer <JWT агента>`; агент шлёт всегда вместе с query `token` (тот же JWT).'
+              x-note: >-
+                Решение сервера, нет в клиенте и моке: заголовок приоритетнее query `token`; если заданы оба и они
+                различаются — закрыть 4401. Мок читает только query `token` (tools/MockServer/src/ws.ts:248),
+                SERVER_API.md §6 описывает только query; агент всегда шлёт одинаковый токен в обоих местах.
+              x-source:
+                - src/ClubShell.Core/Realtime/RealtimeClient.cs:107
+                - src/ClubShell.Core/Realtime/RealtimeClient.cs:111
+        bindingVersion: 0.1.0
+    x-close-codes:
+      - code: 4401
+        sender: server
+        when: Токен агента неверен, истёк или отозван (при подключении или в любой момент позже).
+        agent: ServerApiException(unauthorized) → POST /agents/refresh, при 401/403 — POST /agents/register → переподключение через 1 с (без роста задержки).
+        x-source:
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:43
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:233
+          - src/ClubShell.Agent/Server/ServerConnection.cs:284
+          - tools/MockServer/src/ws.ts:251
+          - tools/MockServer/src/ws.ts:361
+      - code: 4426
+        sender: server
+        when: Неподдерживаемый сабпротокол или версия протокола.
+        agent: >-
+          ServerApiException(versionMismatch) → переподключение через 1 с без роста задержки (соединение уже было
+          установлено, счётчик попыток обнулён); попытки не прекращаются. Отказывать по версии лучше HTTP 426 на
+          рукопожатии — тогда действует экспоненциальный backoff.
+        x-source:
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:44
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:240
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:140
+          - src/ClubShell.Agent/Server/ServerConnection.cs:282
+          - src/ClubShell.Core/Realtime/Reconnector.cs:201
+          - tools/MockServer/src/ws.ts:255
+      - code: 1000
+        sender: server | agent
+        when: Сервер — соединение вытеснено новым соединением того же ПК; агент — штатное закрытие.
+        agent: Переподключение через 1 с.
+        x-source:
+          - tools/MockServer/src/ws.ts:261
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:256
+      - code: 1001
+        sender: server
+        when: Остановка сервера.
+        agent: Переподключение через 1 с без роста задержки (соединение уже было установлено); далее, если сервер не отвечает на рукопожатие, — экспоненциальный backoff.
+        x-source:
+          - tools/MockServer/src/ws.ts:299
+          - src/ClubShell.Core/Realtime/Reconnector.cs:201
+      - code: 1009
+        sender: server
+        when: Кадр больше 1 МиБ.
+        agent: Переподключение через 1 с без роста задержки (соединение уже было установлено).
+        x-source:
+          - tools/MockServer/src/ws.ts:276
+          - src/ClubShell.Core/Realtime/Reconnector.cs:201
+    x-limits:
+      maxFrameBytes: 1048576
+      serverPingIntervalSec: 20
+      pongTimeoutSec: 10
+      agentReceiveIdleTimeoutSec: 75
+      agentWsKeepAliveIntervalSec: 30
+      agentOutboundBufferFrames: 1024
+      agentCommandTimeoutSec: 300
+      agentDedupeWindowHours: 24
+      agentReconnectBackoffSec:
+        min: 1
+        max: 60
+        multiplier: 2
+        jitter: full
+        appliesTo: Только отказы рукопожатия (HTTP-статус вместо 101, сетевая ошибка). После закрытия уже установленного соединения (любой код, тайм-аут простоя) — всегда 1 с.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:653
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:32
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:35
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:38
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:41
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:62
+        - src/ClubShell.Core/Realtime/Reconnector.cs:28
+        - tools/MockServer/src/ws.ts:56
+        - tools/MockServer/src/ws.ts:57
+    x-source:
+      - docs/SERVER_API.md:487
+      - src/ClubShell.Core/Realtime/RealtimeClient.cs:104
+      - tools/MockServer/src/ws.ts:246
+
+operations:
+  # ---- Команды сервер -> агент (ответ: ack) --------------------------------------------------------------------------
+  sendCommandLock:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда lock
+    summary: Заблокировать сессию или показать экран простоя.
+    messages:
+      - $ref: '#/channels/agent/messages/commandLock'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackLock'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-triggered-by:
+      - 'POST /admin/pcs/{pcId}/command (kind = lock)'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:91
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:269
+      - docs/SERVER_API.md:516
+      - tools/MockServer/src/routes/admin.ts:255
+  sendCommandUnlock:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда unlock
+    summary: Разблокировать ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandUnlock'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackUnlock'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-triggered-by:
+      - 'POST /admin/pcs/{pcId}/command (kind = unlock)'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:94
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:281
+      - docs/SERVER_API.md:517
+      - tools/MockServer/src/routes/admin.ts:257
+  sendCommandMessage:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда message
+    summary: Показать сообщение администратора.
+    description: |
+      Первый ack (по WS) — факт показа (`deliveredAt`). Если `requiresAck = true`, после подтверждения пользователем
+      агент шлёт второй ack той же команды по REST `POST /agents/{pcId}/commands/{commandId}/ack` с `ackedAt`
+      (не по WS).
+    messages:
+      - $ref: '#/channels/agent/messages/commandMessage'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackMessage'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-triggered-by:
+      - 'POST /admin/pcs/{pcId}/command (kind = message)'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:97
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:292
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:315
+      - docs/SERVER_API.md:518
+      - tools/MockServer/src/routes/admin.ts:245
+  sendCommandReboot:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда reboot
+    summary: Перезагрузить ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandReboot'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackReboot'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-triggered-by:
+      - 'POST /admin/pcs/{pcId}/command (kind = reboot)'
+    x-note: Всегда задавать expiresAt — дедупликация агента не переживает перезагрузку, повторная доставка после рестарта снова перезагрузит ПК.
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:100
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:324
+      - docs/SERVER_API.md:519
+      - tools/MockServer/src/routes/admin.ts:259
+  sendCommandShutdown:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда shutdown
+    summary: Выключить ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandShutdown'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackShutdown'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-triggered-by:
+      - 'POST /admin/pcs/{pcId}/command (kind = shutdown)'
+    x-note: Всегда задавать expiresAt — иначе после включения ПК недоставленный ack приведёт к повторному выключению.
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:103
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:324
+      - docs/SERVER_API.md:520
+      - tools/MockServer/src/routes/admin.ts:261
+      - tools/MockServer/src/club.ts:620
+  sendCommandWake:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда wake
+    summary: Отправить Wake-on-LAN другому ПК через этот агент (ретрансляция в LAN).
+    messages:
+      - $ref: '#/channels/agent/messages/commandWake'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackWake'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:106
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:333
+      - docs/SERVER_API.md:521
+  sendCommandEndSession:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда endSession
+    summary: Завершить сессию на ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandEndSession'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackEndSession'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:109
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:347
+      - docs/SERVER_API.md:522
+  sendCommandExtendSession:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда extendSession
+    summary: Продлить сессию на ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandExtendSession'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackExtendSession'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:112
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:359
+      - docs/SERVER_API.md:523
+  sendCommandLaunchGame:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда launchGame
+    summary: Запустить игру на ПК как из шелла.
+    messages:
+      - $ref: '#/channels/agent/messages/commandLaunchGame'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackLaunchGame'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-prohibited-note: >-
+      Пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён. Флаг
+      useAccountPool = false в команде пул НЕ отключает: агент берёт аккаунт из пула, если useAccountPool = true ИЛИ у
+      игры в каталоге requiresAccount = true (src/ClubShell.Agent/Games/GameLaunchService.cs:202). Поэтому до решения
+      Q8 сервер обязан отдавать requiresAccount = false для всех игр в GET /games и GET /games/{id}, а в команде слать
+      useAccountPool = false и не слать accountLeaseId.
+    x-note: >-
+      Провал запуска (игры нет, сессия не активна, policyDenied, antiCheatBlocked, gameLaunchFailed,
+      accountPoolExhausted, уже запущена, тайм-аут лаунчера) приходит НЕ как ack.error, а как ack.ok = true +
+      ack.result.ok = false + ack.result.error (IpcError). Сервер обязан проверять ack.result.ok.
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:115
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:380
+      - src/ClubShell.Agent/Games/GameLaunchService.cs:145
+      - src/ClubShell.Agent/Games/GameLaunchService.cs:202
+      - docs/SERVER_API.md:524
+  sendCommandKillGame:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда killGame
+    summary: Завершить игру на ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandKillGame'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackKillGame'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:118
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:387
+      - docs/SERVER_API.md:525
+  sendCommandSetPolicy:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда setPolicy
+    summary: Применить переданную политику ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandSetPolicy'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackSetPolicy'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:121
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:394
+      - docs/SERVER_API.md:526
+  sendCommandReloadPolicy:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда reloadPolicy
+    summary: Перечитать политику с сервера (GET /agents/{pcId}/policies) и применить.
+    messages:
+      - $ref: '#/channels/agent/messages/commandReloadPolicy'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackReloadPolicy'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:124
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:408
+      - docs/SERVER_API.md:527
+  sendCommandScreenshot:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда screenshot
+    summary: Снять экран и загрузить PNG (image/png) PUT-запросом по uploadUrl.
+    messages:
+      - $ref: '#/channels/agent/messages/commandScreenshot'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackScreenshot'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-note: uploadUrl подписывать под PUT с Content-Type image/png (агент грузит PNG, не JPEG — расхождение с SERVER_API.md:528, см. commandScreenshot.x-discrepancy).
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:127
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:422
+      - src/ClubShell.Agent/Remote/ScreenCapture.cs:127
+      - docs/SERVER_API.md:528
+  sendCommandRemoteControlStart:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда remoteControlStart
+    summary: Начать удалённое управление через релей.
+    messages:
+      - $ref: '#/channels/agent/messages/commandRemoteControlStart'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackRemoteControlStart'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-note: >-
+      allowInput = true: агент шлёт SendInput без проверки активного античита
+      (src/ClubShell.Agent/Remote/RemoteInput.cs:216, :459) — риск бана игрового аккаунта/ПК античитом. Сервер не
+      отправляет allowInput = true, пока на ПК запущена игра с античитом.
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:130
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:429
+      - src/ClubShell.Agent/Remote/RemoteInput.cs:100
+      - docs/SERVER_API.md:529
+  sendCommandRemoteControlStop:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда remoteControlStop
+    summary: Остановить удалённое управление.
+    messages:
+      - $ref: '#/channels/agent/messages/commandRemoteControlStop'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackRemoteControlStop'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:133
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:436
+      - docs/SERVER_API.md:530
+  sendCommandUpdate:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда update
+    summary: Проверить и/или применить обновление агента или шелла.
+    messages:
+      - $ref: '#/channels/agent/messages/commandUpdate'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackUpdate'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-note: >-
+      Без manifest агент идёт в GET /updates/{channel}/manifest, который в v1 notImplemented (501) — сервер v1 передаёт
+      manifest в payload. applyNow = true применяет пакет немедленно даже при активной сессии (для agent — перезапуск
+      службы) — слать только на свободный ПК. Сбой подготовки приходит как ack.ok = true + result.scheduled = false.
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:136
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:443
+      - src/ClubShell.Agent/Updates/AgentUpdater.cs:137
+      - src/ClubShell.Agent/Updates/AgentUpdater.cs:175
+      - docs/SERVER_API.md:531
+  sendCommandShowAds:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда showAds
+    summary: Показать рекламу в шелле.
+    messages:
+      - $ref: '#/channels/agent/messages/commandShowAds'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackShowAds'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:139
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:450
+      - docs/SERVER_API.md:532
+  sendCommandSetVolume:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда setVolume
+    summary: Установить громкость ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/commandSetVolume'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackSetVolume'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:142
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:457
+      - docs/SERVER_API.md:533
+  sendCommandRefreshConfig:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Команда refreshConfig
+    summary: Перечитать выбранные кэши агента (все, если флагов нет).
+    messages:
+      - $ref: '#/channels/agent/messages/commandRefreshConfig'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/ackRefreshConfig'
+    tags:
+      - $ref: '#/components/tags/command'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:145
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:473
+      - docs/SERVER_API.md:534
+
+  # ---- События агент -> сервер -------------------------------------------------------------------------------------
+  receiveEventSessionStarted:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Событие sessionStarted
+    summary: Агент начал сессию (агент сейчас по WS не шлёт).
+    messages:
+      - $ref: '#/channels/agent/messages/eventSessionStarted'
+    tags:
+      - $ref: '#/components/tags/event'
+    x-agent-emits: false
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:437
+      - docs/SERVER_API.md:540
+  receiveEventSessionEnded:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Событие sessionEnded
+    summary: Агент завершил сессию (агент сейчас по WS не шлёт).
+    messages:
+      - $ref: '#/channels/agent/messages/eventSessionEnded'
+    tags:
+      - $ref: '#/components/tags/event'
+    x-agent-emits: false
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:440
+      - docs/SERVER_API.md:541
+  receiveEventGameLaunched:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Событие gameLaunched
+    summary: Игра запущена (агент сейчас по WS не шлёт).
+    messages:
+      - $ref: '#/channels/agent/messages/eventGameLaunched'
+    tags:
+      - $ref: '#/components/tags/event'
+    x-agent-emits: false
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:443
+      - docs/SERVER_API.md:542
+  receiveEventGameExited:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Событие gameExited
+    summary: Игра завершилась (агент сейчас по WS не шлёт).
+    messages:
+      - $ref: '#/channels/agent/messages/eventGameExited'
+    tags:
+      - $ref: '#/components/tags/event'
+    x-agent-emits: false
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:446
+      - docs/SERVER_API.md:543
+  receiveEventAnticheatViolation:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Событие anticheatViolation
+    summary: Находка античит-монитора агента.
+    messages:
+      - $ref: '#/channels/agent/messages/eventAnticheatViolation'
+    tags:
+      - $ref: '#/components/tags/event'
+    x-agent-emits: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:449
+      - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:347
+      - docs/SERVER_API.md:544
+  receiveEventHardwareChanged:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Событие hardwareChanged
+    summary: Изменилась аппаратная конфигурация ПК.
+    messages:
+      - $ref: '#/channels/agent/messages/eventHardwareChanged'
+    tags:
+      - $ref: '#/components/tags/event'
+    x-agent-emits: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:452
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:257
+      - docs/SERVER_API.md:545
+  receiveEventOfflineQueueFlushed:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Событие offlineQueueFlushed
+    summary: Агент доставил накопленный офлайн outbox.
+    messages:
+      - $ref: '#/channels/agent/messages/eventOfflineQueueFlushed'
+    tags:
+      - $ref: '#/components/tags/event'
+    x-agent-emits: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:455
+      - src/ClubShell.Agent/AgentWorker.cs:418
+      - docs/SERVER_API.md:546
+
+  # ---- Push сервер -> агент ----------------------------------------------------------------------------------------
+  sendPushWalletUpdated:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push walletUpdated
+    summary: Баланс пользователя изменился.
+    messages:
+      - $ref: '#/channels/agent/messages/pushWalletUpdated'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:554
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:246
+      - docs/SERVER_API.md:556
+      - tools/MockServer/src/routes/wallet.ts:65
+  sendPushChatMessage:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push chatMessage
+    summary: Новое сообщение чата.
+    messages:
+      - $ref: '#/channels/agent/messages/pushChatMessage'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:557
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:249
+      - docs/SERVER_API.md:557
+      - tools/MockServer/src/routes/chat.ts:93
+  sendPushNotification:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push notification
+    summary: Уведомление для показа в шелле.
+    messages:
+      - $ref: '#/channels/agent/messages/pushNotification'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:560
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:252
+      - docs/SERVER_API.md:558
+      - tools/MockServer/src/routes/shop.ts:58
+  sendPushOrderUpdated:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push orderUpdated
+    summary: Заказ магазина изменился.
+    messages:
+      - $ref: '#/channels/agent/messages/pushOrderUpdated'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:563
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:255
+      - docs/SERVER_API.md:559
+      - tools/MockServer/src/routes/shop.ts:56
+  sendPushBookingUpdated:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push bookingUpdated
+    summary: Бронь изменилась.
+    messages:
+      - $ref: '#/channels/agent/messages/pushBookingUpdated'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:566
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:264
+      - docs/SERVER_API.md:560
+      - tools/MockServer/src/routes/chat.ts:266
+  sendPushTournamentUpdated:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push tournamentUpdated
+    summary: Турнир изменился.
+    messages:
+      - $ref: '#/channels/agent/messages/pushTournamentUpdated'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:569
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:274
+      - docs/SERVER_API.md:561
+      - tools/MockServer/src/routes/chat.ts:309
+  sendPushSessionUpdated:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push sessionUpdated
+    summary: Сессия ПК изменилась на сервере (сервер авторитетен).
+    messages:
+      - $ref: '#/channels/agent/messages/pushSessionUpdated'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:572
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:283
+      - docs/SERVER_API.md:562
+      - tools/MockServer/src/routes/session.ts:100
+  sendPushPcStatusChanged:
+    x-server-status: notImplemented
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push pcStatusChanged
+    summary: Статус какого-либо ПК клуба изменился (для карты мест).
+    messages:
+      - $ref: '#/channels/agent/messages/pushPcStatusChanged'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: false
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:575
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:300
+      - docs/SERVER_API.md:563
+      - tools/MockServer/src/routes/session.ts:95
+  sendPushUserRevoked:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Push userRevoked
+    summary: Пользователь отозван — агент завершает его сессию и разлогинивает.
+    messages:
+      - $ref: '#/channels/agent/messages/pushUserRevoked'
+    tags:
+      - $ref: '#/components/tags/push'
+    x-agent-handles: true
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:578
+      - src/ClubShell.Agent/Ipc/PipeServer.cs:290
+      - docs/SERVER_API.md:564
+
+  # ---- Keepalive ---------------------------------------------------------------------------------------------------
+  sendPing:
+    x-server-status: required
+    action: send
+    channel:
+      $ref: '#/channels/agent'
+    title: Ping сервера
+    summary: Keepalive каждые 20 с; ответ pong с тем же id в течение 10 с.
+    messages:
+      - $ref: '#/channels/agent/messages/ping'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/pong'
+    tags:
+      - $ref: '#/components/tags/keepalive'
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:540
+      - src/ClubShell.Core/Realtime/RealtimeClient.cs:339
+      - docs/SERVER_API.md:494
+      - tools/MockServer/src/ws.ts:229
+  receiveAgentPing:
+    x-server-status: required
+    action: receive
+    channel:
+      $ref: '#/channels/agent'
+    title: Ping агента
+    summary: Необязательный ping от агента; сервер отвечает pong с тем же id (агент сейчас не шлёт).
+    messages:
+      - $ref: '#/channels/agent/messages/agentPing'
+    reply:
+      channel:
+        $ref: '#/channels/agent'
+      messages:
+        - $ref: '#/channels/agent/messages/serverPong'
+    tags:
+      - $ref: '#/components/tags/keepalive'
+    x-agent-emits: false
+    x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:677
+      - tools/MockServer/src/ws.ts:211
+
+components:
+  tags:
+    command:
+      name: command
+      description: Команда сервер → агент; агент отвечает кадром ack.
+    ack:
+      name: ack
+      description: Подтверждение команды агент → сервер.
+    event:
+      name: event
+      description: Событие агент → сервер; без подтверждения.
+    push:
+      name: push
+      description: Уведомление сервер → агент; без подтверждения.
+    keepalive:
+      name: keepalive
+      description: Кадры ping/pong.
+
+  securitySchemes:
+    agentBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        `Authorization: Bearer <JWT агента>` в запросе рукопожатия (тот же accessToken, что для REST). Агент шлёт всегда.
+        Предпочтительный способ для сервера.
+      x-source:
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:111
+    agentTokenQuery:
+      type: httpApiKey
+      in: query
+      name: token
+      description: >-
+        Query `token=<JWT агента>` (SERVER_API.md §6, мок проверяет только его). Агент шлёт всегда вместе с заголовком.
+      x-note: >-
+        Риск утечки токена: URL с `token` пишется в access-логи reverse-proxy, балансировщика и веб-сервера, в
+        трассировки и метрики по URL. Маскировать `token` в логах всех звеньев (или не логировать query у `/ws/agent`),
+        серверу предпочитать заголовок `Authorization`, а query оставить только для совместимости.
+      x-source:
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:267
+        - tools/MockServer/src/ws.ts:248
+        - docs/SERVER_API.md:492
+
+  correlationIds:
+    commandId:
+      description: '`id` кадра command = id команды; ответный ack несёт его в `ack.id`.'
+      location: '$message.payload#/id'
+    ackCommandId:
+      description: '`ack.id` = id подтверждаемой команды (сам кадр ack имеет свой случайный `id`).'
+      location: '$message.payload#/ack/id'
+    pingId:
+      description: '`id` кадра ping; pong повторяет его в своём `id`.'
+      location: '$message.payload#/id'
+
+  schemas:
+    WsCommandFrame:
+      description: Кадр command (сервер → агент). Требует ack; `name` — ServerCommandType.
+      allOf:
+        - $ref: '../openapi/openapi.yaml#/components/schemas/WsFrame'
+        - type: object
+          required:
+            - type
+            - id
+            - ts
+            - name
+            - payload
+          properties:
+            type:
+              const: command
+            id:
+              description: Id команды (ключ дедупликации агента и ack.id).
+            name:
+              $ref: '../openapi/openapi.yaml#/components/schemas/ServerCommandType'
+            supersedes:
+              description: Id более ранней команды, выполнение которой агент должен отменить.
+            expiresAt:
+              description: После этого времени (по часам агента) команда не выполняется, ack { ok = false, error.code = timeout }.
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:642
+      x-note: Сужение WsFrame по `type`; отдельного C#-типа нет. Первая ссылка в x-source — фабричный метод/разбор кадра этого типа.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:180
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:361
+        - tools/MockServer/src/ws.ts:137
+    WsAckFrame:
+      description: |
+        Кадр ack (агент → сервер). `id` кадра случаен, `ack.id` — id команды, `payload` = null. При `ok = false` есть
+        `error`; результат — по типу команды (сужается в сообщениях ack*). Ack на команду с неизвестным `name` приходит
+        с `error.code = notFound`. `ok = true` означает, что команда обработана, но не всегда — что действие удалось:
+        у `launchGame` смотреть `result.ok`, у `update` — `result.scheduled` (info §7).
+      allOf:
+        - $ref: '../openapi/openapi.yaml#/components/schemas/WsFrame'
+        - type: object
+          required:
+            - type
+            - id
+            - ts
+            - payload
+            - ack
+          properties:
+            type:
+              const: ack
+            payload:
+              type: 'null'
+            ack:
+              allOf:
+                - $ref: '../openapi/openapi.yaml#/components/schemas/WsAck'
+                - if:
+                    required:
+                      - ok
+                    properties:
+                      ok:
+                        const: false
+                  then:
+                    required:
+                      - error
+                    properties:
+                      error:
+                        $ref: '../openapi/openapi.yaml#/components/schemas/IpcError'
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:642
+      x-note: Сужение WsFrame по `type`; отдельного C#-типа нет. Первая ссылка в x-source — фабричный метод/разбор кадра этого типа.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:659
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:461
+        - tools/MockServer/src/ws.ts:214
+    WsEventFrame:
+      description: Кадр event (агент → сервер). Без подтверждения; `name` — AgentEventType; `ts` — время отправки.
+      allOf:
+        - $ref: '../openapi/openapi.yaml#/components/schemas/WsFrame'
+        - type: object
+          required:
+            - type
+            - id
+            - ts
+            - name
+            - payload
+          properties:
+            type:
+              const: event
+            name:
+              $ref: '../openapi/openapi.yaml#/components/schemas/AgentEventType'
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:642
+      x-note: Сужение WsFrame по `type`; отдельного C#-типа нет. Первая ссылка в x-source — фабричный метод/разбор кадра этого типа.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:663
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:204
+        - tools/MockServer/src/ws.ts:221
+    WsPushFrame:
+      description: Кадр push (сервер → агент). Без подтверждения; `name` — WsPushKind; `supersedes`/`expiresAt` не используются.
+      allOf:
+        - $ref: '../openapi/openapi.yaml#/components/schemas/WsFrame'
+        - type: object
+          required:
+            - type
+            - id
+            - ts
+            - name
+            - payload
+          properties:
+            type:
+              const: push
+            name:
+              $ref: '../openapi/openapi.yaml#/components/schemas/WsPushKind'
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:642
+      x-note: Сужение WsFrame по `type`; отдельного C#-типа нет. Первая ссылка в x-source — фабричный метод/разбор кадра этого типа.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:680
+        - src/ClubShell.Agent/Server/ServerConnection.cs:368
+        - tools/MockServer/src/ws.ts:88
+    WsPingFrame:
+      description: Кадр ping. `payload` = null, `name` отсутствует.
+      allOf:
+        - $ref: '../openapi/openapi.yaml#/components/schemas/WsFrame'
+        - type: object
+          required:
+            - type
+            - id
+            - ts
+            - payload
+          properties:
+            type:
+              const: ping
+            payload:
+              type: 'null'
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:642
+      x-note: Сужение WsFrame по `type`; отдельного C#-типа нет. Первая ссылка в x-source — фабричный метод/разбор кадра этого типа.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:677
+        - tools/MockServer/src/ws.ts:232
+    WsPongFrame:
+      description: Кадр pong. `id` = id ping, на который это ответ; `payload` = null.
+      allOf:
+        - $ref: '../openapi/openapi.yaml#/components/schemas/WsFrame'
+        - type: object
+          required:
+            - type
+            - id
+            - ts
+            - payload
+          properties:
+            type:
+              const: pong
+            payload:
+              type: 'null'
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:642
+      x-note: Сужение WsFrame по `type`; отдельного C#-типа нет. Первая ссылка в x-source — фабричный метод/разбор кадра этого типа.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:670
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:340
+        - tools/MockServer/src/ws.ts:205
+
+  messages:
+    # ==== Команды и ack ===============================================================================================
+    commandLock:
+      name: command.lock
+      title: Команда lock
+      summary: Заблокировать сессию (если открыта) или показать экран простоя; IPC shell.command{lock}.
+      description: Payload необязателен (null/отсутствует — все поля пустые). Результат ack — нет.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: lock
+              payload:
+                oneOf:
+                  - $ref: '../openapi/openapi.yaml#/components/schemas/LockCommand'
+                  - type: 'null'
+      examples:
+        - name: lockByStaff
+          summary: Блокировка с кассы
+          payload:
+            type: command
+            id: c0a8f5e2-1d3b-4c5a-9e7f-0a1b2c3d4e5f
+            ts: '2026-09-21T10:20:00.000Z'
+            name: lock
+            payload:
+              reason: staff
+              message: Подойдите к стойке администратора
+            expiresAt: '2026-09-21T10:25:00.000Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:91
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:264
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:271
+        - docs/SERVER_API.md:516
+        - tools/MockServer/src/routes/admin.ts:255
+    ackLock:
+      name: ack.lock
+      title: Ack команды lock
+      summary: Результат — нет (ack.result отсутствует).
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    type: 'null'
+      examples:
+        - name: ok
+          payload:
+            type: ack
+            id: 77aa0b1c-2d3e-4f50-8a9b-0c1d2e3f4a5b
+            ts: '2026-09-21T10:20:00.050Z'
+            payload: null
+            ack:
+              id: c0a8f5e2-1d3b-4c5a-9e7f-0a1b2c3d4e5f
+              ok: true
+        - name: expired
+          summary: Команда пришла после expiresAt
+          payload:
+            type: ack
+            id: 88bb1c2d-3e4f-4a51-9b0c-1d2e3f4a5b6c
+            ts: '2026-09-21T10:26:00.010Z'
+            payload: null
+            ack:
+              id: c0a8f5e2-1d3b-4c5a-9e7f-0a1b2c3d4e5f
+              ok: false
+              error:
+                code: timeout
+                message: Command expired before delivery
+                details: null
+      x-source:
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:278
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:386
+    commandUnlock:
+      name: command.unlock
+      title: Команда unlock
+      summary: Разблокировать ПК (выйти из lock сессии); IPC shell.command{unlock}.
+      description: Payload нет — сервер пишет null (агент содержимое игнорирует). Результат ack — нет.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: unlock
+              payload:
+                type: 'null'
+      examples:
+        - name: unlock
+          payload:
+            type: command
+            id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+            ts: '2026-09-21T10:30:00.000Z'
+            name: unlock
+            payload: null
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:94
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:281
+        - docs/SERVER_API.md:517
+        - tools/MockServer/src/routes/admin.ts:257
+    ackUnlock:
+      name: ack.unlock
+      title: Ack команды unlock
+      summary: Результат — нет.
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    type: 'null'
+      examples:
+        - name: ok
+          payload:
+            type: ack
+            id: 2b3c4d5e-6f70-4b8c-9d0e-1f2a3b4c5d6e
+            ts: '2026-09-21T10:30:00.040Z'
+            payload: null
+            ack:
+              id: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+              ok: true
+      x-source:
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:289
+    commandMessage:
+      name: command.message
+      title: Команда message
+      summary: Показать сообщение администратора (IPC admin.message).
+      description: Payload обязателен. `payload.id` — id сообщения (не команды); по нему шелл подтверждает прочтение.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: message
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/MessageCommand'
+      examples:
+        - name: staffMessage
+          payload:
+            type: command
+            id: 3c4d5e6f-7081-4c9d-8e0f-2a3b4c5d6e7f
+            ts: '2026-09-21T10:31:00.000Z'
+            name: message
+            payload:
+              id: 4d5e6f70-8192-4dae-9f10-3b4c5d6e7f80
+              from: Администратор
+              text: Через 10 минут технический перерыв
+              level: info
+              requiresAck: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:97
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:274
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:292
+        - docs/SERVER_API.md:518
+        - tools/MockServer/src/routes/admin.ts:245
+    ackMessage:
+      name: ack.message
+      title: Ack команды message
+      summary: 'Результат — MessageDeliveryResult { deliveredAt, ackedAt? }.'
+      description: |
+        По WS приходит первый ack (показано, `ackedAt` нет). Если `requiresAck = true`, второй ack той же команды с
+        `ackedAt` агент шлёт по REST `POST /agents/{pcId}/commands/{commandId}/ack` (тело CommandAck) — сервер
+        принимает его после уже полученного первого.
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/MessageDeliveryResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: delivered
+          payload:
+            type: ack
+            id: 5e6f7081-92a3-4ebf-8a21-4c5d6e7f8091
+            ts: '2026-09-21T10:31:00.300Z'
+            payload: null
+            ack:
+              id: 3c4d5e6f-7081-4c9d-8e0f-2a3b4c5d6e7f
+              ok: true
+              result:
+                deliveredAt: '2026-09-21T10:31:00.250Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:284
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:296
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:315
+    commandReboot:
+      name: command.reboot
+      title: Команда reboot
+      summary: Перезагрузить ПК через delaySec; открытая сессия завершается всегда, force — принудительно закрыть приложения.
+      description: |
+        Payload обязателен. Сервер всегда задаёт `expiresAt` (см. info §7).
+
+        Реализация (`PowerCommands.InitiateAsync`): агент показывает уведомление, затем ВСЕГДА (независимо от `force`)
+        завершает открытую сессию с `reason = admin`, затем вызывает `InitiateSystemShutdownExW(..., delaySec,
+        bForceAppsClosed = force, reboot)`. `force` означает принудительное закрытие приложений Windows без запроса
+        на сохранение, а не «сначала завершить сессию». `message` показывается пользователю в тексте уведомления.
+      x-discrepancy: >-
+        SERVER_API.md:519 («end session if force») и doc-комментарий PowerCommand.Force в
+        src/ClubShell.Contracts/Commands/ServerCommand.cs:290 («End an active session first») расходятся с кодом:
+        src/ClubShell.Agent/Power/PowerCommands.cs:210 завершает сессию без условия, а force передаётся в
+        InitiateSystemShutdownExW как bForceAppsClosed (src/ClubShell.Windows/Power/PowerControl.cs:207). Контракт
+        следует коду.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: reboot
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/PowerCommand'
+      examples:
+        - name: reboot
+          payload:
+            type: command
+            id: 6f708192-a3b4-4fc0-9b32-5d6e7f8091a2
+            ts: '2026-09-21T10:40:00.000Z'
+            name: reboot
+            payload:
+              delaySec: 5
+              force: false
+              message: ПК будет перезагружен
+            expiresAt: '2026-09-21T10:41:00.000Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:100
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:292
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:324
+        - src/ClubShell.Agent/Power/PowerCommands.cs:199
+        - src/ClubShell.Agent/Power/PowerCommands.cs:210
+        - src/ClubShell.Agent/Power/PowerCommands.cs:246
+        - src/ClubShell.Windows/Power/PowerControl.cs:207
+        - docs/SERVER_API.md:519
+        - tools/MockServer/src/routes/admin.ts:259
+    ackReboot:
+      name: ack.reboot
+      title: Ack команды reboot
+      summary: 'Результат — ScheduledResult { scheduledAt }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/ScheduledResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: scheduled
+          payload:
+            type: ack
+            id: 708192a3-b4c5-40d1-8c43-6e7f8091a2b3
+            ts: '2026-09-21T10:40:00.080Z'
+            payload: null
+            ack:
+              id: 6f708192-a3b4-4fc0-9b32-5d6e7f8091a2
+              ok: true
+              result:
+                scheduledAt: '2026-09-21T10:40:05.080Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:299
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:330
+    commandShutdown:
+      name: command.shutdown
+      title: Команда shutdown
+      summary: Выключить ПК через delaySec; открытая сессия завершается всегда, force — принудительно закрыть приложения.
+      description: |
+        Payload обязателен. Сервер всегда задаёт `expiresAt` (см. info §7).
+
+        Реализация (`PowerCommands.InitiateAsync`): агент показывает уведомление, затем ВСЕГДА (независимо от `force`)
+        завершает открытую сессию с `reason = admin`, затем вызывает `InitiateSystemShutdownExW(..., delaySec,
+        bForceAppsClosed = force, reboot = false)`. `force` означает принудительное закрытие приложений Windows без
+        запроса на сохранение, а не «сначала завершить сессию». `message` показывается пользователю в тексте уведомления.
+      x-discrepancy: >-
+        SERVER_API.md:519-520 («end session if force») и doc-комментарий PowerCommand.Force в
+        src/ClubShell.Contracts/Commands/ServerCommand.cs:290 («End an active session first») расходятся с кодом:
+        src/ClubShell.Agent/Power/PowerCommands.cs:210 завершает сессию без условия, а force передаётся в
+        InitiateSystemShutdownExW как bForceAppsClosed (src/ClubShell.Windows/Power/PowerControl.cs:207). Контракт
+        следует коду.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: shutdown
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/PowerCommand'
+      examples:
+        - name: shutdown
+          payload:
+            type: command
+            id: 8192a3b4-c5d6-41e2-9d54-7f8091a2b3c4
+            ts: '2026-09-21T23:00:00.000Z'
+            name: shutdown
+            payload:
+              delaySec: 30
+              force: false
+              message: Клуб закрывается
+            expiresAt: '2026-09-21T23:02:00.000Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:103
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:292
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:324
+        - src/ClubShell.Agent/Power/PowerCommands.cs:199
+        - src/ClubShell.Agent/Power/PowerCommands.cs:210
+        - src/ClubShell.Agent/Power/PowerCommands.cs:246
+        - src/ClubShell.Windows/Power/PowerControl.cs:207
+        - docs/SERVER_API.md:520
+        - tools/MockServer/src/routes/admin.ts:261
+    ackShutdown:
+      name: ack.shutdown
+      title: Ack команды shutdown
+      summary: 'Результат — ScheduledResult { scheduledAt }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/ScheduledResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: scheduled
+          payload:
+            type: ack
+            id: 92a3b4c5-d6e7-42f3-8e65-8091a2b3c4d5
+            ts: '2026-09-21T23:00:00.090Z'
+            payload: null
+            ack:
+              id: 8192a3b4-c5d6-41e2-9d54-7f8091a2b3c4
+              ok: true
+              result:
+                scheduledAt: '2026-09-21T23:00:30.090Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:299
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:330
+    commandWake:
+      name: command.wake
+      title: Команда wake
+      summary: Разослать Wake-on-LAN magic packet на targetMac (агент — ретранслятор в LAN).
+      description: Payload обязателен. Отправляется агенту ДРУГОГО, уже включённого ПК той же сети.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: wake
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/WakeCommand'
+      examples:
+        - name: wake
+          payload:
+            type: command
+            id: a3b4c5d6-e7f8-4304-9f76-91a2b3c4d5e6
+            ts: '2026-09-21T09:00:00.000Z'
+            name: wake
+            payload:
+              targetMac: 'AA:BB:CC:DD:EE:FF'
+            expiresAt: '2026-09-21T09:05:00.000Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:106
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:303
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:333
+        - docs/SERVER_API.md:521
+    ackWake:
+      name: ack.wake
+      title: Ack команды wake
+      summary: Результат — нет. policyDenied при power.wolEnabled = false; serverUnavailable, если пакет не ушёл.
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    type: 'null'
+      examples:
+        - name: wolDisabled
+          payload:
+            type: ack
+            id: b4c5d6e7-f809-4415-8a87-a2b3c4d5e6f7
+            ts: '2026-09-21T09:00:00.020Z'
+            payload: null
+            ack:
+              id: a3b4c5d6-e7f8-4304-9f76-91a2b3c4d5e6
+              ok: false
+              error:
+                code: policyDenied
+                message: Denied by policy rule 'power.wolEnabled'
+                details:
+                  rule: power.wolEnabled
+      x-source:
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:336
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:342
+    commandEndSession:
+      name: command.endSession
+      title: Команда endSession
+      summary: Завершить сессию sessionId на ПК; IPC session.ended.
+      description: Payload обязателен. Если на ПК открыта другая сессия — ack notFound.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: endSession
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/EndSessionCommand'
+      examples:
+        - name: endByAdmin
+          payload:
+            type: command
+            id: c5d6e7f8-091a-4526-9b98-b3c4d5e6f708
+            ts: '2026-09-21T11:00:00.000Z'
+            name: endSession
+            payload:
+              sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-001122334455
+              reason: admin
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:109
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:308
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:347
+        - docs/SERVER_API.md:522
+    ackEndSession:
+      name: ack.endSession
+      title: Ack команды endSession
+      summary: 'Результат — SessionResult { session } (итоговая сессия).'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/SessionResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: ended
+          payload:
+            type: ack
+            id: d6e7f809-1a2b-4637-8ca9-c4d5e6f70819
+            ts: '2026-09-21T11:00:00.400Z'
+            payload: null
+            ack:
+              id: c5d6e7f8-091a-4526-9b98-b3c4d5e6f708
+              ok: true
+              result:
+                session:
+                  id: 9c1e2d3f-4a5b-4c6d-8e7f-001122334455
+                  userId: 3f9a8b7c-6d5e-4f40-9a1b-2c3d4e5f6a7b
+                  pcId: 7d2f1c3a-1111-4222-8333-444455556666
+                  state: ended
+                  startedAt: '2026-09-21T09:00:00.000Z'
+                  endsAt: '2026-09-21T11:00:00.300Z'
+                  tariffId: 1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9
+                  secondsLeft: 0
+                  secondsUsed: 7200
+                  cost:
+                    amount: 2400000
+                    currency: UZS
+                  isPrepaid: true
+                  warningsSent: []
+        - name: otherSession
+          summary: На ПК открыта другая сессия
+          payload:
+            type: ack
+            id: e7f8091a-2b3c-4748-9dba-d5e6f708192a
+            ts: '2026-09-21T11:00:00.030Z'
+            payload: null
+            ack:
+              id: c5d6e7f8-091a-4526-9b98-b3c4d5e6f708
+              ok: false
+              error:
+                code: notFound
+                message: Session 9c1e2d3f-4a5b-4c6d-8e7f-001122334455 not found
+                details: null
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:323
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:352
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:356
+    commandExtendSession:
+      name: command.extendSession
+      title: Команда extendSession
+      summary: Продлить сессию на minutes.
+      description: |
+        Payload обязателен. `charge = false` — продление уже оплачено на сервере: агент не списывает, а берёт
+        состояние из `GET /sessions/current`. `charge = true` — агент сам вызывает `POST /sessions/{id}/extend`
+        (списание). Чужой `sessionId` — ack notFound.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: extendSession
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/ExtendSessionCommand'
+      examples:
+        - name: extendPaid
+          payload:
+            type: command
+            id: f8091a2b-3c4d-4859-8eab-e6f708192a3b
+            ts: '2026-09-21T10:50:00.000Z'
+            name: extendSession
+            payload:
+              sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-001122334455
+              minutes: 60
+              charge: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:112
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:316
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:359
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:367
+        - docs/SERVER_API.md:523
+    ackExtendSession:
+      name: ack.extendSession
+      title: Ack команды extendSession
+      summary: 'Результат — SessionResult { session } (сессия после продления).'
+      description: Ошибки кроме общих — sessionNotActive (charge = false, а сессии нет), коды REST-продления (insufficientFunds и т.п.).
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/SessionResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:323
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:372
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:377
+    commandLaunchGame:
+      name: command.launchGame
+      title: Команда launchGame
+      summary: Запустить игру как из шелла (LaunchRequest).
+      description: Payload обязателен.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: launchGame
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/LaunchRequest'
+      examples:
+        - name: launch
+          payload:
+            type: command
+            id: 091a2b3c-4d5e-496a-9fbc-f708192a3b4c
+            ts: '2026-09-21T10:21:00.000Z'
+            name: launchGame
+            payload:
+              gameId: 5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d
+              sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-001122334455
+              userId: 3f9a8b7c-6d5e-4f40-9a1b-2c3d4e5f6a7b
+              useAccountPool: false
+              launchTimeoutSec: 0
+            expiresAt: '2026-09-21T10:23:00.000Z'
+      x-prohibited-note: >-
+        Пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён. Флаг
+        useAccountPool = false пул НЕ отключает: агент берёт аккаунт из пула, если useAccountPool = true ИЛИ у игры в
+        каталоге requiresAccount = true (src/ClubShell.Agent/Games/GameLaunchService.cs:202,
+        src/ClubShell.Contracts/Games/GameInfo.cs:47). До решения Q8 сервер обязан отдавать requiresAccount = false
+        для всех игр в GET /games и GET /games/{id}, а в команде слать useAccountPool = false и не слать accountLeaseId.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:115
+        - src/ClubShell.Contracts/Games/LaunchRequest.cs:51
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:202
+        - src/ClubShell.Contracts/Games/GameInfo.cs:47
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:380
+        - docs/SERVER_API.md:524
+    ackLaunchGame:
+      name: ack.launchGame
+      title: Ack команды launchGame
+      summary: Результат — LaunchResult; провал запуска — ack.ok = true и result.ok = false.
+      description: |
+        `GameLaunchService.LaunchAsync` не бросает исключений при ошибках запуска, а возвращает
+        `LaunchResult { ok: false, error }`; `CommandReceiver` без условий оборачивает его в `CommandAck.Success`.
+        Поэтому провалившийся запуск на проводе выглядит так: `ack.ok = true`, `ack.result.ok = false`,
+        `ack.result.error` = `IpcError`. Сервер, проверяющий только `ack.ok`, посчитает неудачный запуск успешным —
+        обязательно проверять `ack.result.ok`.
+
+        Коды в `ack.result.error.code`: `notFound` (игры нет в каталоге агента), `sessionNotActive` (нет активной
+        сессии или чужой `sessionId`), `policyDenied`, `antiCheatBlocked`, `gameNotInstalled`, `gameLaunchFailed`
+        (`details.stage`), `accountPoolExhausted`, `conflict` (`details.reason = alreadyRunning`), `timeout` (лаунчер не
+        запустил процесс за `launchTimeoutSec`), а также коды из REST-вызовов агента при запуске (аренда аккаунта,
+        сохранения).
+
+        `ack.ok = false` + `ack.error` бывает только для ошибок уровня команды: `validation` (нет payload),
+        `internal` (непредвиденное исключение, неизвестная форма payload), `timeout` (команда истекла по `expiresAt`,
+        5 мин на агенте, вытеснена по REST-пути), `conflict` + `details.reason = superseded` (вытеснена по WS).
+
+        При `result.ok = true` всегда есть `pid`; при `result.ok = false` всегда есть `error`, `pid` отсутствует.
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - allOf:
+                          - $ref: '../openapi/openapi.yaml#/components/schemas/LaunchResult'
+                          - if:
+                              required:
+                                - ok
+                              properties:
+                                ok:
+                                  const: false
+                            then:
+                              required:
+                                - error
+                              properties:
+                                error:
+                                  $ref: '../openapi/openapi.yaml#/components/schemas/IpcError'
+                            else:
+                              required:
+                                - pid
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: launched
+          payload:
+            type: ack
+            id: 1a2b3c4d-5e6f-4a7b-8c9d-a1b2c3d4e5f6
+            ts: '2026-09-21T10:21:04.000Z'
+            payload: null
+            ack:
+              id: 091a2b3c-4d5e-496a-9fbc-f708192a3b4c
+              ok: true
+              result:
+                ok: true
+                pid: 7788
+                startedAt: '2026-09-21T10:21:03.500Z'
+        - name: launchFailed
+          summary: Провал запуска — ack.ok = true, result.ok = false.
+          payload:
+            type: ack
+            id: 4e5f6a7b-8c9d-4e0f-9a1b-c2d3e4f5a6b7
+            ts: '2026-09-21T10:21:01.200Z'
+            payload: null
+            ack:
+              id: 091a2b3c-4d5e-496a-9fbc-f708192a3b4c
+              ok: true
+              result:
+                ok: false
+                startedAt: '2026-09-21T10:21:01.000Z'
+                error:
+                  code: gameLaunchFailed
+                  message: Steam client is not available
+                  details:
+                    stage: launcher
+        - name: commandExpired
+          summary: Ошибка уровня команды — ack.ok = false, ack.error.
+          payload:
+            type: ack
+            id: 5f6a7b8c-9d0e-4f1a-8b2c-d3e4f5a6b7c8
+            ts: '2026-09-21T10:24:00.000Z'
+            payload: null
+            ack:
+              id: 091a2b3c-4d5e-496a-9fbc-f708192a3b4c
+              ok: false
+              error:
+                code: timeout
+                message: Command expired before delivery
+                details: null
+      x-source:
+        - src/ClubShell.Contracts/Games/LaunchRequest.cs:67
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:384
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:145
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:288
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:458
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:255
+    commandKillGame:
+      name: command.killGame
+      title: Команда killGame
+      summary: Завершить игру по pid, по gameId или все игры (если не заданы ни pid, ни gameId).
+      description: |
+        Payload обязателен. Правила выбора цели (`GameLaunchService.KillAsync`); учитываются только игры, запущенные
+        агентом:
+        - задан `pid` — завершается только этот процесс, `gameId` игнорируется (pid приоритетнее); неизвестный `pid` —
+          ack `notFound`;
+        - задан только `gameId` — завершаются все процессы этой игры; если игра не запущена — ack `notFound`;
+        - не заданы ни `pid`, ни `gameId` — завершаются ВСЕ запущенные игры (без ошибки, даже если игр нет —
+          `killed = 0`). Не отправлять payload без `pid` и `gameId`, если цель — не «завершить всё».
+
+        `force = true` — завершить сразу, без мягкого закрытия.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: killGame
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/KillGameCommand'
+      examples:
+        - name: killByGame
+          payload:
+            type: command
+            id: 2b3c4d5e-6f70-4b8c-9dae-b2c3d4e5f607
+            ts: '2026-09-21T10:45:00.000Z'
+            name: killGame
+            payload:
+              gameId: 5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d
+              force: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:118
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:329
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:387
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:295
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:301
+        - src/ClubShell.Contracts/Ipc/IpcMessage.cs:624
+        - docs/SERVER_API.md:525
+    ackKillGame:
+      name: ack.killGame
+      title: Ack команды killGame
+      summary: 'Результат — GamesKillResponse { killed, pids }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/GamesKillResponse'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: killed
+          payload:
+            type: ack
+            id: 3c4d5e6f-7081-4c9d-8ebf-c3d4e5f60718
+            ts: '2026-09-21T10:45:02.000Z'
+            payload: null
+            ack:
+              id: 2b3c4d5e-6f70-4b8c-9dae-b2c3d4e5f607
+              ok: true
+              result:
+                killed: 1
+                pids:
+                  - 7788
+      x-source:
+        - src/ClubShell.Contracts/Ipc/IpcMessage.cs:636
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:391
+    commandSetPolicy:
+      name: command.setPolicy
+      title: Команда setPolicy
+      summary: Применить и закэшировать переданную политику (IPC policy.changed).
+      description: Payload обязателен (Policy целиком). Невалидная политика — ack validation (field = policy).
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: setPolicy
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/Policy'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:121
+        - src/ClubShell.Contracts/Pc/PcInfo.cs:171
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:394
+        - docs/SERVER_API.md:526
+    ackSetPolicy:
+      name: ack.setPolicy
+      title: Ack команды setPolicy
+      summary: 'Результат — SetPolicyResult { version, applied }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/SetPolicyResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: applied
+          payload:
+            type: ack
+            id: 4d5e6f70-8192-4dae-9fc0-d4e5f6071829
+            ts: '2026-09-21T10:46:00.500Z'
+            payload: null
+            ack:
+              id: 5e6f7081-92a3-4ebf-8ad1-e5f60718293a
+              ok: true
+              result:
+                version: 42
+                applied: true
+        - name: invalid
+          payload:
+            type: ack
+            id: 6f708192-a3b4-4fc0-9be2-f60718293a4b
+            ts: '2026-09-21T10:46:00.100Z'
+            payload: null
+            ack:
+              id: 5e6f7081-92a3-4ebf-8ad1-e5f60718293a
+              ok: false
+              error:
+                code: validation
+                message: "Invalid 'policy': shellReplacement is required"
+                details:
+                  field: policy
+                  reason: shellReplacement is required
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:337
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:400
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:405
+    commandReloadPolicy:
+      name: command.reloadPolicy
+      title: Команда reloadPolicy
+      summary: Перечитать политику (GET /agents/{pcId}/policies) и применить.
+      description: Payload нет — сервер пишет null.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: reloadPolicy
+              payload:
+                type: 'null'
+      examples:
+        - name: reload
+          payload:
+            type: command
+            id: 708192a3-b4c5-40d1-8cf3-0718293a4b5c
+            ts: '2026-09-21T10:47:00.000Z'
+            name: reloadPolicy
+            payload: null
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:124
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:408
+        - docs/SERVER_API.md:527
+    ackReloadPolicy:
+      name: ack.reloadPolicy
+      title: Ack команды reloadPolicy
+      summary: 'Результат — ReloadPolicyResult { version }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/ReloadPolicyResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: reloaded
+          payload:
+            type: ack
+            id: 8192a3b4-c5d6-41e2-9d04-18293a4b5c6d
+            ts: '2026-09-21T10:47:00.700Z'
+            payload: null
+            ack:
+              id: 708192a3-b4c5-40d1-8cf3-0718293a4b5c
+              ok: true
+              result:
+                version: 42
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:343
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:411
+    commandScreenshot:
+      name: command.screenshot
+      title: Команда screenshot
+      summary: Снять экран и загрузить PNG PUT-запросом на uploadUrl (Content-Type image/png).
+      description: |
+        Payload обязателен. Агент снимает экран GDI (`BitBlt`) и кодирует кадр в PNG собственным zlib-писателем, затем
+        делает `PUT uploadUrl` с телом PNG и заголовком `Content-Type: image/png` (без авторизации и подписи — URL сам
+        заранее подписан). Сервер подписывает `uploadUrl` под `image/png` (например, для S3 с ограничением
+        Content-Type): URL, подписанный под `image/jpeg`, отклонит загрузку, и агент ответит ack `serverUnavailable`.
+        `quality` на путь GDI не влияет (используется только в запасном пути через шелл, который в текущей версии
+        всегда возвращает null). `maxWidth` — уменьшение ширины. Запрет `remoteAdmin.allowScreenCapture` на агенте —
+        ack `policyDenied`; кадр не получен — ack `internal`; не-2xx ответ или сетевая ошибка при PUT — ack
+        `serverUnavailable`.
+      x-discrepancy: >-
+        SERVER_API.md:528 («PUT JPEG to uploadUrl») и doc-комментарии ScreenshotCommand.Quality/UploadUrl
+        (src/ClubShell.Contracts/Commands/ServerCommand.cs:346-347, «JPEG») расходятся с кодом:
+        src/ClubShell.Agent/Remote/ScreenCapture.cs:28,35,127 загружает PNG с Content-Type image/png, quality
+        игнорируется (ScreenCapture.cs:43, запасной путь через шелл — src/ClubShell.Agent/Ipc/PipeServer.cs:312 всегда
+        null). Контракт следует коду.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: screenshot
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/ScreenshotCommand'
+      examples:
+        - name: screenshot
+          payload:
+            type: command
+            id: 92a3b4c5-d6e7-42f3-8e15-293a4b5c6d7e
+            ts: '2026-09-21T10:48:00.000Z'
+            name: screenshot
+            payload:
+              quality: 70
+              uploadUrl: 'https://club.example.uz/uploads/screens/92a3b4c5.png?sig=abc'
+              maxWidth: 1280
+            expiresAt: '2026-09-21T10:49:00.000Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:127
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:350
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:422
+        - src/ClubShell.Agent/Remote/ScreenCapture.cs:28
+        - src/ClubShell.Agent/Remote/ScreenCapture.cs:35
+        - src/ClubShell.Agent/Remote/ScreenCapture.cs:127
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:312
+        - docs/SERVER_API.md:528
+    ackScreenshot:
+      name: ack.screenshot
+      title: Ack команды screenshot
+      summary: 'Результат — ScreenshotResult { width, height, bytes, uploadedAt }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/ScreenshotResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: uploaded
+          payload:
+            type: ack
+            id: a3b4c5d6-e7f8-4304-9f26-3a4b5c6d7e8f
+            ts: '2026-09-21T10:48:01.200Z'
+            payload: null
+            ack:
+              id: 92a3b4c5-d6e7-42f3-8e15-293a4b5c6d7e
+              ok: true
+              result:
+                width: 1280
+                height: 720
+                bytes: 183422
+                uploadedAt: '2026-09-21T10:48:01.150Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:361
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:426
+    commandRemoteControlStart:
+      name: command.remoteControlStart
+      title: Команда remoteControlStart
+      summary: Подключиться к релею (wss) и транслировать экран; при allowInput — принимать ввод администратора.
+      description: |
+        Payload обязателен. Агент подключается к `relayUrl` с `Authorization: Bearer <sessionToken>`, шлёт кадры экрана
+        бинарными сообщениями с частотой `fps` и (если разрешено и командой, и `remoteAdmin.allowRemoteInput` агента)
+        применяет события мыши/клавиатуры от релея через `SendInput`. Повтор с тем же `sessionToken` возвращает текущую
+        сессию; другой токен — останавливает прежнюю. Сессия ограничена 2 ч и 5 мин без ввода. Протокол релея вне этого
+        контракта. Запрет remoteAdmin.allowScreenCapture — ack policyDenied; релей недоступен — ack serverUnavailable.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: remoteControlStart
+              payload:
+                allOf:
+                  - $ref: '../openapi/openapi.yaml#/components/schemas/RemoteControlStartCommand'
+                  - type: object
+                    properties:
+                      allowInput:
+                        x-note: >-
+                          true: агент шлёт SendInput без проверки активного античита
+                          (src/ClubShell.Agent/Remote/RemoteInput.cs:216, :459) — риск бана.
+      examples:
+        - name: viewOnly
+          payload:
+            type: command
+            id: b4c5d6e7-f809-4415-8a37-4b5c6d7e8f90
+            ts: '2026-09-21T10:50:00.000Z'
+            name: remoteControlStart
+            payload:
+              sessionToken: rc_6d7e8f90a1b2
+              relayUrl: 'wss://relay.club.example.uz/rc'
+              fps: 5
+              allowInput: false
+              adminName: Администратор
+            expiresAt: '2026-09-21T10:51:00.000Z'
+      x-note: >-
+        allowInput = true: агент шлёт SendInput без проверки активного античита
+        (src/ClubShell.Agent/Remote/RemoteInput.cs:216 — allowInput = команда && remoteAdmin.allowRemoteInput, по
+        умолчанию true; RemoteInput.cs:459 — User32.SendInput) — синтетический ввод во время игры с EAC/BattlEye/
+        Vanguard/FACEIT и т.п. — риск бана. Сервер не отправляет allowInput = true, пока на ПК идёт игра с античитом.
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:130
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:373
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:429
+        - src/ClubShell.Agent/Remote/RemoteInput.cs:100
+        - src/ClubShell.Agent/Remote/RemoteInput.cs:216
+        - src/ClubShell.Agent/Remote/RemoteInput.cs:459
+        - docs/SERVER_API.md:529
+    ackRemoteControlStart:
+      name: ack.remoteControlStart
+      title: Ack команды remoteControlStart
+      summary: 'Результат — RemoteControlStartResult { startedAt }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/RemoteControlStartResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: started
+          payload:
+            type: ack
+            id: c5d6e7f8-091a-4526-9b48-5c6d7e8f90a1
+            ts: '2026-09-21T10:50:00.600Z'
+            payload: null
+            ack:
+              id: b4c5d6e7-f809-4415-8a37-4b5c6d7e8f90
+              ok: true
+              result:
+                startedAt: '2026-09-21T10:50:00.550Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:382
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:433
+    commandRemoteControlStop:
+      name: command.remoteControlStop
+      title: Команда remoteControlStop
+      summary: Остановить удалённое управление (IPC admin.remoteControl{stopped}).
+      description: Payload обязателен.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: remoteControlStop
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/RemoteControlStopCommand'
+      examples:
+        - name: stop
+          payload:
+            type: command
+            id: d6e7f809-1a2b-4637-8c59-6d7e8f90a1b2
+            ts: '2026-09-21T11:05:00.000Z'
+            name: remoteControlStop
+            payload:
+              sessionToken: rc_6d7e8f90a1b2
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:133
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:386
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:436
+        - docs/SERVER_API.md:530
+    ackRemoteControlStop:
+      name: ack.remoteControlStop
+      title: Ack команды remoteControlStop
+      summary: 'Результат — RemoteControlStopResult { stoppedAt, durationSec }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/RemoteControlStopResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: stopped
+          payload:
+            type: ack
+            id: e7f8091a-2b3c-4748-9d6a-7e8f90a1b2c3
+            ts: '2026-09-21T11:05:00.400Z'
+            payload: null
+            ack:
+              id: d6e7f809-1a2b-4637-8c59-6d7e8f90a1b2
+              ok: true
+              result:
+                stoppedAt: '2026-09-21T11:05:00.350Z'
+                durationSec: 900
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:391
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:440
+    commandUpdate:
+      name: command.update
+      title: Команда update
+      summary: Проверить/подготовить/применить обновление компонента (agent | shell).
+      description: |
+        Payload обязателен. `manifest` задан — агент скачивает `manifest.url` (Bearer, Range), проверяет SHA-256 и
+        подпись и готовит пакет; `manifest` нет — агент сам запрашивает `GET /updates/{channel}/manifest`
+        (в v1 notImplemented → сервер v1 обязан передавать manifest). `manifest.component` ≠ `component` — ack internal.
+
+        `applyNow = true` — пакет применяется НЕМЕДЛЕННО, без проверки сессии и окна применения
+        (`AgentUpdater.HandleCommandAsync`): для `component = agent` это перезапуск службы агента даже во время
+        игровой сессии. Сервер отправляет `applyNow = true` только на свободный ПК (без открытой сессии).
+        `applyNow = false` — пакет готовится, применение — по обычным правилам агента (сессия, окно, `mandatory`).
+
+        Результат: `scheduled = true` — пакет подготовлен (при `applyNow = false`) или передан на применение (при
+        `applyNow = true`). Сбой скачивания/проверки SHA-256 или подписи/подготовки, отсутствие ключа подписи на
+        агенте, «нечего применять» и сбой применения приходят НЕ как `ack.error`, а как `ack.ok = true` +
+        `result.scheduled = false` (подробности — только в логе агента и IPC `update.progress`).
+      x-discrepancy: >-
+        Doc-комментарий UpdateCommand.ApplyNow (src/ClubShell.Contracts/Commands/ServerCommand.cs:397, «subject to
+        session/mandatory rules») расходится с кодом: src/ClubShell.Agent/Updates/AgentUpdater.cs:134-135 и :175-178
+        применяют пакет сразу, без проверки сессии и окна. Контракт следует коду.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: update
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/UpdateCommand'
+      examples:
+        - name: updateAgent
+          payload:
+            type: command
+            id: f8091a2b-3c4d-4859-8e7b-8f90a1b2c3d4
+            ts: '2026-09-21T04:00:00.000Z'
+            name: update
+            payload:
+              component: agent
+              applyNow: false
+              manifest:
+                channel: stable
+                component: agent
+                version: 1.4.3
+                url: 'https://club.example.uz/api/v1/updates/stable/packages/agent-1.4.3.zip'
+                sha256: 3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855e
+                size: 48213504
+                signature: c2lnbmF0dXJlLWJ5dGVz
+                releaseNotes: Исправления стабильности
+                mandatory: false
+                publishedAt: '2026-09-20T12:00:00.000Z'
+            expiresAt: '2026-09-21T06:00:00.000Z'
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:136
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:399
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:69
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:443
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:134
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:137
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:175
+        - docs/SERVER_API.md:531
+    ackUpdate:
+      name: ack.update
+      title: Ack команды update
+      summary: 'Результат — UpdateApplyResponse { scheduled, at? }; сбой подготовки — ack.ok = true и scheduled = false.'
+      description: |
+        `scheduled = true` — пакет подготовлен (`applyNow = false`) или передан на применение (`applyNow = true`).
+        `scheduled = false` при `ack.ok = true` — ничего не подготовлено/не применено: сбой скачивания или проверки
+        (SHA-256, подпись), нет ключа подписи на агенте, нечего применять на канале, сбой применения
+        (`AgentUpdater.StageAsync` возвращает null без исключения). `ack.error` бывает только для ошибок уровня
+        команды (`validation`, `internal` — в т.ч. `manifest.component` ≠ `component`, `timeout`, `conflict`/superseded).
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/UpdateApplyResponse'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: staged
+          summary: Пакет скачан, проверен и подготовлен (applyNow = false).
+          payload:
+            type: ack
+            id: 091a2b3c-4d5e-496a-9f8c-90a1b2c3d4e5
+            ts: '2026-09-21T04:02:10.000Z'
+            payload: null
+            ack:
+              id: f8091a2b-3c4d-4859-8e7b-8f90a1b2c3d4
+              ok: true
+              result:
+                scheduled: true
+        - name: stageFailed
+          summary: Сбой скачивания/проверки/подготовки — ack.ok = true, но scheduled = false.
+          payload:
+            type: ack
+            id: 1a2b3c4d-5e6f-4a7b-9c8d-0e1f2a3b4c5d
+            ts: '2026-09-21T04:02:10.000Z'
+            payload: null
+            ack:
+              id: f8091a2b-3c4d-4859-8e7b-8f90a1b2c3d4
+              ok: true
+              result:
+                scheduled: false
+      x-source:
+        - src/ClubShell.Contracts/Ipc/IpcMessage.cs:1162
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:447
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:164
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:170
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:180
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:417
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:442
+        - src/ClubShell.Agent/Updates/AgentUpdater.cs:464
+    commandShowAds:
+      name: command.showAds
+      title: Команда showAds
+      summary: Показать рекламный плейлист в шелле (IPC shell.command{showAds}).
+      description: Payload обязателен.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: showAds
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/ShowAdsArgs'
+      examples:
+        - name: ads
+          payload:
+            type: command
+            id: 1a2b3c4d-5e6f-4a7b-8c9d-a0b1c2d3e4f5
+            ts: '2026-09-21T12:00:00.000Z'
+            name: showAds
+            payload:
+              items:
+                - url: 'https://club.example.uz/ads/promo.mp4'
+                  type: video
+                  durationSec: 15
+              skippable: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:139
+        - src/ClubShell.Contracts/Ipc/IpcMessage.cs:1341
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:450
+        - docs/SERVER_API.md:532
+    ackShowAds:
+      name: ack.showAds
+      title: Ack команды showAds
+      summary: Результат — нет.
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    type: 'null'
+      x-source:
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:454
+    commandSetVolume:
+      name: command.setVolume
+      title: Команда setVolume
+      summary: Установить громкость 0–100 (агент зажимает значение в диапазон).
+      description: Payload обязателен.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: setVolume
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/SetVolumeRequest'
+      examples:
+        - name: volume
+          payload:
+            type: command
+            id: 2b3c4d5e-6f70-4b8c-9dae-b1c2d3e4f506
+            ts: '2026-09-21T12:05:00.000Z'
+            name: setVolume
+            payload:
+              level: 30
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:142
+        - src/ClubShell.Contracts/Ipc/IpcMessage.cs:1059
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:457
+        - docs/SERVER_API.md:533
+    ackSetVolume:
+      name: ack.setVolume
+      title: Ack команды setVolume
+      summary: 'Результат — VolumeState { level, muted }.'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/VolumeState'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: applied
+          payload:
+            type: ack
+            id: 3c4d5e6f-7081-4c9d-8ebf-c2d3e4f50617
+            ts: '2026-09-21T12:05:00.030Z'
+            payload: null
+            ack:
+              id: 2b3c4d5e-6f70-4b8c-9dae-b1c2d3e4f506
+              ok: true
+              result:
+                level: 30
+                muted: false
+      x-source:
+        - src/ClubShell.Contracts/Ipc/IpcMessage.cs:1066
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:466
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:470
+    commandRefreshConfig:
+      name: command.refreshConfig
+      title: Команда refreshConfig
+      summary: Перечитать выбранные кэши агента; ни одного флага true (или payload null) — все.
+      description: Payload необязателен.
+      tags:
+        - $ref: '#/components/tags/command'
+      correlationId:
+        $ref: '#/components/correlationIds/commandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsCommandFrame'
+          - type: object
+            properties:
+              name:
+                const: refreshConfig
+              payload:
+                oneOf:
+                  - $ref: '../openapi/openapi.yaml#/components/schemas/RefreshConfigCommand'
+                  - type: 'null'
+      examples:
+        - name: refreshGames
+          payload:
+            type: command
+            id: 4d5e6f70-8192-4dae-9fc0-d3e4f5061728
+            ts: '2026-09-21T12:10:00.000Z'
+            name: refreshConfig
+            payload:
+              games: true
+              apps: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:145
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:411
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:475
+        - docs/SERVER_API.md:534
+    ackRefreshConfig:
+      name: ack.refreshConfig
+      title: Ack команды refreshConfig
+      summary: 'Результат — RefreshConfigResult { refreshed: string[] } (config, games, tariffs, products, themes).'
+      tags:
+        - $ref: '#/components/tags/ack'
+      correlationId:
+        $ref: '#/components/correlationIds/ackCommandId'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsAckFrame'
+          - type: object
+            properties:
+              ack:
+                properties:
+                  result:
+                    oneOf:
+                      - $ref: '../openapi/openapi.yaml#/components/schemas/RefreshConfigResult'
+                      - type: 'null'
+                if:
+                  required:
+                    - ok
+                  properties:
+                    ok:
+                      const: true
+                then:
+                  required:
+                    - result
+      examples:
+        - name: refreshed
+          payload:
+            type: ack
+            id: 5e6f7081-92a3-4ebf-8ad1-e4f506172839
+            ts: '2026-09-21T12:10:01.500Z'
+            payload: null
+            ack:
+              id: 4d5e6f70-8192-4dae-9fc0-d3e4f5061728
+              ok: true
+              result:
+                refreshed:
+                  - games
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:426
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:477
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:480
+
+    # ==== События агент -> сервер =====================================================================================
+    eventSessionStarted:
+      name: event.sessionStarted
+      title: Событие sessionStarted
+      summary: 'Сессия началась: { session }.'
+      description: Описано в C# и SERVER_API, но агент по WS его не шлёт — начало сессии сервер видит по REST (POST /sessions, POST /sessions/{id}/events).
+      tags:
+        - $ref: '#/components/tags/event'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsEventFrame'
+          - type: object
+            properties:
+              name:
+                const: sessionStarted
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/SessionStartedEvent'
+      x-agent-emits: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:437
+        - src/ClubShell.Contracts/Session/SessionEvent.cs:135
+        - docs/SERVER_API.md:540
+    eventSessionEnded:
+      name: event.sessionEnded
+      title: Событие sessionEnded
+      summary: 'Сессия завершилась: { session, reason, charged }.'
+      description: Агент публикует SessionEndedEvent только в IPC шеллу (SessionManager.cs:933), по WS не шлёт; сервер узнаёт о завершении по REST (POST /sessions/{id}/end, /events).
+      tags:
+        - $ref: '#/components/tags/event'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsEventFrame'
+          - type: object
+            properties:
+              name:
+                const: sessionEnded
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/SessionEndedEvent'
+      x-agent-emits: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:440
+        - src/ClubShell.Contracts/Session/SessionEvent.cs:128
+        - src/ClubShell.Agent/Session/SessionManager.cs:933
+        - docs/SERVER_API.md:541
+    eventGameLaunched:
+      name: event.gameLaunched
+      title: Событие gameLaunched
+      summary: Игра запущена.
+      description: По WS агент не шлёт; запуск сервер видит через POST /games/{id}/launch-report.
+      tags:
+        - $ref: '#/components/tags/event'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsEventFrame'
+          - type: object
+            properties:
+              name:
+                const: gameLaunched
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/GameLaunchedEvent'
+      examples:
+        - name: launched
+          payload:
+            type: event
+            id: e1f20314-2536-4758-89a0-b1c2d3e4f5a6
+            ts: '2026-09-21T10:21:00.000Z'
+            name: gameLaunched
+            payload:
+              sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-001122334455
+              gameId: 5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d
+              pid: 7788
+              at: '2026-09-21T10:21:00.000Z'
+      x-agent-emits: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:443
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:482
+        - docs/SERVER_API.md:542
+    eventGameExited:
+      name: event.gameExited
+      title: Событие gameExited
+      summary: Игра завершилась.
+      description: По WS агент не шлёт (GameSessionTracker.Exited уходит только в IPC/учёт агента).
+      tags:
+        - $ref: '#/components/tags/event'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsEventFrame'
+          - type: object
+            properties:
+              name:
+                const: gameExited
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/GameExitedEvent'
+      examples:
+        - name: exited
+          payload:
+            type: event
+            id: f2031425-3647-4869-8ab1-c2d3e4f5a6b7
+            ts: '2026-09-21T11:40:00.000Z'
+            name: gameExited
+            payload:
+              sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-001122334455
+              gameId: 5a6b7c8d-9e0f-4a1b-8c2d-3e4f5a6b7c8d
+              pid: 7788
+              exitCode: 0
+              playedSec: 4740
+              at: '2026-09-21T11:40:00.000Z'
+      x-agent-emits: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:446
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:496
+        - src/ClubShell.Agent/Games/GameSessionTracker.cs:248
+        - docs/SERVER_API.md:543
+    eventAnticheatViolation:
+      name: event.anticheatViolation
+      title: Событие anticheatViolation
+      summary: Находка античит-монитора (тело = AntiCheatReport, как у POST /anticheat/report).
+      description: |
+        Агент шлёт событие при каждой находке, затем (если `anticheat.reportViolations`) дублирует `POST /anticheat/report`.
+        REST-маршрут в v1 notImplemented, поэтому для сервера v1 это единственный канал; при разорванном WS находка
+        теряется. `payload.at` — время находки.
+      tags:
+        - $ref: '#/components/tags/event'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsEventFrame'
+          - type: object
+            properties:
+              name:
+                const: anticheatViolation
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/AntiCheatReport'
+      x-agent-emits: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:449
+        - src/ClubShell.Contracts/Games/LauncherType.cs:147
+        - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:347
+        - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:361
+        - docs/SERVER_API.md:544
+    eventHardwareChanged:
+      name: event.hardwareChanged
+      title: Событие hardwareChanged
+      summary: 'Изменилась аппаратная конфигурация: { hardware, diff }.'
+      description: Шлётся при пересканировании; та же инвентаризация приходит и в следующем POST /agents/{pcId}/telemetry (поле hardware), так что потеря события не критична.
+      tags:
+        - $ref: '#/components/tags/event'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsEventFrame'
+          - type: object
+            properties:
+              name:
+                const: hardwareChanged
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/HardwareChangedEvent'
+      x-agent-emits: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:452
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:507
+        - src/ClubShell.Agent/Server/TelemetryReporter.cs:257
+        - docs/SERVER_API.md:545
+    eventOfflineQueueFlushed:
+      name: event.offlineQueueFlushed
+      title: Событие offlineQueueFlushed
+      summary: 'Outbox доставлен после офлайна: { count, deadlettered, offlineFrom, offlineTo }.'
+      description: Информационное; сами записи outbox пришли по REST. Шлётся только если что-то было отправлено или ушло в dead-letter.
+      tags:
+        - $ref: '#/components/tags/event'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsEventFrame'
+          - type: object
+            properties:
+              name:
+                const: offlineQueueFlushed
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/OfflineQueueFlushedEvent'
+      examples:
+        - name: flushed
+          payload:
+            type: event
+            id: 03142536-4758-497a-8bc2-d3e4f5a6b7c8
+            ts: '2026-09-21T10:15:31.000Z'
+            name: offlineQueueFlushed
+            payload:
+              count: 12
+              deadlettered: 0
+              offlineFrom: '2026-09-21T09:58:02.000Z'
+              offlineTo: '2026-09-21T10:15:30.000Z'
+      x-agent-emits: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:455
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:516
+        - src/ClubShell.Agent/AgentWorker.cs:418
+        - docs/SERVER_API.md:546
+
+    # ==== Push сервер -> агент ========================================================================================
+    pushWalletUpdated:
+      name: push.walletUpdated
+      title: Push walletUpdated
+      summary: Баланс пользователя изменился → IPC wallet.updated.
+      description: Адресат — ПК, где пользователь авторизован.
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: walletUpdated
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/Balance'
+      examples:
+        - name: topUp
+          payload:
+            type: push
+            id: 14253647-5869-4a8b-9cd3-e4f5a6b7c8d9
+            ts: '2026-09-21T10:22:00.000Z'
+            name: walletUpdated
+            payload:
+              userId: 3f9a8b7c-6d5e-4f40-9a1b-2c3d4e5f6a7b
+              amount:
+                amount: 2000000
+                currency: UZS
+              bonus:
+                amount: 50000
+                currency: UZS
+              currency: UZS
+              updatedAt: '2026-09-21T10:22:00.000Z'
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:554
+        - src/ClubShell.Contracts/Wallet/Balance.cs:250
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:246
+        - docs/SERVER_API.md:556
+        - tools/MockServer/src/routes/wallet.ts:65
+    pushChatMessage:
+      name: push.chatMessage
+      title: Push chatMessage
+      summary: Новое сообщение чата → IPC chat.message.
+      description: Адресация по комнате (info §9); отправителю не дублируется.
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: chatMessage
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/ChatMessage'
+      examples:
+        - name: clubChat
+          payload:
+            type: push
+            id: 25364758-697a-4b8c-8de4-f5a6b7c8d9e0
+            ts: '2026-09-21T10:23:00.000Z'
+            name: chatMessage
+            payload:
+              id: 36475869-7a8b-4c9d-9ef5-a6b7c8d9e0f1
+              roomId: club
+              senderId: 3f9a8b7c-6d5e-4f40-9a1b-2c3d4e5f6a7b
+              senderName: Bobur
+              senderRole: member
+              text: Кто на турнир?
+              createdAt: '2026-09-21T10:23:00.000Z'
+              readAt: null
+              kind: text
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:557
+        - src/ClubShell.Contracts/Users/UserProfile.cs:258
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:249
+        - docs/SERVER_API.md:557
+        - tools/MockServer/src/routes/chat.ts:93
+    pushNotification:
+      name: push.notification
+      title: Push notification
+      summary: Уведомление → IPC notification.push.
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: notification
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/Notification'
+      examples:
+        - name: orderDelivered
+          payload:
+            type: push
+            id: 4758697a-8b9c-4dae-8f06-b7c8d9e0f1a2
+            ts: '2026-09-21T10:24:00.000Z'
+            name: notification
+            payload:
+              id: 58697a8b-9cad-4ebf-9017-c8d9e0f1a2b3
+              title: Заказ доставлен
+              body: Приятного аппетита!
+              level: success
+              ttlSec: 10
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:560
+        - src/ClubShell.Contracts/Users/UserProfile.cs:195
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:252
+        - docs/SERVER_API.md:558
+        - tools/MockServer/src/routes/shop.ts:58
+        - tools/MockServer/src/routes/pcs.ts:266
+    pushOrderUpdated:
+      name: push.orderUpdated
+      title: Push orderUpdated
+      summary: Заказ изменился → IPC shop.orderUpdated + notification.push (агент формирует уведомление сам).
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: orderUpdated
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/Order'
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:563
+        - src/ClubShell.Contracts/Shop/Order.cs:77
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:255
+        - docs/SERVER_API.md:559
+        - tools/MockServer/src/routes/shop.ts:56
+    pushBookingUpdated:
+      name: push.bookingUpdated
+      title: Push bookingUpdated
+      summary: Бронь изменилась → IPC notification.push (агент формирует уведомление сам).
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: bookingUpdated
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/Booking'
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:566
+        - src/ClubShell.Contracts/Users/UserProfile.cs:320
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:264
+        - docs/SERVER_API.md:560
+        - tools/MockServer/src/routes/chat.ts:266
+    pushTournamentUpdated:
+      name: push.tournamentUpdated
+      title: Push tournamentUpdated
+      summary: Турнир изменился → IPC notification.push (агент формирует уведомление сам).
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: tournamentUpdated
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/Tournament'
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:569
+        - src/ClubShell.Contracts/Users/UserProfile.cs:392
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:274
+        - docs/SERVER_API.md:561
+        - tools/MockServer/src/routes/chat.ts:309
+    pushSessionUpdated:
+      name: push.sessionUpdated
+      title: Push sessionUpdated
+      summary: Серверная версия сессии ПК → агент сверяет состояние (сервер авторитетен), IPC session.updated.
+      description: Адресат — ПК сессии. Шлётся при старте, паузе/возобновлении, продлении и завершении сессии с кассы или сервером.
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: sessionUpdated
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/Session'
+      examples:
+        - name: extended
+          payload:
+            type: push
+            id: 697a8b9c-adbe-4fc0-8128-d9e0f1a2b3c4
+            ts: '2026-09-21T10:50:00.500Z'
+            name: sessionUpdated
+            payload:
+              id: 9c1e2d3f-4a5b-4c6d-8e7f-001122334455
+              userId: 3f9a8b7c-6d5e-4f40-9a1b-2c3d4e5f6a7b
+              pcId: 7d2f1c3a-1111-4222-8333-444455556666
+              state: active
+              startedAt: '2026-09-21T09:00:00.000Z'
+              endsAt: '2026-09-21T12:00:00.000Z'
+              tariffId: 1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9
+              secondsLeft: 4200
+              secondsUsed: 6600
+              cost:
+                amount: 3600000
+                currency: UZS
+              isPrepaid: true
+              warningsSent: []
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:572
+        - src/ClubShell.Contracts/Session/SessionState.cs:60
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:283
+        - docs/SERVER_API.md:562
+        - tools/MockServer/src/routes/session.ts:100
+    pushPcStatusChanged:
+      name: push.pcStatusChanged
+      title: Push pcStatusChanged
+      summary: Статус ПК клуба изменился (карта мест); рассылается всем подключённым ПК.
+      description: Текущий агент этот push игнорирует (нет обработчика в PipeServer) — сервер может не слать его до появления потребителя.
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: pcStatusChanged
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/PcStatusChangedPush'
+      examples:
+        - name: busy
+          payload:
+            type: push
+            id: 7a8b9cad-becf-40d1-9239-e0f1a2b3c4d5
+            ts: '2026-09-21T09:00:00.100Z'
+            name: pcStatusChanged
+            payload:
+              pcId: 7d2f1c3a-1111-4222-8333-444455556666
+              status: busy
+      x-agent-handles: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:575
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:603
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:300
+        - docs/SERVER_API.md:563
+        - tools/MockServer/src/routes/session.ts:95
+        - tools/MockServer/src/health.ts:291
+    pushUserRevoked:
+      name: push.userRevoked
+      title: Push userRevoked
+      summary: Пользователь отозван (блокировка, смена пароля и т.п.).
+      description: |
+        Агент, если на ПК авторизован именно этот `userId`, завершает его сессию, очищает пользователя и шлёт шеллу
+        `auth.expired{revoked}`. Сервер параллельно инвалидирует его `X-User-Token`. Адресат — ПК, где пользователь
+        авторизован. Мок этот push не генерирует.
+      tags:
+        - $ref: '#/components/tags/push'
+      payload:
+        allOf:
+          - $ref: '#/components/schemas/WsPushFrame'
+          - type: object
+            properties:
+              name:
+                const: userRevoked
+              payload:
+                $ref: '../openapi/openapi.yaml#/components/schemas/UserRevokedPush'
+      examples:
+        - name: blocked
+          payload:
+            type: push
+            id: 8b9cadbe-cfd0-41e2-8a4a-f1a2b3c4d5e6
+            ts: '2026-09-21T10:55:00.000Z'
+            name: userRevoked
+            payload:
+              userId: 3f9a8b7c-6d5e-4f40-9a1b-2c3d4e5f6a7b
+              reason: blocked
+      x-agent-handles: true
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:578
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:610
+        - src/ClubShell.Agent/Ipc/PipeServer.cs:290
+        - docs/SERVER_API.md:564
+
+    # ==== Keepalive ===================================================================================================
+    ping:
+      name: ping
+      title: Ping сервера
+      summary: Кадр ping; сервер шлёт каждые 20 с.
+      tags:
+        - $ref: '#/components/tags/keepalive'
+      correlationId:
+        $ref: '#/components/correlationIds/pingId'
+      payload:
+        $ref: '#/components/schemas/WsPingFrame'
+      examples:
+        - name: ping
+          payload:
+            type: ping
+            id: 9cadbecf-d0e1-42f3-9b5b-a2b3c4d5e6f7
+            ts: '2026-09-21T10:20:20.000Z'
+            payload: null
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:540
+        - tools/MockServer/src/ws.ts:232
+        - docs/SERVER_API.md:494
+    pong:
+      name: pong
+      title: Pong агента
+      summary: Ответ агента на ping; `id` = id ping; сервер ждёт 10 с.
+      tags:
+        - $ref: '#/components/tags/keepalive'
+      correlationId:
+        $ref: '#/components/correlationIds/pingId'
+      payload:
+        $ref: '#/components/schemas/WsPongFrame'
+      examples:
+        - name: pong
+          payload:
+            type: pong
+            id: 9cadbecf-d0e1-42f3-9b5b-a2b3c4d5e6f7
+            ts: '2026-09-21T10:20:20.015Z'
+            payload: null
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:670
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:340
+        - tools/MockServer/src/ws.ts:205
+    agentPing:
+      name: agentPing
+      title: Ping агента
+      summary: Необязательный ping от агента (текущий агент не шлёт; есть WsFrame.Ping и обработка в моке).
+      tags:
+        - $ref: '#/components/tags/keepalive'
+      correlationId:
+        $ref: '#/components/correlationIds/pingId'
+      payload:
+        $ref: '#/components/schemas/WsPingFrame'
+      x-agent-emits: false
+      x-source:
+        - src/ClubShell.Contracts/Commands/ServerCommand.cs:677
+        - tools/MockServer/src/ws.ts:211
+    serverPong:
+      name: serverPong
+      title: Pong сервера
+      summary: Ответ сервера на ping агента; `id` = id ping (агент входящие pong игнорирует).
+      tags:
+        - $ref: '#/components/tags/keepalive'
+      correlationId:
+        $ref: '#/components/correlationIds/pingId'
+      payload:
+        $ref: '#/components/schemas/WsPongFrame'
+      x-source:
+        - tools/MockServer/src/ws.ts:212
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:355

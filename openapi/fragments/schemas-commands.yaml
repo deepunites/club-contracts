@@ -1,0 +1,1613 @@
+# Группа schemas-commands: публичные типы из
+#   src/ClubShell.Contracts/Commands/ServerCommand.cs (регистрация/refresh/heartbeat/telemetry агента, WS-кадры,
+#     команды сервер -> агент с payload и результатами, события агента, push-уведомления, UpdateManifest),
+#   src/ClubShell.Contracts/Errors/ErrorCode.cs (ErrorCode, ServerErrorEnvelope, ServerError),
+#   src/ClubShell.Contracts/Ipc/IpcErrors.cs (IpcError и все *Details).
+# Пропущены: IpcException (исключение, не провод); статические классы-помощники без данных
+#   ServerCommandTypes, WsPushKinds, ErrorCodes (таблицы ErrorCodes перенесены в x-* расширения схемы ErrorCode);
+#   Commands/AgentCommand.cs (IPC агент <-> шелл; ни один серверный тип его не использует).
+# TelemetryEventKinds (класс строковых констант) описан как открытый набор строк — по образцу PeripheralKinds.
+# Внешние схемы (определяют другие группы, здесь только $ref): Money, AntiCheatKind, HardwareInfo, Pc,
+#   AgentServerConfig, PcStatus, PcMetrics, Session, SessionEndReason, NotificationLevel, CallAdminCategory,
+#   LaunchRequest, LaunchResult, Policy, GamesKillResponse, UpdateApplyResponse, ShowAdsArgs, SetVolumeRequest,
+#   VolumeState, SessionStartedEvent, SessionEndedEvent, AntiCheatReport, Balance, ChatMessage, Notification,
+#   Order, Booking, Tournament (последние — только по имени в x-*-schemas, не через $ref).
+# Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter; неизвестная
+# строка = JsonException у агента), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
+# DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ. Переопределения в этих файлах: JsonIgnore(Never) у ServerError.details,
+# IpcError.details, WsFrame.payload (ключ пишется всегда, даже null); [JsonIgnore] у RefreshConfigCommand.IsAll,
+# AgentEvent.WireName, IpcError.IsRetryable (на провод не попадают). JsonPolymorphic/JsonPropertyName нет.
+components:
+  schemas:
+
+    # ------------------------------------------------------------------ Errors/ErrorCode.cs
+
+    ErrorCode:
+      type: string
+      enum:
+        - unauthorized
+        - forbidden
+        - notFound
+        - validation
+        - conflict
+        - insufficientFunds
+        - sessionNotActive
+        - sessionAlreadyActive
+        - gameNotInstalled
+        - gameLaunchFailed
+        - accountPoolExhausted
+        - antiCheatBlocked
+        - policyDenied
+        - agentOffline
+        - serverUnavailable
+        - timeout
+        - rateLimited
+        - internal
+        - protocolError
+        - versionMismatch
+      description: >-
+        Код ошибки; один и тот же набор в REST-конверте (error.code), IPC (IpcError.code) и шелле. Сервер обязан
+        использовать только эти значения: неизвестную строку агент не распарсит, весь конверт будет отброшен, код
+        выведется из HTTP-статуса (x-from-http-status), а message и details потеряются. HTTP-статус ответа должен
+        совпадать с x-http-status. agentOffline, protocolError (для IPC-кадров) и timeout в основном порождает сам
+        агент; «не реализовано» (501) передаётся как serverUnavailable c details.reason = notImplemented.
+      x-enum-descriptions:
+        unauthorized: Не аутентифицирован, неверный/истёкший токен или учётные данные (401).
+        forbidden: Аутентифицирован, но нет прав (роль, привязка, возможность) (403).
+        notFound: >-
+          Сущность (или имя IPC-сообщения) не найдена (404). В REST details = null или свободный объект (мок шлёт
+          { what }); details { name } (C# NameDetails) бывают только в IPC и в контракт не входят.
+        validation: Неверные данные; details = ValidationDetails (400).
+        conflict: Конфликт состояния — дубликат, нет в наличии, уже вступил (409).
+        insufficientFunds: Недостаточно средств; details = InsufficientFundsDetails (402).
+        sessionNotActive: >-
+          Операции нужна активная/приостановленная сессия (409); details = { session: Session } или null. Если
+          сессия уже завершена, сервер обязан вернуть details.session (state = ended): на POST /sessions/{id}/end
+          агент считает такой ответ успехом (идемпотентный повтор завершения), без details.session повтор упадёт.
+        sessionAlreadyActive: Сессия уже открыта (409).
+        gameNotInstalled: Игра не установлена или нет пути установки (409).
+        gameLaunchFailed: Ошибка лаунчера; details = LaunchFailedDetails (500).
+        accountPoolExhausted: Нет свободного аккаунта из пула (409).
+        antiCheatBlocked: Не выполнено требование античита; details = AntiCheatBlockedDetails (403).
+        policyDenied: Запрещено политикой; details = PolicyDeniedDetails (403).
+        agentOffline: Агент без связи с сервером, кэш не помогает (503).
+        serverUnavailable: Сервер вернул 5xx или разомкнут circuit breaker (503).
+        timeout: Таймаут вышестоящего вызова или запуска (504).
+        rateLimited: Слишком много запросов; details = RateLimitDetails, заголовок Retry-After (429).
+        internal: Непредвиденная ошибка; details = TraceDetails (500).
+        protocolError: Нарушение формата конверта/кадра (400).
+        versionMismatch: Версия протокола/приложения не поддерживается; details = VersionMismatchDetails (426).
+      x-http-status:
+        unauthorized: 401
+        forbidden: 403
+        notFound: 404
+        validation: 400
+        conflict: 409
+        insufficientFunds: 402
+        sessionNotActive: 409
+        sessionAlreadyActive: 409
+        gameNotInstalled: 409
+        gameLaunchFailed: 500
+        accountPoolExhausted: 409
+        antiCheatBlocked: 403
+        policyDenied: 403
+        agentOffline: 503
+        serverUnavailable: 503
+        timeout: 504
+        rateLimited: 429
+        internal: 500
+        protocolError: 400
+        versionMismatch: 426
+      x-from-http-status:
+        description: >-
+          Обратное отображение, которым агент пользуется, когда тело ответа не распарсилось как ServerErrorEnvelope
+          (ErrorCodes.FromHttpStatus).
+        "400": validation
+        "401": unauthorized
+        "402": insufficientFunds
+        "403": forbidden
+        "404": notFound
+        "408": timeout
+        "409": conflict
+        "426": versionMismatch
+        "429": rateLimited
+        "504": timeout
+        ">=500": serverUnavailable
+        other: internal
+      x-retryable: [timeout, rateLimited, serverUnavailable, agentOffline]
+      x-auth-failure: [unauthorized, forbidden]
+      x-details-schemas:
+        unauthorized: ReasonDetails
+        forbidden: ReasonDetails
+        conflict: ReasonDetails
+        notFound: "REST: null | { what: string } (мок); { name } (C# NameDetails) — только IPC, неизвестное имя сообщения"
+        validation: ValidationDetails
+        insufficientFunds: InsufficientFundsDetails
+        sessionNotActive: "{ session: Session } | null (session обязателен, если сессия уже завершена)"
+        policyDenied: PolicyDeniedDetails
+        antiCheatBlocked: AntiCheatBlockedDetails
+        gameLaunchFailed: LaunchFailedDetails
+        versionMismatch: VersionMismatchDetails
+        rateLimited: RateLimitDetails
+        serverUnavailable: ReasonDetails
+        internal: TraceDetails
+      x-discrepancy: >-
+        notFound: в C# у IpcError.NotFound(what) details нет (null), NameDetails создаётся только в
+        IpcError.UnknownMessage для IPC (IpcErrors.cs:46-49; в ack команды на сервер не попадает: неизвестное имя
+        команды агент подтверждает notFound без details — RealtimeClient.cs:379; ветка UnknownMessage в
+        CommandReceiver.cs:266 недостижима — switch покрывает все значения ServerCommandType); мок на REST шлёт details = { what } (db.ts:76);
+        SERVER_API.md форму details для notFound не задаёт. В контракте: REST details = null или свободный объект;
+        ни агент, ни шелл details.what не читают (агент передаёт details шеллу как есть).
+      x-csharp: "src/ClubShell.Contracts/Errors/ErrorCode.cs:14"
+      x-source:
+        - "src/ClubShell.Contracts/Errors/ErrorCode.cs:78"
+        - "src/ClubShell.Core/Http/ServerClient.cs:589"
+        - "docs/IPC_PROTOCOL.md:117"
+        - "src/ClubShell.Core/Http/ServerClient.cs:314"
+        - "src/ClubShell.Core/Http/ServerClient.cs:574"
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:199"
+        - "docs/SERVER_API.md:293"
+        - "tools/MockServer/src/db.ts:76"
+        - "tools/MockServer/src/db.ts:85"
+        - "src/ClubShell.Contracts/Ipc/IpcErrors.cs:46"
+
+    ServerErrorEnvelope:
+      type: object
+      description: 'Тело любого не-2xx ответа центрального сервера (кроме 304) — { "error": ServerError }.'
+      required: [error]
+      properties:
+        error:
+          $ref: '#/components/schemas/ServerError'
+      examples:
+        - error:
+            code: insufficientFunds
+            message: Balance too low
+            details:
+              required: {amount: 500000, currency: UZS}
+              available: {amount: 120000, currency: UZS}
+            traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-csharp: "src/ClubShell.Contracts/Errors/ErrorCode.cs:171"
+      x-source:
+        - "src/ClubShell.Core/Http/ServerClient.cs:589"
+        - "docs/SERVER_API.md:87"
+        - "tools/MockServer/src/index.ts:191"
+
+    ServerError:
+      type: object
+      description: >-
+        Объект ошибки сервера. Агент отображает его 1:1 в IpcError для шелла (details передаются как есть, traceId
+        переносится в details.traceId). Поведение агента на 401 для запросов с авторизацией agent/user (club и none
+        не обрабатываются) по details.reason: clockSkew при наличии заголовка X-Server-Time — поправка часов и один
+        повтор; userToken — без refresh, ошибка уходит шеллу; любая другая причина или её отсутствие (expired,
+        invalid, revoked, reused, signature, clockSkew без X-Server-Time и т.д.) — один refresh токена агента
+        (POST /agents/refresh, если его ещё не обновил параллельный запрос) и повтор. Второго refresh нет: следующий
+        401 (кроме первого clockSkew с X-Server-Time) возвращается вызывающему как ошибка.
+      required: [code, message, details, traceId]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: Сообщение на английском для логов; UI локализует по code.
+        details:
+          description: >-
+            Структурированные данные ошибки. Ключ присутствует всегда (JsonIgnore(Never)), null — если данных нет.
+            В C# это JsonElement? (любой JSON); на практике объект или null. Форма по коду — ErrorCode.x-details-schemas;
+            поля сверх типизированных допустимы (например, pcId у pendingApproval, problem у unauthorized от проверки
+            подписи; attemptsLeft у unauthorized badCredentials на POST /auth/login; pcId и pcName у conflict
+            activeSessionElsewhere; productId у conflict outOfStock). Для sessionNotActive — { session: Session }
+            или null (session обязателен, если сессия уже завершена).
+        traceId:
+          type: string
+          description: Идентификатор трассировки (эхо X-Trace-Id запроса).
+      x-csharp: "src/ClubShell.Contracts/Errors/ErrorCode.cs:178"
+      x-source:
+        - "src/ClubShell.Core/Http/ServerClient.cs:696"
+        - "src/ClubShell.Core/Http/ServerClient.cs:717"
+        - "src/ClubShell.Core/Http/ServerClient.cs:725"
+        - "src/ClubShell.Core/Http/ServerClient.cs:843"
+        - "src/ClubShell.Core/Abstractions/IServerClient.cs:73"
+        - "docs/SERVER_API.md:99"
+        - "docs/SERVER_API.md:239"
+        - "docs/IPC_PROTOCOL.md:765"
+        - "tools/MockServer/src/routes/auth.ts:62"
+        - "tools/MockServer/src/routes/auth.ts:131"
+        - "tools/MockServer/src/index.ts:116"
+
+    # ------------------------------------------------------------------ Ipc/IpcErrors.cs
+
+    IpcError:
+      type: object
+      description: >-
+        Ошибка в формате IPC. На сервер приходит в CommandAck.error / WsAck.error, когда агент не смог выполнить
+        команду (например, notFound для неизвестной команды, validation при отсутствии обязательного payload,
+        timeout для просроченной/вытесненной команды, internal при исключении обработчика).
+      required: [code, message, details]
+      properties:
+        code:
+          $ref: '#/components/schemas/ErrorCode'
+        message:
+          type: string
+          description: Сообщение на английском; UI локализует по code.
+        details:
+          description: >-
+            Структурированные данные (C#: JsonElement?, ключ пишется всегда — JsonIgnore(Never)); null, если нет.
+            Форма по коду — ErrorCode.x-details-schemas.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:18"
+      x-source:
+        - "src/ClubShell.Core/Realtime/RealtimeClient.cs:379"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:568"
+        - "docs/IPC_PROTOCOL.md:62"
+
+    ValidationDetails:
+      type: object
+      description: details для validation.
+      required: [field, reason]
+      properties:
+        field:
+          type: string
+          description: JSON-путь поля с ошибкой, например minutes или items[2].qty.
+        reason:
+          type: string
+          description: Машиночитаемая причина — required, min, max, format и т.п. (набор открытый).
+          examples: [required, min, max, format, enum]
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:155"
+
+    ReasonDetails:
+      type: object
+      description: >-
+        details с одним кодом причины (unauthorized, forbidden, conflict; также serverUnavailable с reason
+        notImplemented для 501). Набор причин открытый; известные — x-known-values.
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          description: Код причины.
+      x-known-values:
+        unauthorized: [expired, clockSkew, userToken, revoked, reused, invalid, missing, signature, clubKey, badCredentials, qrNotConfirmed, invalidPin]
+        forbidden: [pendingApproval, clubDisabled, banned, zoneNotAllowed, ageRestricted, guest, guestDisabled, notOwner, notMember, ownerOnly, pcMismatch]
+        conflict: [outOfStock, slotTaken, full, alreadyJoined, notOpen, notPending, alreadyPaused, notPaused, alreadyStarted, pcBusy, activeSessionElsewhere, postpaidSession, shiftOpen, noShift]
+        serverUnavailable: [notImplemented]
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:159"
+      x-source:
+        - "src/ClubShell.Core/Http/ServerClient.cs:61"
+        - "docs/SERVER_API.md:40"
+        - "docs/SERVER_API.md:239"
+        - "tools/MockServer/src/db.ts:73"
+        - "tools/MockServer/src/index.ts:116"
+        - "tools/MockServer/src/routes/club.ts:205"
+        - "tools/MockServer/src/routes/club.ts:225"
+
+    RateLimitDetails:
+      type: object
+      description: details для rateLimited; то же значение сервер дублирует в заголовке Retry-After.
+      required: [retryAfterSec]
+      properties:
+        retryAfterSec:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Через сколько секунд можно повторить.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:167"
+
+    InsufficientFundsDetails:
+      type: object
+      description: details для insufficientFunds.
+      required: [required, available]
+      properties:
+        required:
+          $ref: '#/components/schemas/Money'
+          description: Сколько нужно для операции.
+        available:
+          $ref: '#/components/schemas/Money'
+          description: Сколько доступно сейчас.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:172"
+
+    PolicyDeniedDetails:
+      type: object
+      description: details для policyDenied.
+      required: [rule]
+      properties:
+        rule:
+          type: string
+          description: Идентификатор правила политики (набор открытый).
+          examples: [ageRating, alreadyRunning, postpaidNotAllowed, pcMaintenance, tariffZone, muted]
+        field:
+          type: [string, "null"]
+          description: Поле настроек, заблокированное политикой (settings.set).
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:177"
+
+    AntiCheatBlockedDetails:
+      type: object
+      description: details для antiCheatBlocked.
+      required: [kind, reason]
+      properties:
+        kind:
+          $ref: '#/components/schemas/AntiCheatKind'
+          description: Подсистема античита.
+        reason:
+          type: string
+          description: Непройденная проверка, например driverMissing, secureBootOff.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:182"
+
+    LaunchFailedDetails:
+      type: object
+      description: details для gameLaunchFailed.
+      required: [stage]
+      properties:
+        stage:
+          type: string
+          description: Этап запуска — lease, inject, createProcess, waitForWindow.
+        exitCode:
+          type: [integer, "null"]
+          format: int32
+          description: Код выхода лаунчера, если он завершился.
+        stderr:
+          type: [string, "null"]
+          description: Хвост stderr, если есть.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:188"
+
+    VersionMismatchDetails:
+      type: object
+      description: details для versionMismatch.
+      required: [supported, got]
+      properties:
+        supported:
+          type: array
+          description: Поддерживаемые мажорные версии протокола.
+          items:
+            type: integer
+            format: int32
+        got:
+          type: integer
+          format: int32
+          description: Полученная версия.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:193"
+
+    TraceDetails:
+      type: object
+      description: details для internal (и любой серверной ошибки, переданной в IPC).
+      required: [traceId]
+      properties:
+        traceId:
+          type: string
+          description: Идентификатор трассировки для сопоставления логов.
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcErrors.cs:197"
+
+    # ------------------------------------------------------------------ Commands/ServerCommand.cs — обновления
+
+    UpdateChannel:
+      type: string
+      enum: [stable, beta]
+      description: Канал обновлений.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:17"
+
+    UpdateComponent:
+      type: string
+      enum: [agent, shell]
+      description: Обновляемый компонент — служба агента или киоск-шелл.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:28"
+
+    UpdateManifest:
+      type: object
+      description: Описание пакета обновления (GET /updates/{channel}/manifest, payload команды update).
+      required: [channel, component, version, url, sha256, size, signature, releaseNotes, mandatory, publishedAt]
+      properties:
+        channel:
+          $ref: '#/components/schemas/UpdateChannel'
+        component:
+          $ref: '#/components/schemas/UpdateComponent'
+        version:
+          type: string
+          description: Semver пакета.
+        url:
+          type: string
+          description: HTTPS-адрес пакета (нужен тот же Bearer, поддерживается Range).
+        sha256:
+          type: string
+          pattern: '^[0-9a-f]{64}$'
+          description: SHA-256 пакета, hex в нижнем регистре.
+        size:
+          type: integer
+          format: int64
+          description: Размер пакета, байт.
+        signature:
+          type: string
+          contentEncoding: base64
+          description: Base64 подписи RSA-PSS-SHA256 над байтами пакета.
+        releaseNotes:
+          type: string
+          description: Примечания к выпуску (Markdown).
+        mandatory:
+          type: boolean
+          description: Ставить даже во время сессии (после предупреждения за 60 с).
+        publishedAt:
+          type: string
+          format: date-time
+          description: Время публикации.
+        minAgentVersion:
+          type: [string, "null"]
+          description: Минимальная версия агента (для пакетов shell).
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:69"
+
+    # ------------------------------------------------------------------ Commands/ServerCommand.cs — команды сервер -> агент
+
+    ServerCommandType:
+      type: string
+      enum:
+        - lock
+        - unlock
+        - message
+        - reboot
+        - shutdown
+        - wake
+        - endSession
+        - extendSession
+        - launchGame
+        - killGame
+        - setPolicy
+        - reloadPolicy
+        - screenshot
+        - remoteControlStart
+        - remoteControlStop
+        - update
+        - showAds
+        - setVolume
+        - refreshConfig
+      description: >-
+        Тип команды сервер -> агент (WS-кадр command, поле name; REST GET /agents/{pcId}/commands, поле name).
+        Payload и результат ack по типу — x-payload-schemas / x-result-schemas (null — нет payload / результат null).
+        Для команд из x-payload-optional payload может быть null или отсутствовать; для остальных без payload агент
+        отвечает ack { ok: false, error.code: validation, details.field: payload }.
+      x-enum-descriptions:
+        lock: Заблокировать сессию или показать экран простоя.
+        unlock: Разблокировать.
+        message: Показать сообщение администратора.
+        reboot: Перезагрузить ПК.
+        shutdown: Выключить ПК.
+        wake: Отправить Wake-on-LAN другому ПК (ретрансляция в LAN).
+        endSession: Завершить сессию.
+        extendSession: Продлить сессию (уже списано на сервере при charge = false).
+        launchGame: Запустить игру как из шелла.
+        killGame: Завершить игру.
+        setPolicy: Применить переданную политику.
+        reloadPolicy: Перечитать политику с сервера и применить.
+        screenshot: Снять экран и загрузить по uploadUrl.
+        remoteControlStart: Начать удалённое управление через релей.
+        remoteControlStop: Остановить удалённое управление.
+        update: Проверить/применить обновление.
+        showAds: Показать рекламу.
+        setVolume: Установить громкость.
+        refreshConfig: Перечитать выбранные кэши (все, если флагов нет).
+      x-payload-schemas:
+        lock: LockCommand
+        unlock: null
+        message: MessageCommand
+        reboot: PowerCommand
+        shutdown: PowerCommand
+        wake: WakeCommand
+        endSession: EndSessionCommand
+        extendSession: ExtendSessionCommand
+        launchGame: LaunchRequest
+        killGame: KillGameCommand
+        setPolicy: Policy
+        reloadPolicy: null
+        screenshot: ScreenshotCommand
+        remoteControlStart: RemoteControlStartCommand
+        remoteControlStop: RemoteControlStopCommand
+        update: UpdateCommand
+        showAds: ShowAdsArgs
+        setVolume: SetVolumeRequest
+        refreshConfig: RefreshConfigCommand
+      x-payload-optional: [lock, unlock, reloadPolicy, refreshConfig]
+      x-result-schemas:
+        lock: null
+        unlock: null
+        message: MessageDeliveryResult
+        reboot: ScheduledResult
+        shutdown: ScheduledResult
+        wake: null
+        endSession: SessionResult
+        extendSession: SessionResult
+        launchGame: LaunchResult
+        killGame: GamesKillResponse
+        setPolicy: SetPolicyResult
+        reloadPolicy: ReloadPolicyResult
+        screenshot: ScreenshotResult
+        remoteControlStart: RemoteControlStartResult
+        remoteControlStop: RemoteControlStopResult
+        update: UpdateApplyResponse
+        showAds: null
+        setVolume: VolumeState
+        refreshConfig: RefreshConfigResult
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:88"
+      x-source:
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:245"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:271"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:475"
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:568"
+        - "docs/SERVER_API.md:512"
+
+    ServerCommand:
+      type: object
+      description: >-
+        Нормализованная команда внутри диспетчера агента (строится из WsFrame или ServerCommandEnvelope). По сети в
+        таком виде не передаётся — описана для полноты; на проводе см. WsFrame и ServerCommandEnvelope.
+      required: [id, type, issuedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор команды (ключ дедупликации, 24 ч).
+        type:
+          $ref: '#/components/schemas/ServerCommandType'
+        issuedAt:
+          type: string
+          format: date-time
+          description: Время выдачи на сервере.
+        payload:
+          description: Payload по типу (ServerCommandType.x-payload-schemas) или null.
+        issuedBy:
+          type: [string, "null"]
+          description: Логин администратора или system.
+        supersedes:
+          type: [string, "null"]
+          format: uuid
+          description: Более ранняя ожидающая команда, которую эта отменяет.
+        expiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: После этого времени команда отбрасывается (ack с timeout).
+      x-agent-internal: true
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:156"
+
+    ServerCommandEnvelope:
+      type: object
+      description: >-
+        Команда в очереди, как её отдаёт GET /agents/{pcId}/commands. Имя вне ServerCommandType ломает разбор всего
+        ответа у агента (JsonException -> protocolError, ни одна команда пачки не выполнится) — отдавать только
+        известные имена. После выполнения агент шлёт POST /agents/{pcId}/commands/{id}/ack с CommandAck.
+      required: [id, ts, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор команды.
+        ts:
+          type: string
+          format: date-time
+          description: Время выдачи на сервере.
+        name:
+          $ref: '#/components/schemas/ServerCommandType'
+        payload:
+          description: Payload по типу (ServerCommandType.x-payload-schemas); null или отсутствует, если данных нет.
+        issuedBy:
+          type: [string, "null"]
+          description: Логин администратора (для аудита на агенте).
+        supersedes:
+          type: [string, "null"]
+          format: uuid
+          description: Более ранняя ожидающая команда, которую эта отменяет.
+        expiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: Срок годности; просроченную команду агент подтверждает ack с ошибкой timeout.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:205"
+      x-source:
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:261"
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:278"
+        - "tools/MockServer/src/ws.ts:153"
+
+    ServerCommandsResponse:
+      type: object
+      description: >-
+        Ответ GET /agents/{pcId}/commands — неподтверждённые непросроченные команды, старые первыми. Агент опрашивает
+        его после каждого heartbeat с pendingCommands > 0 (независимо от состояния WS; дубли отсекаются по id).
+      required: [items]
+      properties:
+        items:
+          type: array
+          description: Ожидающие команды, по возрастанию времени.
+          items:
+            $ref: '#/components/schemas/ServerCommandEnvelope'
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:216"
+      x-source:
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:197"
+
+    CommandAck:
+      type: object
+      description: >-
+        Тело POST /agents/{pcId}/commands/{commandId}/ack и основа WsAck. При ok = false агент всегда заполняет error.
+      required: [ok]
+      properties:
+        ok:
+          type: boolean
+          description: Команда выполнена успешно.
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/IpcError'
+            - type: "null"
+          description: Ошибка, когда ok = false.
+        result:
+          description: >-
+            Результат по типу команды (ServerCommandType.x-result-schemas); отсутствует или null, если результата нет.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:222"
+      x-source:
+        - "src/ClubShell.Core/Http/ServerClient.cs:191"
+        - "tools/MockServer/src/routes/pcs.ts:219"
+
+    LockCommand:
+      type: object
+      description: Payload команды lock (payload может быть null — тогда все поля пустые).
+      properties:
+        reason:
+          type: [string, "null"]
+          description: Машиночитаемая причина.
+        message:
+          type: [string, "null"]
+          description: Текст на экране блокировки.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:264"
+
+    MessageCommand:
+      type: object
+      description: Payload команды message — сообщение администратора игроку.
+      required: [id, from, text, level, requiresAck]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор сообщения (подтверждается через sys.ackAdminMessage).
+        from:
+          type: string
+          description: Имя отправителя.
+        text:
+          type: string
+          description: Текст.
+        level:
+          $ref: '#/components/schemas/NotificationLevel'
+        requiresAck:
+          type: boolean
+          description: Игрок должен подтвердить прочтение.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:274"
+
+    MessageDeliveryResult:
+      type: object
+      description: >-
+        Результат команды message. Первый ack приходит при показе; если requiresAck, после подтверждения игроком
+        приходит второй ack с ackedAt.
+      required: [deliveredAt]
+      properties:
+        deliveredAt:
+          type: string
+          format: date-time
+          description: Когда шелл показал сообщение.
+        ackedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Когда игрок подтвердил.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:284"
+
+    PowerCommand:
+      type: object
+      description: Payload команд reboot и shutdown.
+      required: [delaySec, force]
+      properties:
+        delaySec:
+          type: integer
+          format: int32
+          description: Задержка перед действием, с.
+        force:
+          type: boolean
+          description: Сначала завершить активную сессию.
+        message:
+          type: [string, "null"]
+          description: Сообщение на экране.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:292"
+
+    ScheduledResult:
+      type: object
+      description: Результат команд reboot/shutdown.
+      required: [scheduledAt]
+      properties:
+        scheduledAt:
+          type: string
+          format: date-time
+          description: Когда будет выполнено действие.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:299"
+
+    WakeCommand:
+      type: object
+      description: Payload команды wake — разбудить другой ПК по Wake-on-LAN.
+      required: [targetMac]
+      properties:
+        targetMac:
+          type: string
+          description: MAC пробуждаемого ПК.
+          examples: ["AA:BB:CC:DD:EE:FF"]
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:303"
+
+    EndSessionCommand:
+      type: object
+      description: Payload команды endSession.
+      required: [sessionId, reason]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: Завершаемая сессия.
+        reason:
+          $ref: '#/components/schemas/SessionEndReason'
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:308"
+
+    ExtendSessionCommand:
+      type: object
+      description: Payload команды extendSession.
+      required: [sessionId, minutes, charge]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: Продлеваемая сессия.
+        minutes:
+          type: integer
+          format: int32
+          description: Сколько минут добавить.
+        charge:
+          type: boolean
+          description: Списать с кошелька (false — уже списано на сервере).
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:316"
+
+    SessionResult:
+      type: object
+      description: Результат endSession/extendSession — сессия после команды.
+      required: [session]
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:323"
+
+    KillGameCommand:
+      type: object
+      description: Payload команды killGame (указать gameId и/или pid).
+      required: [force]
+      properties:
+        gameId:
+          type: [string, "null"]
+          format: uuid
+          description: Игра.
+        pid:
+          type: [integer, "null"]
+          format: int32
+          description: Процесс.
+        force:
+          type: boolean
+          description: Завершить сразу, без мягкого закрытия.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:329"
+
+    SetPolicyResult:
+      type: object
+      description: Результат setPolicy.
+      required: [version, applied]
+      properties:
+        version:
+          type: integer
+          format: int32
+          description: Версия политики.
+        applied:
+          type: boolean
+          description: Применена без ошибок.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:337"
+
+    ReloadPolicyResult:
+      type: object
+      description: Результат reloadPolicy.
+      required: [version]
+      properties:
+        version:
+          type: integer
+          format: int32
+          description: Действующая версия политики.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:343"
+
+    ScreenshotCommand:
+      type: object
+      description: Payload команды screenshot.
+      required: [quality, uploadUrl]
+      properties:
+        quality:
+          type: integer
+          format: int32
+          minimum: 1
+          maximum: 100
+          description: Качество JPEG, 1–100.
+        uploadUrl:
+          type: string
+          description: Предподписанный URL для PUT JPEG.
+        monitor:
+          type: [integer, "null"]
+          format: int32
+          description: Индекс монитора; null — основной.
+        maxWidth:
+          type: [integer, "null"]
+          format: int32
+          description: Уменьшить до этой ширины, px.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:350"
+
+    ScreenshotResult:
+      type: object
+      description: Результат screenshot.
+      required: [width, height, bytes, uploadedAt]
+      properties:
+        width:
+          type: integer
+          format: int32
+          description: Ширина изображения, px.
+        height:
+          type: integer
+          format: int32
+          description: Высота изображения, px.
+        bytes:
+          type: integer
+          format: int64
+          description: Размер загруженного файла, байт.
+        uploadedAt:
+          type: string
+          format: date-time
+          description: Время загрузки.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:361"
+
+    RemoteControlStartCommand:
+      type: object
+      description: Payload команды remoteControlStart.
+      required: [sessionToken, relayUrl, fps, allowInput, adminName]
+      properties:
+        sessionToken:
+          type: string
+          description: Токен сессии релея.
+        relayUrl:
+          type: string
+          description: Адрес релея wss://.
+        fps:
+          type: integer
+          format: int32
+          description: Частота кадров захвата.
+        allowInput:
+          type: boolean
+          description: Разрешить удалённый ввод клавиатуры/мыши.
+        adminName:
+          type: string
+          description: Имя администратора в экранном индикаторе.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:373"
+
+    RemoteControlStartResult:
+      type: object
+      description: Результат remoteControlStart.
+      required: [startedAt]
+      properties:
+        startedAt:
+          type: string
+          format: date-time
+          description: Время начала.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:382"
+
+    RemoteControlStopCommand:
+      type: object
+      description: Payload команды remoteControlStop.
+      required: [sessionToken]
+      properties:
+        sessionToken:
+          type: string
+          description: Токен сессии релея.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:386"
+
+    RemoteControlStopResult:
+      type: object
+      description: Результат remoteControlStop.
+      required: [stoppedAt, durationSec]
+      properties:
+        stoppedAt:
+          type: string
+          format: date-time
+          description: Время остановки.
+        durationSec:
+          type: integer
+          format: int32
+          description: Длительность сеанса, с.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:391"
+
+    UpdateCommand:
+      type: object
+      description: Payload команды update.
+      required: [component, applyNow]
+      properties:
+        component:
+          $ref: '#/components/schemas/UpdateComponent'
+        applyNow:
+          type: boolean
+          description: Применить сразу (с учётом правил сессии/mandatory).
+        manifest:
+          oneOf:
+            - $ref: '#/components/schemas/UpdateManifest'
+            - type: "null"
+          description: Манифест; null — агент запросит его сам.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:399"
+
+    RefreshConfigCommand:
+      type: object
+      description: >-
+        Payload команды refreshConfig. Если ни один флаг не равен true (или payload null), обновляется всё.
+      properties:
+        config:
+          type: [boolean, "null"]
+          description: Перечитать /agents/{pcId}/config.
+        games:
+          type: [boolean, "null"]
+          description: Перечитать игры.
+        apps:
+          type: [boolean, "null"]
+          description: Перечитать приложения.
+        tariffs:
+          type: [boolean, "null"]
+          description: Перечитать тарифы.
+        products:
+          type: [boolean, "null"]
+          description: Перечитать товары магазина.
+        themes:
+          type: [boolean, "null"]
+          description: Перекачать темы.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:411"
+
+    RefreshConfigResult:
+      type: object
+      description: Результат refreshConfig.
+      required: [refreshed]
+      properties:
+        refreshed:
+          type: array
+          description: >-
+            Обновлённые кэши. Агент сообщает config, games (игры и приложения — одним значением), tariffs, products,
+            themes; apps в список не попадает.
+          items:
+            type: string
+          x-known-values: [config, games, apps, tariffs, products, themes]
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:426"
+      x-source:
+        - "src/ClubShell.Agent/Server/CommandReceiver.cs:480"
+
+    # ------------------------------------------------------------------ Commands/ServerCommand.cs — события агент -> сервер
+
+    AgentEventType:
+      type: string
+      enum:
+        - sessionStarted
+        - sessionEnded
+        - gameLaunched
+        - gameExited
+        - anticheatViolation
+        - hardwareChanged
+        - offlineQueueFlushed
+      description: >-
+        Тип события агента (WS-кадр event, поле name). Сервер событие не подтверждает. Payload по типу —
+        x-payload-schemas. Агент сейчас реально шлёт только x-emitted-by-agent; при разорванном WS событие
+        отбрасывается (не копится), данные доходят через REST-аналоги (/sessions/{id}/events,
+        /games/{id}/launch-report, /anticheat/report, /agents/{pcId}/telemetry).
+      x-payload-schemas:
+        sessionStarted: SessionStartedEvent
+        sessionEnded: SessionEndedEvent
+        gameLaunched: GameLaunchedEvent
+        gameExited: GameExitedEvent
+        anticheatViolation: AntiCheatReport
+        hardwareChanged: HardwareChangedEvent
+        offlineQueueFlushed: OfflineQueueFlushedEvent
+      x-emitted-by-agent: [anticheatViolation, hardwareChanged, offlineQueueFlushed]
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:434"
+      x-source:
+        - "src/ClubShell.Agent/DependencyInjection.cs:472"
+        - "src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:347"
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:257"
+        - "src/ClubShell.Agent/AgentWorker.cs:418"
+
+    AgentEvent:
+      type: object
+      description: >-
+        Событие агента во внутреннем виде. По сети передаётся как WsFrame { type: event, name: <тип>, payload }.
+      required: [type, at]
+      properties:
+        type:
+          $ref: '#/components/schemas/AgentEventType'
+        at:
+          type: string
+          format: date-time
+          description: Время события.
+        payload:
+          description: Payload по типу (AgentEventType.x-payload-schemas).
+      x-agent-internal: true
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:462"
+
+    GameLaunchedEvent:
+      type: object
+      description: Payload события gameLaunched.
+      required: [sessionId, gameId, pid, at]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: Сессия.
+        gameId:
+          type: string
+          format: uuid
+          description: Игра.
+        pid:
+          type: integer
+          format: int32
+          description: Идентификатор процесса.
+        accountLeaseId:
+          type: [string, "null"]
+          format: uuid
+          description: Использованная аренда аккаунта, если была.
+        at:
+          type: string
+          format: date-time
+          description: Время запуска.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:482"
+
+    GameExitedEvent:
+      type: object
+      description: Payload события gameExited.
+      required: [sessionId, gameId, pid, exitCode, playedSec, at]
+      properties:
+        sessionId:
+          type: string
+          format: uuid
+          description: Сессия.
+        gameId:
+          type: string
+          format: uuid
+          description: Игра.
+        pid:
+          type: integer
+          format: int32
+          description: Идентификатор процесса.
+        exitCode:
+          type: integer
+          format: int32
+          description: Код выхода.
+        playedSec:
+          type: integer
+          format: int32
+          description: Сыграно секунд.
+        at:
+          type: string
+          format: date-time
+          description: Время выхода.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:496"
+
+    HardwareChangedEvent:
+      type: object
+      description: Payload события hardwareChanged.
+      required: [hardware, diff]
+      properties:
+        hardware:
+          $ref: '#/components/schemas/HardwareInfo'
+        diff:
+          type: array
+          description: Изменившиеся ключи верхнего уровня (gpu, disks, …).
+          items:
+            type: string
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:507"
+
+    OfflineQueueFlushedEvent:
+      type: object
+      description: Payload события offlineQueueFlushed — outbox агента выгружен после офлайна.
+      required: [count, deadlettered, offlineFrom, offlineTo]
+      properties:
+        count:
+          type: integer
+          format: int32
+          description: Доставлено записей.
+        deadlettered:
+          type: integer
+          format: int32
+          description: Перенесено в dead-letter.
+        offlineFrom:
+          type: string
+          format: date-time
+          description: Начало офлайна.
+        offlineTo:
+          type: string
+          format: date-time
+          description: Конец офлайна.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:516"
+
+    # ------------------------------------------------------------------ Commands/ServerCommand.cs — WebSocket
+
+    WsFrameType:
+      type: string
+      enum: [command, ack, event, ping, pong, push]
+      description: >-
+        Тип WS-кадра. Кадр с неизвестным type агент целиком отбрасывает (JsonException). Входящие ack/event/pong агент
+        игнорирует; на ping отвечает pong с тем же id.
+      x-enum-descriptions:
+        command: Сервер -> агент, команда; требует ack.
+        ack: Агент -> сервер, подтверждение команды.
+        event: Агент -> сервер, событие; без подтверждения.
+        ping: Keepalive-запрос (сервер каждые 20 с).
+        pong: Keepalive-ответ (в течение 10 с).
+        push: Сервер -> агент, уведомление; без подтверждения.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:528"
+      x-source:
+        - "src/ClubShell.Core/Realtime/RealtimeClient.cs:318"
+        - "src/ClubShell.Core/Realtime/RealtimeClient.cs:339"
+
+    WsPushKind:
+      type: string
+      enum:
+        - walletUpdated
+        - chatMessage
+        - notification
+        - orderUpdated
+        - bookingUpdated
+        - tournamentUpdated
+        - sessionUpdated
+        - pcStatusChanged
+        - userRevoked
+      description: >-
+        Вид push-кадра сервер -> агент (поле name). Payload по виду — x-payload-schemas. Неизвестный вид агент
+        игнорирует; pcStatusChanged агент сейчас тоже игнорирует (нет обработчика).
+      x-enum-descriptions:
+        walletUpdated: Баланс изменился -> IPC wallet.updated.
+        chatMessage: Новое сообщение чата -> IPC chat.message.
+        notification: Уведомление -> IPC notification.push.
+        orderUpdated: Заказ изменился -> IPC shop.orderUpdated + notification.push.
+        bookingUpdated: Бронь изменилась -> IPC notification.push.
+        tournamentUpdated: Турнир изменился -> IPC notification.push.
+        sessionUpdated: Сессия изменилась на сервере -> сверка + IPC session.updated.
+        pcStatusChanged: Статус другого ПК (карта мест).
+        userRevoked: Пользователь отозван -> IPC auth.expired{revoked}, завершение сессии.
+      x-payload-schemas:
+        walletUpdated: Balance
+        chatMessage: ChatMessage
+        notification: Notification
+        orderUpdated: Order
+        bookingUpdated: Booking
+        tournamentUpdated: Tournament
+        sessionUpdated: Session
+        pcStatusChanged: PcStatusChangedPush
+        userRevoked: UserRevokedPush
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:551"
+      x-source:
+        - "src/ClubShell.Agent/Server/ServerConnection.cs:368"
+        - "src/ClubShell.Agent/Ipc/PipeServer.cs:242"
+
+    PcStatusChangedPush:
+      type: object
+      description: Payload push pcStatusChanged.
+      required: [pcId, status]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        status:
+          $ref: '#/components/schemas/PcStatus'
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:603"
+
+    UserRevokedPush:
+      type: object
+      description: Payload push userRevoked.
+      required: [userId, reason]
+      properties:
+        userId:
+          type: string
+          format: uuid
+          description: Отозванный пользователь.
+        reason:
+          type: string
+          description: Причина.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:610"
+
+    WsAck:
+      type: object
+      description: Тело подтверждения внутри WS-кадра type = ack (CommandAck + id команды).
+      required: [id, ok]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор подтверждаемой команды.
+        ok:
+          type: boolean
+          description: Успех.
+        error:
+          oneOf:
+            - $ref: '#/components/schemas/IpcError'
+            - type: "null"
+          description: Ошибка, когда ok = false.
+        result:
+          description: Результат по типу команды (ServerCommandType.x-result-schemas); отсутствует или null, если нет.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:619"
+
+    WsFrame:
+      type: object
+      description: >-
+        Один текстовый кадр на wss://<server>/ws/agent (сабпротокол clubshell.v1), не больше 1 МиБ. name обязателен
+        для command/event/push (ServerCommandType / AgentEventType / WsPushKind); ack — для type = ack. Команду с
+        неизвестным name агент подтверждает ack { ok: false, error.code: notFound }. Ключ payload агент пишет всегда.
+      required: [type, id, ts, payload]
+      properties:
+        type:
+          $ref: '#/components/schemas/WsFrameType'
+        id:
+          type: string
+          format: uuid
+          description: Идентификатор кадра (для command — id команды; pong повторяет id ping).
+        ts:
+          type: string
+          format: date-time
+          description: Время отправителя.
+        name:
+          type: [string, "null"]
+          description: Имя команды/события/push; для ping/pong/ack отсутствует.
+        payload:
+          description: >-
+            Тело кадра или null (JsonIgnore(Never) — ключ присутствует всегда). Форма — по name:
+            ServerCommandType / AgentEventType / WsPushKind .x-payload-schemas.
+        ack:
+          oneOf:
+            - $ref: '#/components/schemas/WsAck'
+            - type: "null"
+          description: Тело подтверждения; обязательно для type = ack.
+        supersedes:
+          type: [string, "null"]
+          format: uuid
+          description: Только command — более ранняя ожидающая команда, которую эта отменяет.
+        expiresAt:
+          type: [string, "null"]
+          format: date-time
+          description: Только command — отбросить после этого времени (ack с timeout).
+      allOf:
+        - if:
+            required: [type]
+            properties:
+              type:
+                enum: [command, event, push]
+          then:
+            required: [name]
+            properties:
+              name:
+                type: string
+        - if:
+            required: [type]
+            properties:
+              type:
+                const: ack
+          then:
+            required: [ack]
+            properties:
+              ack:
+                $ref: '#/components/schemas/WsAck'
+      examples:
+        - type: command
+          id: c0a8f5e2-1d3b-4c5a-9e7f-0a1b2c3d4e5f
+          ts: "2026-09-21T10:20:00.000Z"
+          name: lock
+          payload: {reason: admin, message: Please come to the desk}
+          expiresAt: "2026-09-21T10:25:00.000Z"
+        - type: ack
+          id: 77aa0b1c-2d3e-4f50-8a9b-0c1d2e3f4a5b
+          ts: "2026-09-21T10:20:00.050Z"
+          payload: null
+          ack: {id: c0a8f5e2-1d3b-4c5a-9e7f-0a1b2c3d4e5f, ok: true}
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:642"
+      x-source:
+        - "src/ClubShell.Core/Realtime/RealtimeClient.cs:318"
+        - "src/ClubShell.Core/Realtime/RealtimeClient.cs:374"
+        - "src/ClubShell.Core/Realtime/RealtimeClient.cs:379"
+        - "docs/SERVER_API.md:487"
+        - "tools/MockServer/src/ws.ts:137"
+
+    # ------------------------------------------------------------------ Commands/ServerCommand.cs — REST агента
+
+    AgentRegisterRequest:
+      type: object
+      description: Тело POST /agents/register (авторизация X-Club-Key).
+      required: [hwid, machineName, agentVersion, hardware, ipAddress, macAddress]
+      properties:
+        hwid:
+          type: string
+          description: Идентификатор железа (sha256 hex).
+        machineName:
+          type: string
+          description: Имя компьютера Windows.
+        agentVersion:
+          type: string
+          description: Semver агента.
+        hardware:
+          $ref: '#/components/schemas/HardwareInfo'
+        ipAddress:
+          type: string
+          description: IPv4-адрес.
+        macAddress:
+          type: string
+          description: Основной MAC.
+        previousPcId:
+          type: [string, "null"]
+          format: uuid
+          description: Подсказка для повторной регистрации после переустановки.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:708"
+
+    AgentRegisterResponse:
+      type: object
+      description: Ответ POST /agents/register. Секреты агент хранит под DPAPI.
+      required: [pcId, pc, accessToken, refreshToken, signingSecret, expiresAt, serverTime, config]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: Назначенный идентификатор ПК.
+        pc:
+          $ref: '#/components/schemas/Pc'
+        accessToken:
+          type: string
+          description: JWT агента (≈ 1 ч).
+        refreshToken:
+          type: string
+          description: Непрозрачный refresh-токен (30 дней, одноразовый с ротацией).
+        signingSecret:
+          type: string
+          contentEncoding: base64
+          description: Base64 32-байтового HMAC-ключа для подписи запросов.
+        expiresAt:
+          type: string
+          format: date-time
+          description: Срок действия access-токена.
+        serverTime:
+          type: string
+          format: date-time
+          description: Часы сервера.
+        config:
+          $ref: '#/components/schemas/AgentServerConfig'
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:726"
+
+    AgentRefreshRequest:
+      type: object
+      description: Тело POST /agents/refresh.
+      required: [refreshToken, hwid]
+      properties:
+        refreshToken:
+          type: string
+          description: Текущий refresh-токен.
+        hwid:
+          type: string
+          description: Идентификатор железа.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:739"
+
+    AgentRefreshResponse:
+      type: object
+      description: Ответ POST /agents/refresh.
+      required: [accessToken, refreshToken, expiresAt]
+      properties:
+        accessToken:
+          type: string
+          description: Новый JWT.
+        refreshToken:
+          type: string
+          description: Новый refresh-токен (старый недействителен).
+        expiresAt:
+          type: string
+          format: date-time
+          description: Срок действия access-токена.
+        signingSecret:
+          type: [string, "null"]
+          contentEncoding: base64
+          description: Только при ротации; агент переключается атомарно.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:748"
+
+    HeartbeatRunningGame:
+      type: object
+      description: Запущенная игра в heartbeat.
+      required: [gameId, pid, startedAt]
+      properties:
+        gameId:
+          type: string
+          format: uuid
+          description: Игра.
+        pid:
+          type: integer
+          format: int32
+          description: Идентификатор процесса.
+        startedAt:
+          type: string
+          format: date-time
+          description: Время запуска.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:758"
+
+    HeartbeatRequest:
+      type: object
+      description: Тело POST /agents/{pcId}/heartbeat (каждые session.heartbeatSec).
+      required: [status, agentVersion, shellVersion, uptimeSec, ipAddress, policyVersion, runningGames, offlineQueue, shellConnected]
+      properties:
+        status:
+          $ref: '#/components/schemas/PcStatus'
+          description: Взгляд агента на статус ПК (агент шлёт только free, busy, locked).
+        currentSessionId:
+          type: [string, "null"]
+          format: uuid
+          description: Открытая сессия, если есть.
+        agentVersion:
+          type: string
+          description: Semver агента.
+        shellVersion:
+          type: string
+          description: Semver шелла.
+        uptimeSec:
+          type: integer
+          format: int64
+          description: Аптайм ОС, с.
+        ipAddress:
+          type: string
+          description: IPv4-адрес.
+        policyVersion:
+          type: integer
+          format: int32
+          description: Применённая версия политики (0 — нет).
+        runningGames:
+          type: array
+          description: Запущенные игры.
+          items:
+            $ref: '#/components/schemas/HeartbeatRunningGame'
+        offlineQueue:
+          type: integer
+          format: int32
+          description: Размер outbox.
+        shellConnected:
+          type: boolean
+          description: Жив ли канал к шеллу (named pipe).
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:774"
+      x-source:
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:163"
+
+    HeartbeatResponse:
+      type: object
+      description: >-
+        Ответ POST /agents/{pcId}/heartbeat. Агент: policyVersion больше применённой — перечитывает политику;
+        configVersion изменился (и на первом heartbeat) — перечитывает config; catalogVersion изменился —
+        обновляет игры/приложения; pendingCommands > 0 — вызывает GET /agents/{pcId}/commands.
+      required: [serverTime, pcStatus, policyVersion, configVersion, catalogVersion, pendingCommands]
+      properties:
+        serverTime:
+          type: string
+          format: date-time
+          description: Часы сервера (для оценки расхождения).
+        pcStatus:
+          $ref: '#/components/schemas/PcStatus'
+          description: Авторитетный статус ПК.
+        policyVersion:
+          type: integer
+          format: int32
+          description: Последняя версия политики.
+        configVersion:
+          type: integer
+          format: int32
+          description: Последняя версия конфигурации.
+        catalogVersion:
+          type: string
+          description: Версия каталога игр/приложений (строка, сравнивается на равенство).
+        pendingCommands:
+          type: integer
+          format: int32
+          minimum: 0
+          description: Неподтверждённые команды в очереди; считать только те, что отдаст GET /agents/{pcId}/commands.
+        session:
+          oneOf:
+            - $ref: '#/components/schemas/Session'
+            - type: "null"
+          description: Серверный взгляд на текущую сессию (для сверки).
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:794"
+      x-source:
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:182"
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:223"
+        - "tools/MockServer/src/routes/pcs.ts:153"
+
+    TelemetryEventKinds:
+      type: string
+      description: >-
+        Значения TelemetryEvent.kind. В C# — статический класс строковых констант, набор открытый: сервер обязан
+        принимать любую строку. x-known-values — константы TelemetryEventKinds; x-emitted-by-agent — что агент
+        реально отправляет сейчас (agentHealth, callAdmin, shellClientError в классе констант отсутствуют).
+        callAdmin — офлайн-очередь вызова администратора: data = CallAdminTicketRequest, отправляется, когда
+        POST /support/call-admin недоступен (сеть или ошибка serverUnavailable/timeout/rateLimited, в т.ч. 501).
+      examples: [shellCrash, shellCrashLoop, policyApplyFailed, updateFailed, pipeError, launcherError, deadletter]
+      x-known-values: [shellCrash, shellCrashLoop, policyApplyFailed, updateFailed, pipeError, launcherError, deadletter]
+      x-emitted-by-agent:
+        shellCrash: "src/ClubShell.Agent/Watchdog/CrashRecovery.cs:180"
+        shellCrashLoop: "src/ClubShell.Agent/Watchdog/CrashRecovery.cs:183"
+        agentHealth: "src/ClubShell.Agent/AgentWorker.cs:443"
+        callAdmin: "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253"
+        shellClientError: "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:385"
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:804"
+
+    TelemetryEvent:
+      type: object
+      description: Диагностическое событие агента в пачке телеметрии.
+      required: [kind, at, data]
+      properties:
+        kind:
+          $ref: '#/components/schemas/TelemetryEventKinds'
+          description: Вид события (см. TelemetryEventKinds; набор открытый).
+        at:
+          type: string
+          format: date-time
+          description: Время события.
+        data:
+          description: >-
+            Структурированные данные (C#: JsonElement — любой JSON, ключ обязателен). Обычно объект, но может быть null,
+            если данные не сериализовались. Для анонимных объектов агент использует JsonSerializerDefaults.Web
+            (camelCase, enum без атрибута — числами).
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:832"
+      x-source:
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:74"
+
+    TelemetryBatch:
+      type: object
+      description: Тело POST /agents/{pcId}/telemetry.
+      required: [samples, events]
+      properties:
+        samples:
+          type: array
+          maxItems: 120
+          description: Замеры метрик (не больше 120).
+          items:
+            $ref: '#/components/schemas/PcMetrics'
+        events:
+          type: array
+          maxItems: 1024
+          description: >-
+            Диагностические события. Пока выгрузка не удаётся, агент копит до 1024 событий и шлёт их одной пачкой —
+            сервер должен принимать все 1024 (отказ 400 заблокирует выгрузку: агент не делит пачку).
+          items:
+            $ref: '#/components/schemas/TelemetryEvent'
+        hardware:
+          oneOf:
+            - $ref: '#/components/schemas/HardwareInfo'
+            - type: "null"
+          description: Инвентаризация при изменении / пересканировании.
+        logsTail:
+          type: [array, "null"]
+          maxItems: 50
+          description: Последние ≤ 50 строк лога уровня Warning+, когда events непуст.
+          items:
+            type: string
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:842"
+      x-source:
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:96"
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:290"
+
+    CallAdminTicketRequest:
+      type: object
+      description: >-
+        Тело POST /support/call-admin (с Idempotency-Key). Тот же объект уходит как data телеметрии kind = callAdmin,
+        если вызов не прошёл.
+      required: [pcId, category, at]
+      properties:
+        pcId:
+          type: string
+          format: uuid
+          description: ПК.
+        userId:
+          type: [string, "null"]
+          format: uuid
+          description: Вошедший пользователь, если есть.
+        category:
+          $ref: '#/components/schemas/CallAdminCategory'
+        message:
+          type: [string, "null"]
+          maxLength: 500
+          description: Свободный текст (агент обрезает пробелы и не пропускает длиннее 500).
+        at:
+          type: string
+          format: date-time
+          description: Время запроса по часам клиента (для офлайн-повтора).
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:861"
+      x-source:
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:238"

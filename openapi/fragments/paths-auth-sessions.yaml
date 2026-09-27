@@ -1,0 +1,1375 @@
+# Группа paths-auth-sessions: клиентские вызовы агента /auth/*, /users/*, /sessions*.
+# Источники: src/ClubShell.Core/Http/Endpoints.cs, src/ClubShell.Core/Abstractions/IServerClient.cs,
+# src/ClubShell.Core/Http/ServerClient.cs, docs/SERVER_API.md §4.3–4.5, tools/MockServer/src/routes/{auth,session}.ts.
+# Приоритет при расхождении: C# агента > MockServer > SERVER_API.md.
+paths:
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /auth/*
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /auth/login:
+    post:
+      tags:
+        - auth
+      operationId: login
+      summary: Вход пользователя на ПК (пароль, карта, одноразовый токен)
+      description: |
+        Вход пользователя с текущего ПК. Режим авторизации `agent` (токен пользователя ещё не выдан).
+
+        - Агент шлёт сюда только `kind` ∈ `password` | `card` | `token` (IPC `auth.login`, а также повторная проверка
+          пароля при разблокировке экрана — `SessionLock`). Гостевой вход идёт через `POST /auth/guest`, QR — опросом
+          `GET /auth/qr/{token}`. Мок дополнительно принимает `kind = qr` (нужен подтверждённый `qrToken`, иначе
+          `401`, `details.reason = "qrNotConfirmed"`) и `kind = guest`.
+        - `pcId` в теле должен совпадать с ПК из токена агента, иначе `403 forbidden`, `details.reason = "pcMismatch"` (мок).
+        - Успех — `200 AuthResponse`. Сервер привязывает токен пользователя к паре (пользователь, pcId); прежние токены
+          пользователей этого ПК отзываются (мок). `session` — открытая сессия этого пользователя на этом ПК (например,
+          после перезапуска агента). `offlineHash` — только при `kind = password` и разрешённом офлайн-входе
+          (формат — см. `AuthResponse.offlineHash`). Агент сохраняет токены пользователя сам, шеллу их не передаёт.
+
+        Ошибки:
+        - `401 unauthorized`, `details.reason = "badCredentials"`, `details.attemptsLeft` — неверные данные входа.
+        - `403 forbidden`, `details.reason` ∈ `banned` | `zoneNotAllowed` | `ageRestricted` | `pcMismatch`.
+        - `409 conflict` — у пользователя открыта сессия на другом ПК: `details: { reason: "activeSessionElsewhere", pcId, pcName }`
+          (`reason` — из мока).
+
+        Внимание: на любой `401`, кроме `details.reason` = `clockSkew` / `userToken`, агент (`ServerClient.SendAsync`)
+        один раз обновляет свой токен (`POST /agents/refresh`, с ротацией refresh-токена) и повторяет запрос. Поэтому одна
+        неудачная попытка пользователя даёт два `POST /auth/login` подряд, и счётчик `attemptsLeft` уменьшается на 2
+        (так ведёт себя и мок). POST без `Idempotency-Key` — агент его автоматически не повторяет.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:33
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:154
+        - src/ClubShell.Core/Http/ServerClient.cs:210
+        - src/ClubShell.Core/Http/ServerClient.cs:725
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:294
+        - src/ClubShell.Agent/Session/SessionLock.cs:222
+        - docs/SERVER_API.md:231
+        - tools/MockServer/src/routes/auth.ts:115
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AuthRequest'
+            examples:
+              password:
+                value:
+                  kind: password
+                  username: alisher
+                  password: '********'
+                  pcId: 7d2f1c3a-1111-4222-8333-444455556666
+                  hwid: 3b1f5e0c9a7d4e2f8c6b5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f
+              card:
+                value:
+                  kind: card
+                  cardId: CARD-0001
+                  pcId: 7d2f1c3a-1111-4222-8333-444455556666
+                  hwid: 3b1f5e0c9a7d4e2f8c6b5a4d3e2f1a0b9c8d7e6f5a4b3c2d1e0f9a8b7c6d5e4f
+      responses:
+        '200':
+          description: Пользователь вошёл; токены пользователя и (опционально) его открытая сессия на этом ПК.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/qr/start:
+    post:
+      tags:
+        - auth
+      operationId: startQrLogin
+      summary: Начать вход по QR-коду
+      description: |
+        Создаёт одноразовый QR-токен для входа через мобильное приложение клуба (IPC `auth.qrStart`). Режим `agent`.
+
+        - Тело `QrStartRequest { pcId }`; агент всегда передаёт свой pcId. Несовпадение с ПК из токена агента —
+          `403 forbidden`, `details.reason = "pcMismatch"` (мок; в моке `pcId` необязателен и по умолчанию берётся из токена).
+        - Ответ `200 QrLoginStart`: `qrUrl` — deep link `https://<server>/q/<qrToken>`, который шелл рисует как QR-код;
+          `pollIntervalSec` — рекомендуемый интервал опроса `GET /auth/qr/{token}` (мок: TTL 120 с, интервал 2 с).
+        - Агент вызывает только при наличии связи и известном pcId.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:36
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:157
+        - src/ClubShell.Core/Http/ServerClient.cs:219
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:377
+        - docs/SERVER_API.md:241
+        - tools/MockServer/src/routes/auth.ts:163
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QrStartRequest'
+      responses:
+        '200':
+          description: QR-токен выдан.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QrLoginStart'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/qr/{token}:
+    parameters:
+      - name: token
+        in: path
+        required: true
+        description: >-
+          `qrToken` из `POST /auth/qr/start` — непрозрачная строка (в моке base64url 24 символа). Агент кодирует сегмент
+          `Uri.EscapeDataString`; подпись считается по закодированному пути ровно как отправлено.
+        schema:
+          type: string
+          minLength: 1
+    get:
+      tags:
+        - auth
+      operationId: getQrLoginStatus
+      summary: Состояние входа по QR-коду
+      description: |
+        Опрос QR-входа. Режим `agent`. Агент вызывает его, когда шелл присылает `auth.login` с `kind = qr`
+        (сам `POST /auth/login` с `kind = qr` агент не использует).
+
+        - `200 QrLoginStatus`: `status` ∈ `pending` → `scanned` → `confirmed` | `expired`.
+        - При `confirmed` в ответе есть `auth` (`AuthResponse`) — ровно один раз: следующие чтения возвращают `expired`.
+          Агент сохраняет токены из `auth` так же, как после `POST /auth/login`.
+        - `pending`, `scanned`, `expired` агент отдаёт шеллу как `unauthorized` (`details.status`).
+        - Токен выдан другому ПК — `403 forbidden`, `details.reason = "pcMismatch"`; неизвестный токен — `404 notFound`,
+          `details.what = "qrToken"` (мок).
+        - Ошибки `409` у входа по QR (активная сессия на другом ПК, `banned` — `403`) те же, что у `POST /auth/login`
+          (мок строит `auth` той же функцией).
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:102
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:160
+        - src/ClubShell.Core/Http/ServerClient.cs:226
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:277
+        - docs/SERVER_API.md:245
+        - tools/MockServer/src/routes/auth.ts:187
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Текущее состояние QR-входа (при `confirmed` — с результатом входа).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QrLoginStatus'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/guest:
+    post:
+      tags:
+        - auth
+      operationId: guestLogin
+      summary: Гостевой вход
+      description: |
+        Создаёт временного пользователя с ролью `guest` (`username = "guest-<номер ПК>-<n>"`) и выполняет вход.
+        Режим `agent`. Агент вызывает для IPC `auth.login` с `kind = guest`: `displayName = null`, `locale` — язык из
+        настроек шелла.
+
+        - `pcId` должен совпадать с ПК из токена агента, иначе `403 forbidden`, `details.reason = "pcMismatch"` (мок).
+        - Гостевой вход выключен в клубе — `403 forbidden`, `details.reason = "guestDisabled"`.
+        - Ответ `200 AuthResponse` (`offlineHash` не выдаётся).
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:39
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:163
+        - src/ClubShell.Core/Http/ServerClient.cs:238
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:274
+        - docs/SERVER_API.md:250
+        - tools/MockServer/src/routes/auth.ts:223
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GuestAuthRequest'
+      responses:
+        '200':
+          description: Гость создан и вошёл.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /auth/logout:
+    post:
+      tags:
+        - auth
+      operationId: logout
+      summary: Выход пользователя с ПК
+      description: |
+        Режим `user`. Тело `LogoutRequest { reason }`; ответ `204` без тела (агент принимает любой 2xx и тело не читает).
+
+        - Сервер завершает открытую сессию этого пользователя на этом ПК с причиной `reason` (как `SessionEndReason`) и
+          отзывает токены пользователя, привязанные к этому ПК (мок).
+        - Агент перед этим сам завершает сессию через `POST /sessions/{id}/end`, поэтому обычно открытой сессии уже нет.
+          Агент шлёт только `reason` ∈ `user` | `idle` | `admin`, вызывает операцию только при наличии связи, ошибки
+          игнорирует и в любом случае удаляет токены пользователя локально.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:42
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:166
+        - src/ClubShell.Core/Http/ServerClient.cs:247
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:324
+        - docs/SERVER_API.md:255
+        - tools/MockServer/src/routes/auth.ts:232
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LogoutRequest'
+            examples:
+              user:
+                value:
+                  reason: user
+      responses:
+        '204':
+          description: Пользователь вышел; открытая сессия (если была) завершена. Тела нет.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /users/*
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /users/{userId}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags:
+        - users
+      operationId: getUser
+      summary: Профиль пользователя
+      description: |
+        Режим `user`, только свой профиль: чужой `userId` — `403 forbidden`, `details.reason = "notOwner"`.
+        В моке пользователь с ролью `admin` может читать любой профиль (неизвестный — `404`, `details.what = "user"`).
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:105
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:169
+        - src/ClubShell.Core/Http/ServerClient.cs:261
+        - docs/SERVER_API.md:262
+        - tools/MockServer/src/routes/auth.ts:243
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Профиль пользователя.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    patch:
+      tags:
+        - users
+      operationId: updateUser
+      summary: Изменить профиль пользователя
+      description: |
+        Режим `user`, только свой профиль (`403 forbidden`, `details.reason = "notOwner"`); гостю —
+        `403 forbidden`, `details.reason = "guest"`. Тело `ProfileUpdateRequest` — частичное обновление: заданы только
+        меняемые поля (хотя бы одно), `null` агент не передаёт. Ответ — обновлённый `User`.
+
+        Агент вызывает из IPC `profile.update` (после своей проверки полей) и при смене языка шелла (`sys.setLocale` —
+        только `locale`, ошибки игнорируются). PATCH агент автоматически не повторяет.
+
+        `400 validation`, `details.field` ∈ `displayName` | `avatarUrl` | `pin` | `locale`: мок требует `displayName`
+        2–32 символа после trim (агент пропускает до 64), `avatarUrl` — http/https, `pin` — 4–6 цифр.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:105
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:172
+        - src/ClubShell.Core/Http/ServerClient.cs:265
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:955
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:301
+        - docs/SERVER_API.md:263
+        - tools/MockServer/src/routes/auth.ts:251
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProfileUpdateRequest'
+            examples:
+              locale:
+                value:
+                  locale: uz
+      responses:
+        '200':
+          description: Профиль обновлён.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /users/{userId}/stats:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags:
+        - users
+      operationId: getUserStats
+      summary: Статистика пользователя
+      description: |
+        Режим `user`, только свой `userId` (иначе `403 forbidden`, `details.reason = "notOwner"`). Если статистики ещё нет,
+        сервер отдаёт нули (`totalHours = 0`, `sessionsCount = 0`, `favoriteGames = []`, `spent = { amount: 0, currency: "UZS" }`,
+        `rank = 0`), а не `404` (мок). `spent` — объект `Money`, не число: `"spent": 0` агент не разберёт (`MoneyJsonConverter`).
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:108
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:175
+        - src/ClubShell.Core/Http/ServerClient.cs:272
+        - docs/SERVER_API.md:264
+        - tools/MockServer/src/routes/auth.ts:271
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Агрегированная статистика.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserStats'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /users/{userId}/achievements:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags:
+        - users
+      operationId: getUserAchievements
+      summary: Достижения пользователя
+      description: |
+        Режим `user`, только свой `userId` (иначе `403 forbidden`, `details.reason = "notOwner"`). Ответ
+        `{ items: Achievement[] }`, пустой список допустим; `title`/`description` локализуются по `Accept-Language`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:111
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:178
+        - src/ClubShell.Core/Http/ServerClient.cs:276
+        - docs/SERVER_API.md:265
+        - tools/MockServer/src/routes/auth.ts:276
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Список достижений.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProfileAchievementsResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /users/{userId}/loyalty:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags:
+        - users
+      operationId: getUserLoyalty
+      summary: Статус программы лояльности
+      description: |
+        Режим `user`, только свой `userId` (иначе `403 forbidden`, `details.reason = "notOwner"`). `perks` локализуются по
+        `Accept-Language`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:114
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:181
+        - src/ClubShell.Core/Http/ServerClient.cs:280
+        - docs/SERVER_API.md:266
+        - tools/MockServer/src/routes/auth.ts:281
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Уровень, очки и привилегии лояльности.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Loyalty'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  # ------------------------------------------------------------------------------------------------------------------
+  # /sessions*
+  # ------------------------------------------------------------------------------------------------------------------
+
+  /sessions/current:
+    get:
+      tags:
+        - sessions
+      operationId: getCurrentSession
+      summary: Текущая открытая сессия ПК
+      description: |
+        Режим `agent` (без `X-User-Token`). Открытая сессия ПК (любого пользователя, состояние не `idle`/`ended`) —
+        `200 Session`; нет открытой сессии — `204` без тела (агент получает `null`).
+
+        Агент вызывает при восстановлении связи (`SessionManager.SyncCoreAsync`) для сверки локальной сессии с серверной.
+        Внутри `SyncCoreAsync` порядок такой: повтор отложенного офлайн-создания (`POST /sessions`) → этот запрос → сверка →
+        отправка очереди событий (`POST /sessions/{id}/events`). Но цикл обслуживания агента (`AgentWorker`) отправляет
+        очередь событий ещё и ДО `SyncWithServerAsync` (а также при остановке агента), поэтому события офлайн-сессии могут
+        прийти раньше её повтора — см. `POST /sessions/{id}/events`. На временные ошибки сверка откладывается.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:48
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:188
+        - src/ClubShell.Core/Http/ServerClient.cs:288
+        - src/ClubShell.Core/Http/ServerClient.cs:646
+        - src/ClubShell.Agent/Session/SessionManager.cs:725
+        - src/ClubShell.Agent/AgentWorker.cs:351
+        - docs/SERVER_API.md:270
+        - tools/MockServer/src/routes/session.ts:129
+      security:
+        - agentBearer: []
+      parameters:
+        - name: pcId
+          in: query
+          required: true
+          description: >-
+            ПК, чью сессию запрашивают; агент всегда передаёт свой pcId. В моке параметр необязателен (по умолчанию — ПК
+            из токена агента) и с токеном не сверяется.
+          schema:
+            type: string
+            format: uuid
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Открытая сессия ПК.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '204':
+          description: У ПК нет открытой сессии. Тела нет.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /sessions:
+    post:
+      tags:
+        - sessions
+      operationId: createSession
+      summary: Начать игровую сессию (в том числе повтор офлайн-сессии)
+      description: |
+        Режим `user` (для повтора офлайн-сессии допустим и режим `agent` — см. «Авторизация повтора»), `Idempotency-Key`
+        обязателен. Ответ `201 Session`; на повтор с тем же ключом (24 ч, METHOD + PATH)
+        сервер возвращает исходный ответ (тот же статус и тело) с `Idempotent-Replayed: true`.
+
+        Проверки (мок): `userId` = владелец `X-User-Token` (иначе `403 forbidden`, `notOwner`); `pcId` = ПК токена агента
+        (`403 forbidden`, `pcMismatch`); ПК и тариф существуют (`404`, `details.what` ∈ `pc` | `tariff`); у пользователя
+        и у ПК нет открытой сессии (`409 sessionAlreadyActive`, `details: { sessionId, pcId }`); `403 policyDenied`,
+        `details.rule` ∈ `pcMaintenance` | `pcBooked` | `tariffZone` | `tariffTime` | `postpaidNotAllowed` (постоплата гостю);
+        `minutes` обязателен для непакетного тарифа и лежит в `minMinutes..maxMinutes` тарифа (`400 validation`,
+        `details.field = minutes`, `reason` ∈ `required` | `min` | `max`); при предоплате баланс ≥ стоимости (`402`).
+
+        Офлайн-сессии. Если вызов закончился временной ошибкой (`ErrorCodes.IsRetryable`: `error.code` ∈ `timeout` |
+        `rateLimited` | `serverUnavailable`, в том числе `429`, `501`/`503` с `serverUnavailable`, 5xx без JSON-конверта —
+        код выводится из статуса, а также сетевой сбой, таймаут, открытый circuit breaker) и офлайн-режим клуба разрешает
+        новые сессии, агент открывает сессию локально. `500` с `error.code = internal` к офлайн-сессии НЕ ведёт: код агент
+        берёт из конверта, `internal` неповторяемый, и ошибка возвращается шеллу.
+        Локальная сессия: `id = clientSessionId` (или новый UUID), `startedAt` — локальное время старта (часы ПК),
+        `minutes = min(исходные minutes или packageMinutes тарифа, offline.maxOfflineMinutes)` (по умолчанию 240); для
+        постоплаты на непакетном тарифе без `minutes` агент подставляет `maxOfflineMinutes`. При восстановлении связи
+        агент повторяет `POST /sessions` с ТЕМ ЖЕ `Idempotency-Key`, но с телом, дополненным `startedAt`, `clientSessionId`
+        и таким `minutes`.
+
+        Авторизация повтора. `X-User-Token` агент добавляет, только если токен у него есть: офлайн-вход токен пользователя
+        не выдаёт, а офлайн-выход не стирает токен прежнего пользователя. Поэтому повтор часто приходит без
+        `X-User-Token` или с чужим/просроченным токеном. Для повтора (в теле есть `startedAt` и `clientSessionId`)
+        допустима вторая альтернатива `security` — только токен агента (+ подпись). Сервер тогда сверяет `pcId` с ПК
+        токена агента (`403 forbidden`, `pcMismatch`), проверяет, что `userId` существует и не заблокирован, а
+        отсутствующий, недействительный или чужой `X-User-Token` игнорирует (не `401 userToken` и не `403 notOwner`).
+        Без `startedAt`/`clientSessionId` `X-User-Token` обязателен (`401 unauthorized`, `details.reason = userToken`).
+        Мок так не умеет (всегда `requireUser`) — расхождение с моком в пользу кода агента.
+
+        Требования к серверу при повторе:
+        - повтор с тем же ключом и отличающимся телом не отклонять: если первая попытка на самом деле была обработана,
+          вернуть сохранённый ответ;
+        - `startedAt` принимать не старше `maxOfflineMinutes` (мок: 240 мин, иначе `400 validation`,
+          `details = { field: startedAt, reason: tooOld }`), время сессии считать от `startedAt`;
+        - при `prepaid = false` не отклонять `minutes` по диапазону тарифа (`minMinutes..maxMinutes`; мок отдаёт
+          `400 validation`, `minutes`/`max`), а игнорировать его или трактовать как лимит офлайн-бюджета;
+        - `clientSessionId` принять как `id` сессии, если он свободен, иначе выдать новый `id`: агент перепривяжет к нему
+          локальную сессию и очередь событий;
+        - если в ответе `state` = `ended`/`idle`, агент завершает сессию локально без расчёта с сервером.
+        Любая невременная ошибка на повторе (в том числе `401`/`403`/`400`/`402`) — агент завершает офлайн-сессию
+        локально (`reason = error`) без расчёта с сервером, и сессия теряется; события такой сессии затем получат `404`
+        на `POST /sessions/{id}/events`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:45
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:191
+        - src/ClubShell.Core/Http/ServerClient.cs:292
+        - src/ClubShell.Core/Http/ServerClient.cs:608
+        - src/ClubShell.Core/Http/ServerClient.cs:834
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:156
+        - src/ClubShell.Agent/Session/SessionManager.cs:210
+        - src/ClubShell.Agent/Session/SessionManager.cs:575
+        - src/ClubShell.Agent/Session/SessionManager.cs:591
+        - src/ClubShell.Agent/Session/SessionManager.cs:618
+        - src/ClubShell.Agent/Session/SessionManager.cs:706
+        - src/ClubShell.Agent/Session/SessionManager.cs:717
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:298
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:342
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:272
+        - tools/MockServer/src/routes/session.ts:136
+      # Открытый вопрос (openQuestions, не норма схемы): вторая альтернатива security (только agentBearer) допустима лишь
+      # для повтора офлайн-сессии (startedAt + clientSessionId) — иначе агент теряет офлайн-сессии пользователей,
+      # вошедших офлайн (SessionHandlers.cs:298-321 не выдаёт токен; ServerClient.cs:834 шлёт X-User-Token только если он
+      # есть; SessionManager.cs:714-717 завершает сессию с reason=error). Цена: сервер создаёт (и при prepaid списывает)
+      # сессию пользователя только по подписанному токену агента. Альтернатива (вариант Б): оставить userToken
+      # обязательным и принять, что такие офлайн-сессии при восстановлении связи завершаются агентом с reason=error.
+      # Нужно решение владельца.
+      security:
+        - agentBearer: []
+          userToken: []
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionCreateRequest'
+            examples:
+              online:
+                summary: Обычный старт
+                value:
+                  pcId: 7d2f1c3a-1111-4222-8333-444455556666
+                  userId: 2b7e4c1d-9a8f-4e3d-b2c1-0a9f8e7d6c5b
+                  tariffId: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                  minutes: 60
+                  prepaid: true
+              offlineReplay:
+                summary: Повтор сессии, созданной офлайн
+                value:
+                  pcId: 7d2f1c3a-1111-4222-8333-444455556666
+                  userId: 2b7e4c1d-9a8f-4e3d-b2c1-0a9f8e7d6c5b
+                  tariffId: 5e4d3c2b-1a09-4f8e-9d7c-6b5a4f3e2d1c
+                  minutes: 60
+                  prepaid: true
+                  startedAt: '2026-09-21T10:15:30.123Z'
+                  clientSessionId: 9c1e2d3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5
+      responses:
+        '201':
+          description: Сессия создана (или повторён сохранённый ответ по `Idempotency-Key`).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /sessions/{id}/pause:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор сессии.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - sessions
+      operationId: pauseSession
+      summary: Поставить сессию на паузу
+      description: |
+        Режим `user`. Тела запроса нет: агент шлёт POST без тела и без `Content-Type` (в подписи — хеш пустого тела).
+        Ответ `200 Session` (`state = paused`, `pausedAt` задан).
+
+        Ошибки: чужая сессия — `403 forbidden`, `notOwner`; `403 policyDenied` (правила клуба, SERVER_API); нет сессии —
+        `404`, `details.what = "session"`; уже на паузе — `409 conflict`, `details.reason = "alreadyPaused"`; сессия не
+        `active` — `409 sessionNotActive`, `details.session`.
+
+        Если вызов не удался временной ошибкой, агент ставит паузу локально и позже отправляет событие `paused` через
+        `POST /sessions/{id}/events`. Для офлайн-сессии, ещё не принятой сервером, агент вызов не делает.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:117
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:194
+        - src/ClubShell.Core/Http/ServerClient.cs:299
+        - src/ClubShell.Core/Http/ServerClient.cs:673
+        - src/ClubShell.Agent/Session/SessionManager.cs:255
+        - docs/SERVER_API.md:289
+        - tools/MockServer/src/routes/session.ts:226
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Сессия на паузе.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /sessions/{id}/resume:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор сессии.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - sessions
+      operationId: resumeSession
+      summary: Снять сессию с паузы
+      description: |
+        Режим `user`. Тела запроса нет (как у `pause`). Ответ `200 Session` (`state = active`, `pausedAt = null`).
+
+        Ошибки: чужая сессия — `403 forbidden`, `notOwner`; нет сессии — `404`, `details.what = "session"`; не на паузе —
+        `409 conflict`, `details.reason = "notPaused"`; сессия не `paused` или предоплаченное время исчерпано —
+        `409 sessionNotActive`, `details.session`; `402 insufficientFunds` (SERVER_API; мок не отдаёт).
+
+        Если вызов не удался временной ошибкой, агент снимает паузу локально и позже отправляет событие `resumed`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:120
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:197
+        - src/ClubShell.Core/Http/ServerClient.cs:303
+        - src/ClubShell.Agent/Session/SessionManager.cs:296
+        - docs/SERVER_API.md:290
+        - tools/MockServer/src/routes/session.ts:243
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      responses:
+        '200':
+          description: Сессия снова активна.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /sessions/{id}/end:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор сессии.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - sessions
+      operationId: endSession
+      summary: Завершить сессию с расчётом
+      description: |
+        Завершает сессию и возвращает расчёт `200 SessionEndResult { session (state = ended), charged, refunded }`.
+        Тело `SessionEndReport { reason, secondsUsed, endedAt }`; агент всегда передаёт `endedAt` = своё текущее время.
+
+        Авторизация: агент вызывает в режиме `user`, но `X-User-Token` добавляется, только если он у агента есть (например,
+        после офлайн-входа его нет), а завершать сессию агент может и без пользователя (time-up, команда админа, питание).
+        Поэтому сервер требует только токен агента (+ подпись); `X-User-Token`, если пришёл, не обязателен. Сессия должна
+        принадлежать ПК из токена агента (`403 forbidden`, `pcMismatch`).
+
+        Уже завершённая сессия — `409 sessionNotActive` с `details.session` (объект `Session`, `state = ended`); агент
+        трактует это как УСПЕХ: `ServerClient.EndSessionAsync` возвращает `SessionEndResult(details.session, charged = 0,
+        refunded = 0)`, а `SessionManager` принимает любой `sessionNotActive` на завершении как уже выполненное завершение
+        (без `details.session` — с локальным расчётом). Поэтому при `state = ended` сервер обязан класть `details.session`.
+
+        Расчёт (мок): постоплата — списание по тарифу за `ceil(used / 60)` минут, где `used` — время, измеренное сервером
+        на момент `min(endedAt, now)`; `secondsUsed` мок только валидирует (целое ≥ 0) и не использует. Предоплата — возврат
+        за неиспользованное время только при `reason` ∈ `admin` | `error` и не для пакетного тарифа. Сервер v1 считает так
+        же — по своему измеренному времени, а не по `secondsUsed` агента (доверять ли `secondsUsed` — открытый вопрос).
+
+        `Idempotency-Key` нет, поэтому агент на 5xx/сетевые ошибки запрос не повторяет: при временной ошибке он
+        рассчитывает сессию локально и ставит в очередь событие `ended` (`data.reason`), которое уйдёт через
+        `POST /sessions/{id}/events`.
+
+        Прочие ошибки: `400 validation` (`reason` enum, `secondsUsed` ≥ 0, `endedAt` формат); `404`, `details.what = "session"`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:123
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:200
+        - src/ClubShell.Core/Http/ServerClient.cs:307
+        - src/ClubShell.Core/Http/ServerClient.cs:314
+        - src/ClubShell.Core/Http/ServerClient.cs:574
+        - src/ClubShell.Core/Http/ServerClient.cs:834
+        - src/ClubShell.Agent/Session/SessionManager.cs:898
+        - src/ClubShell.Agent/Session/SessionManager.cs:900
+        - src/ClubShell.Agent/Session/SessionManager.cs:924
+        - docs/SERVER_API.md:291
+        - tools/MockServer/src/routes/session.ts:259
+        - tools/MockServer/src/routes/session.ts:269
+        - tools/MockServer/src/routes/session.ts:67
+      # Открытый вопрос (openQuestions, не норма схемы): постоплату мок (session.ts:66-90, db.ts:596-598) и сервер v1
+      # считают по серверному времени на min(endedAt, now); присланный агентом secondsUsed игнорируется (session.ts:266).
+      # Доверять ли secondsUsed (например, для офлайн-интервалов, паузы которых сервер узнаёт только из очереди событий)
+      # — решение владельца.
+      security:
+        - agentBearer: []
+          userToken: []
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionEndReport'
+            examples:
+              user:
+                value:
+                  reason: user
+                  secondsUsed: 3540
+                  endedAt: '2026-09-21T11:14:30.123Z'
+      responses:
+        '200':
+          description: Сессия завершена; итоговая сессия и суммы расчёта.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionEndResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /sessions/{id}/extend:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор сессии.
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - sessions
+      operationId: extendSession
+      summary: Продлить сессию
+      description: |
+        Режим `user`, `Idempotency-Key` обязателен (агент генерирует новый ключ на каждое действие пользователя и
+        переиспользует его при автоматических повторах). Тело `SessionExtendRequest { minutes, tariffId }`, ответ
+        `200 Session` (стоимость списана с баланса).
+
+        Ошибки: чужая сессия — `403 forbidden`, `notOwner`; `403 policyDenied` (SERVER_API); нет сессии или тарифа —
+        `404`, `details.what` ∈ `session` | `tariff`; сессия не `active`/`paused`/`locked` — `409 sessionNotActive`;
+        постоплатная сессия — `409 conflict`, `details.reason = "postpaidSession"`; `minutes` вне 1..1440 или сверх
+        `maxMinutes` тарифа с учётом уже купленного — `400 validation`, `details.field = minutes`; не хватает средств — `402`.
+
+        Если вызов не удался временной ошибкой, агент продлевает сессию локально (только предоплатную) и позже
+        отправляет событие `extended` с `data = { minutes, cost }`.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:126
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:203
+        - src/ClubShell.Core/Http/ServerClient.cs:322
+        - src/ClubShell.Agent/Session/SessionManager.cs:359
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:295
+        - tools/MockServer/src/routes/session.ts:272
+      security:
+        - agentBearer: []
+          userToken: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionExtendRequest'
+            examples:
+              plus30:
+                value:
+                  minutes: 30
+      responses:
+        '200':
+          description: Сессия продлена (или повторён сохранённый ответ по `Idempotency-Key`).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Session'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/PaymentRequired'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /sessions/{id}/events:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: >-
+          Идентификатор сессии. Для офлайн-сессии до её принятия сервером — `clientSessionId`: пакет может прийти ДО
+          повтора `POST /sessions` (агент отправляет очередь раньше `SyncWithServerAsync`), тогда сервер отвечает `404`
+          (`details.what = session`) и не кэширует этот ответ по `Idempotency-Key`. После принятия — id, под которым
+          сервер принял сессию (если он отличается, агент перепривязывает очередь на него).
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - sessions
+      operationId: postSessionEvents
+      summary: Пакет событий сессии (офлайн-очередь и аудит)
+      description: |
+        Режим `agent` (без `X-User-Token`), `Idempotency-Key` обязателен. Тело `SessionEventsBatch` — до 100 событий ОДНОЙ
+        сессии в хронологическом порядке; ответ `204` без тела (агент принимает любой 2xx). Сессия должна принадлежать ПК
+        из токена агента (`403 forbidden`, `pcMismatch`).
+
+        `Idempotency-Key` детерминирован: первые 16 байт SHA-256 от `"<sessionId>:<первый id>:<последний id>"` очереди,
+        отформатированные как GUID, — это НЕ UUID v4 (биты версии произвольные). Сервер не должен проверять версию UUID;
+        повтор того же пакета (в том числе после перезапуска агента) обязан дедуплицироваться.
+
+        Что шлёт агент (`SessionEvent.type`, `data`):
+        - `started` — только для сессии, созданной офлайн (`at` = `startedAt`);
+        - `paused` / `resumed` / `extended` (`data = { minutes, cost }`) — если соответствующий онлайн-вызов не удался
+          временной ошибкой и действие применено локально, либо сессия создана офлайн и ещё не принята сервером (тогда
+          онлайн-вызов вообще не делается);
+        - `locked` / `unlocked` — всегда; `warning` (`data = { minutesLeft }`) — всегда;
+        - `charged` (`data = { amount }`) — периодическая оценка агентом начислений постоплаты;
+        - `ended` (`data = { reason }`) — только если `POST /sessions/{id}/end` не удался временной ошибкой; сервер должен
+          завершить по нему сессию (мок этого не делает — см. openQuestions контракта).
+        Мок применяет к состоянию только `locked`/`unlocked` (state) и `warning` (`warningsSent`), остальное пишет в аудит.
+
+        Офлайн-сессия: цикл обслуживания агента (`AgentWorker`) отправляет очередь ДО `SyncWithServerAsync` с повтором
+        `POST /sessions`, поэтому пакет (первым в нём идёт `started`) может прийти раньше создания — под `clientSessionId`.
+        Сервер отвечает `404 notFound` (`details.what = session`), и этот ответ НЕ сохраняется под `Idempotency-Key` (мок
+        проверяет сессию до idempotency-обработки). Для агента это засчитанная неудачная попытка (не больше 5, затем
+        dead-letter) и экспоненциальная задержка отправки. После принятия сессии пакет придёт повторно — с тем же ключом,
+        если id сессии и состав пакета не изменились, иначе с новым.
+
+        Ошибки: `400 validation`, `details.field`/`reason` как в моке: `events` — `required` (нет массива) | `max` (больше
+        100); элемент не объект — `events[i]`, `format`; поля элемента — без префикса `events[i]`: `type` — `enum`, `at` —
+        `required` (нет или пустая строка) | `format` (не дата). `404`, `details.what = "session"` — агент помечает пакет
+        как неудачный (после исчерпания попыток — dead-letter) и приостанавливает отправку очереди с экспоненциальной
+        задержкой; на временные ошибки и `401`/`403` отправка откладывается без потери событий.
+      x-server-status: required
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:129
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:206
+        - src/ClubShell.Core/Http/ServerClient.cs:329
+        - src/ClubShell.Agent/Session/OfflineSessionStore.cs:61
+        - src/ClubShell.Agent/Session/OfflineSessionStore.cs:503
+        - src/ClubShell.Agent/Session/OfflineSessionStore.cs:519
+        - src/ClubShell.Agent/Session/OfflineSessionStore.cs:770
+        - src/ClubShell.Agent/AgentWorker.cs:351
+        - src/ClubShell.Agent/Session/SessionManager.cs:250
+        - src/ClubShell.Agent/Session/SessionManager.cs:1005
+        - docs/SERVER_API.md:20
+        - docs/SERVER_API.md:299
+        - tools/MockServer/src/routes/session.ts:302
+        - tools/MockServer/src/routes/session.ts:310
+      security:
+        - agentBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTimestamp'
+        - $ref: '#/components/parameters/XSignature'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/XAgentVersion'
+        - $ref: '#/components/parameters/XShellVersion'
+        - $ref: '#/components/parameters/AcceptLanguage'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SessionEventsBatch'
+            examples:
+              lockAudit:
+                value:
+                  events:
+                    - sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5
+                      type: locked
+                      at: '2026-09-21T10:40:00.000Z'
+                    - sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5
+                      type: unlocked
+                      at: '2026-09-21T10:42:10.500Z'
+                    - sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5
+                      type: warning
+                      at: '2026-09-21T11:05:30.123Z'
+                      data:
+                        minutesLeft: 10
+      responses:
+        '204':
+          description: События приняты (или пакет с этим `Idempotency-Key` уже был принят). Тела нет.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '426':
+          $ref: '#/components/responses/UpgradeRequired'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+        '500':
+          $ref: '#/components/responses/InternalError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'

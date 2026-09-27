@@ -1,0 +1,1047 @@
+openapi: 3.1.0
+info:
+  title: Club server API
+  version: 1.0.0
+  description: |
+    REST-API центрального сервера игрового клуба. Потребители: агент на ПК клуба (C#, `club-shell/src/ClubShell.Core`,
+    через него — шелл/киоск) и касса `club-shell/apps/admin` (маршруты `/admin/*`). Пути и форма данных взяты из кода
+    клиента (C# DTO `ClubShell.Contracts` > MockServer > `docs/SERVER_API.md`; для `/admin/*` — `apps/admin/src/api.ts` >
+    MockServer). WebSocket агента (`wss://{host}/ws/agent`, подпротокол `clubshell.v1`) описан отдельно в
+    `asyncapi/asyncapi.yaml`.
+
+    ## 1. Формат данных
+
+    - `Content-Type: application/json; charset=utf-8` в обе стороны; пустое тело допустимо только у 204/304.
+    - Свойства — camelCase; enum — camelCase-строки (кроме явно переопределённых атрибутами C#; точные строки — в схемах).
+    - `null` агент при записи опускает (`WhenWritingNull`): отсутствие поля == `null`. Сервер обязан отдавать все
+      не-nullable поля схемы: агент их наличие не проверяет, и пропущенное поле превратится в `null`/0 в не-nullable члене.
+    - Неизвестные поля агент игнорирует (`UnmappedMemberHandling.Skip`).
+    - Время — ISO-8601 UTC с миллисекундами и `Z` (`2026-09-21T10:15:30.123Z`); время клуба — `HH:mm`;
+      даты — `YYYY-MM-DD` (локальная дата клуба); деньги — `{ "amount": <int64 минорные единицы>, "currency": "UZS" }`;
+      идентификаторы — UUID строчными буквами.
+
+    ## 2. Авторизация
+
+    | Режим | Заголовки | Где |
+    |-------|-----------|-----|
+    | `club` | `X-Club-Key` (ключ клуба из `agent.json`) | только `POST /agents/register` |
+    | `none` | — (токен обновления в теле) | `POST /agents/refresh`, `POST /admin/login` |
+    | `agent` | `Authorization: Bearer <JWT агента>` + `X-Timestamp` + `X-Signature` | почти все маршруты агента |
+    | `user` | `agent` + `X-User-Token: <токен пользователя>` (только если пользователь вошёл) | пользовательские маршруты |
+    | `staff` | `Authorization: Bearer <токен персонала>` (без подписи) | `/admin/*` |
+
+    JWT агента (RS256, `exp` ≈ 1 ч): `sub` = pcId, `club`, `hwid`, `role = "agent"`, `iat`, `exp`, `jti`; агент проверяет
+    только `exp`. `refreshToken` — непрозрачный, 30 дней, одноразовый (ротация). Токен пользователя выдаётся
+    `POST /auth/*` и привязан к паре (пользователь, pcId).
+
+    `X-User-Token` агент добавляет только при вошедшем пользователе (`ServerClient.Authorize`: `auth == User` и есть
+    токен пользователя), а режим `user` используется и там, где пользователь необязателен. Поэтому операции режима `user`
+    делятся на два вида:
+    - **пользователь обязателен** (профиль, кошелёк, старт/пауза/продление сессии, заказы, сообщения чата, бронь,
+      вступление в турнир, аренда аккаунта и т. п.): токена нет или он чужой/просроченный — `401`,
+      `details.reason = "userToken"`; security `[{agentBearer: [], userToken: []}]`;
+    - **пользователь необязателен** (токен только обогащает ответ): `GET /games`, `GET /games/{id}` (`lastPlayed`),
+      `POST /sessions/{id}/end` (агент завершает сессию и по таймауту/команде админа), `GET /tournaments` (`joined`),
+      `GET /tournaments/{id}/leaderboard` (`me`), `POST /support/call-admin`. Без токена (и с недействительным токеном —
+      мок его молча игнорирует, `optionalUser`) сервер отвечает обычным ответом без пользовательского обогащения;
+      `401 userToken` здесь недопустим: агент на `reason = userToken` токен не обновляет, и ошибка уходит в шелл
+      (например, каталог игр пропадёт с экрана блокировки). Рекомендуемый security —
+      `[{agentBearer: [], userToken: []}, {agentBearer: []}]`. Это отступление от общего правила
+      «user → `[{agentBearer, userToken}]`» — открытый вопрос владельцу.
+
+    Поведение агента на `401` (`ServerClient.SendAsync`): `reason = clockSkew` и есть `X-Server-Time` — корректирует
+    смещение часов и повторяет запрос один раз; `reason = userToken` — ошибка уходит в шелл без обновления токена агента;
+    любой другой `reason` — один `POST /agents/refresh` и повтор; `401/403` на refresh при переподключении
+    (`ServerConnection.RefreshOrReregisterAsync`) — повторная регистрация (`POST /agents/register`). Отсюда требование:
+    `details.reason` в 401 обязателен и берётся из списка в ответе `Unauthorized`.
+
+    ## 3. Подпись запросов агента (байт в байт)
+
+    Каждый запрос `ServerClient` к маршрутам `/api/v1/*` с Bearer-токеном агента (режимы `agent` и `user`) несёт
+    `X-Timestamp` и `X-Signature` (`Signing.cs`, `ServerClient.Authorize`). Исключение — передача файлов по URL из
+    ответов сервера, которую агент делает отдельным клиентом без конвейера подписи и без повторов
+    (`RetryPolicy.DownloadHttpClientName`):
+    - пакет обновления по `UpdateManifest.url` — только `Authorization: Bearer <JWT агента>`, **без** `X-Timestamp` и
+      `X-Signature`, с докачкой через `Range` (`UpdateDownloader`); сервер проверяет только Bearer и поддерживает
+      `Range`/`206`;
+    - облачные сохранения (URL скачивания архива и `uploadUrl` для `PUT`) и медиа каталога (обложки, видео, реклама,
+      темы; `LocalCache`) — вообще без заголовков авторизации (публичные или предварительно подписанные URL).
+
+    Если такие файлы раздаёт тот же сервер, их маршруты не должны стоять за проверкой подписи.
+
+    ```
+    X-Timestamp = десятичное Unix-время в секундах (часы агента + выученное смещение сервера), без знака и дробной части
+    BODY_HASH   = lowercase hex( SHA-256( сырые байты тела запроса ) )
+                  для пустого тела: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    message     = X-Timestamp + METHOD + PATH + BODY_HASH        (простая конкатенация, без разделителей, UTF-8)
+    X-Signature = lowercase hex( HMAC-SHA256( key = base64decode(signingSecret), message ) )
+    ```
+
+    - `METHOD` — метод в верхнем регистре (`GET`, `POST`, `PATCH`, `DELETE`).
+    - `PATH` — путь **с префиксом `/api/v1`** и query-строкой ровно так, как отправлены (`Uri.PathAndQuery` агента):
+      без схемы и хоста, без декодирования `%XX` и без нормализации. Сервер сверяет по сырому request-target
+      (мок: `req.raw.url`). За reverse-proxy, переписывающим путь, проверять исходный путь клиента.
+    - `signingSecret` — base64 32 байт из ответа `POST /agents/register` (и `POST /agents/refresh`, если он ротирован;
+      агент переключается атомарно). Ключ HMAC — декодированные байты, не строка base64.
+    - Окно: `|now − X-Timestamp| ≤ 300 с`. Иначе `401 unauthorized`, `details.reason = "clockSkew"` и заголовок
+      `X-Server-Time` (ISO-8601 UTC) — агент вычисляет смещение и повторяет запрос один раз.
+    - Повторы кортежа (`pcId`, `X-Timestamp`, `X-Signature`). SERVER_API.md §2.2 требует его уникальности в пределах
+      окна, но буквально это ломает агента (приоритет у кода агента): подпись ставится один раз до отправки
+      (`ServerClient.SendOnceAsync` → `Authorize`), а автоматические повторы (408/425/429/5xx/сетевые ошибки, §8) идут
+      внутри конвейера `HttpClient` с теми же `X-Timestamp`/`X-Signature`; nonce в подписи нет, поэтому два одинаковых
+      запроса в одну секунду (и повтор после `POST /agents/refresh` в ту же секунду без ротации `signingSecret`) дают
+      тот же кортеж. `401` на повтор агент принял бы за протухший токен: лишний refresh с ротацией refresh-токена, а
+      затем ошибка ушла бы в шелл. Норма v1:
+      - повтор кортежа **не** отклоняется ответом `401` и не считается ошибкой подписи;
+      - `GET`/`PUT`/`DELETE`/`HEAD` исполняются заново как обычно; `POST` с `Idempotency-Key` проходят через хранилище
+        идемпотентности (§5: исходный ответ);
+      - для `POST`/`PATCH` без `Idempotency-Key` (агент их автоматически не повторяет) сервер может лишь журналировать
+        повтор кортежа для аудита, не отклоняя запрос (мок окно повторов не реализует).
+      Открытый вопрос владельцу: нужна ли в v1 активная защита от повторов неидемпотентных запросов; если да, отказ
+      должен быть не `401` (вызывает refresh), а, например, `409 conflict`, `details.reason = "replay"` (агент 409 не
+      повторяет и токен не обновляет) — по согласованию с агентом.
+    - Неверная/отсутствующая подпись — `401`, `details.reason = "signature"`, `details.problem` ∈ `missing` | `mismatch`
+      (мок).
+    - Сравнение подписи — за постоянное время; агент шлёт hex в нижнем регистре.
+    - Отключение подписи на агенте (`server.signingEnabled = false`) допустимо только против мока; боевой сервер
+      запросы режимов `agent`/`user` к маршрутам `/api/v1/*` без подписи отклоняет (загрузки из списка выше под это
+      правило не подпадают).
+
+    Тестовые векторы (`signingSecret` = `AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=`, т.е. байты `00..1f`,
+    `X-Timestamp` = `1789992930`; проверено Python `hmac` и Node `crypto`, как в моке):
+
+    | METHOD | PATH | тело | X-Signature |
+    |--------|------|------|-------------|
+    | `GET` | `/api/v1/sessions/current?pcId=7d2f1c3a-1111-4222-8333-444455556666` | пусто | `50428126405b54687a7cb8f813b7bbde31a74b8e5dddf1aa9aa596cc532abaa2` |
+    | `POST` | `/api/v1/auth/logout` | `{"reason":"user"}` | `20046a0e46e3a7681e416ba37d5ce61baf40bfcec560685fa5042fe6f90ee7c4` |
+
+    (Пример из SERVER_API.md §2.2 использует секрет, который декодируется в 31 байт, — для проверки не годится.)
+
+    ## 4. Конверт ошибок
+
+    Любой не-2xx ответ (кроме 304) — `ServerErrorEnvelope`:
+    `{ "error": { "code": ErrorCode, "message": string, "details": object | null, "traceId": string } }`.
+    Ключ `details` присутствует всегда (`null`, если деталей нет); `traceId` = `X-Trace-Id` запроса.
+    `code` — строго одно из значений `ErrorCode`: неизвестное значение агент не распарсит, отбросит конверт целиком и
+    выведет код из HTTP-статуса (`ErrorCodes.FromHttpStatus`: 400→validation, 401→unauthorized, 402→insufficientFunds,
+    403→forbidden, 404→notFound, 408/504→timeout, 409→conflict, 426→versionMismatch, 429→rateLimited,
+    прочие ≥500→serverUnavailable).
+
+    | HTTP | error.code |
+    |------|------------|
+    | 400 | `validation` (`details: { field, reason }`), `protocolError` |
+    | 401 | `unauthorized` (`details.reason`) |
+    | 402 | `insufficientFunds` (`details: { required: Money, available: Money }`) |
+    | 403 | `forbidden` (`details.reason`), `policyDenied` (`details.rule`), `antiCheatBlocked` (`details: { kind, reason }`) |
+    | 404 | `notFound` (`details.what`) |
+    | 409 | `conflict` (`details.reason`), `sessionNotActive`, `sessionAlreadyActive`, `accountPoolExhausted`, `gameNotInstalled` |
+    | 426 | `versionMismatch` (`details: { supported, got }`) |
+    | 429 | `rateLimited` (`details.retryAfterSec`) + `Retry-After` |
+    | 500 | `internal` |
+    | 501 | см. ответ `NotImplemented` |
+    | 503 | `serverUnavailable` |
+
+    ## 5. Idempotency-Key
+
+    `POST`, которые создают или списывают, принимают `Idempotency-Key: <uuid>`; для `/sessions`, `/sessions/{id}/extend`,
+    `/sessions/{id}/events`, `/shop/orders`, `/wallet/{userId}/topup-intent`, `/booking/reserve`, `/chat/{roomId}/messages`,
+    `/support/call-admin` агент отправляет его всегда. Сервер хранит ключ 24 ч в пределах METHOD + PATH (как мок) и на
+    повтор возвращает исходный ответ (тот же статус и тело) с заголовком `Idempotent-Replayed: true`. Ответы с ошибкой не
+    сохраняются — повтор исполняется заново (мок, `db.ts` `idempotent`). Только POST с этим заголовком агент считает
+    безопасным для автоматического повтора.
+
+    ## 6. ETag / If-None-Match
+
+    `GET /games`, `/apps`, `/tariffs`, `/shop/products`, `/agents/{pcId}/policies`, `/agents/{pcId}/config` отдают `ETag`.
+    Агент сохраняет значение заголовка как есть (в кавычках) и присылает его в `If-None-Match`; `304 Not Modified` без тела
+    означает «использовать кэш». ETag обязан быть в форме RFC 9110 (`"…"` или `W/"…"`): некавыченное значение .NET не
+    распознаёт, и агент никогда не пришлёт `If-None-Match`.
+
+    ## 7. Трассировка, версии, локаль, лимиты, пагинация
+
+    - `X-Trace-Id: <uuid>` — генерирует агент (для вызовов из шелла = `id` IPC-конверта); сервер эхо-возвращает его в
+      заголовке ответа и в `error.traceId`; если заголовка нет — генерирует сам.
+    - `X-Agent-Version`, `X-Shell-Version` (semver; до `auth.hello` шелла — `0.0.0`) и
+      `User-Agent: ClubShellAgent/<ver> (Windows NT 10.0)` агент шлёт в каждом запросе. Неподдерживаемая версия —
+      `426 Upgrade Required`, `error.code = versionMismatch`; агент 426 не повторяет.
+    - `Accept-Language: ru | uz | en` — язык локализуемых `title`/`description`.
+    - Лимит: 600 запросов/мин на токен агента, всплеск 100; превышение — `429` с `Retry-After` (секунды) и `rateLimited`.
+    - Пагинация: query `page` (с 1, по умолчанию 1), `pageSize` (по умолчанию 50, максимум 200, если операция не
+      говорит иное); ответ `{ items, total, page, pageSize }` с фактически применёнными `page`/`pageSize`. Агент
+      передаёт значения шелла без проверки, поэтому сервер не отвечает на них `400`, а нормализует (как мок,
+      `db.ts` `paginate`): `page` < 1 или не число → 1; `pageSize` = 0 или не число → по умолчанию; `pageSize` < 0 → 1;
+      `pageSize` больше максимума → максимум.
+    - Сжатие: `Accept-Encoding: gzip, br`; ответы > 1 КиБ сжимаются.
+
+    ## 8. Повторы и circuit breaker агента (что должен учитывать сервер)
+
+    Агент повторяет `GET`/`PUT`/`DELETE`/`HEAD` и `POST` с `Idempotency-Key` на 408/425/429/**любой 5xx** и сетевые ошибки:
+    до 5 попыток, включая первую (4 повтора), экспоненциальная задержка 0,5…15 с с джиттером, `Retry-After` учитывается. Все такие исходы (включая
+    501) считаются отказами общего circuit breaker: ≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на 30 с для
+    **всех** запросов агента к серверу. Тайм-аут одного запроса — 15 с. Прочие 4xx агент не повторяет.
+
+    ## 9. Совместимость
+
+    - Добавлять поля в ответы и необязательные поля в запросы можно всегда (в схемах нет `additionalProperties: false`).
+    - Удалять, переименовывать, менять тип/смысл поля, делать обязательное поле необязательным/nullable, добавлять
+      обязательное поле запроса — только в `/api/v2`.
+    - Новые значения enum (включая `ErrorCode`) ломают текущего агента: конвертер enum не имеет запасного значения, и
+      весь ответ (или конверт ошибки) не десериализуется. Добавлять только согласованно с релизом агента или в `/api/v2`.
+
+    ## 10. Статус реализации: x-server-status, x-prohibited
+
+    - У каждой операции `x-server-status`: `required` — сервер v1 реализует; `notImplemented` — операция описана, чтобы
+      зафиксировать контракт клиента, но сервер v1 её не реализует и отвечает `501 Not Implemented` с `ServerErrorEnvelope`
+      (ответ `NotImplemented`). Путь при этом существует: 404 на такие операции не отдаётся.
+    - `x-prohibited: telegram` — Telegram в продукте запрещён. Такие операции — `notImplemented`; такие поля сервер не
+      хранит и не использует, на входе принимает и игнорирует, в ответах отдаёт пустое значение того же типа
+      (`""`/`false`), а не опускает поле, если потребитель объявил его обязательным.
+
+    ## 11. Касса `/admin/*`: CORS и тела ответов
+
+    Касса — браузерное SPA на другом origin (dev: `http://localhost:1421`, API — `VITE_ADMIN_API`, по умолчанию
+    `http://localhost:8080/api/v1`); `fetch` шлёт `Authorization: Bearer …` и `Content-Type: application/json`, поэтому
+    браузер делает preflight. Сервер для `/api/v1/admin/*` обязан:
+    - отвечать на preflight `OPTIONS` (`204`, без авторизации) для методов `GET`, `POST`, `PUT`, `PATCH`, `DELETE`;
+    - отдавать `Access-Control-Allow-Origin` для origin кассы (настраиваемый список; мок отражает любой origin) и
+      `Vary: Origin`;
+    - `Access-Control-Allow-Headers`: как минимум `Authorization`, `Content-Type` (мок разрешает любые);
+    - `Access-Control-Expose-Headers: ETag, X-Trace-Id, X-Server-Time, Retry-After` (как мок).
+
+    CORS-заголовки нужны и на ответах с ошибкой (401/403/…), иначе касса не прочитает `ServerErrorEnvelope`.
+    Касса на любом 2xx вызывает `res.json()`, поэтому операции `/admin/*` отвечают JSON-телом, а не `204` без тела.
+  x-source:
+    - docs/SERVER_API.md:10
+    - docs/SERVER_API.md:32
+    - docs/SERVER_API.md:47
+    - docs/SERVER_API.md:87
+    - src/ClubShell.Core/Security/Signing.cs:76
+    - src/ClubShell.Core/Http/ServerClient.cs:696
+    - src/ClubShell.Core/Http/ServerClient.cs:806
+    - src/ClubShell.Core/Http/RetryPolicy.cs:42
+    - src/ClubShell.Core/Http/RetryPolicy.cs:75
+    - src/ClubShell.Contracts/Errors/ErrorCode.cs:136
+    - src/ClubShell.Contracts/Serialization/JsonDefaults.cs:83
+    - src/ClubShell.Contracts/Serialization/JsonDefaults.cs:113
+    - tools/MockServer/src/index.ts:110
+    - tools/MockServer/src/db.ts:460
+    - tools/MockServer/src/db.ts:478
+    - docs/ARCHITECTURE.md:388
+    - docs/SERVER_API.md:64
+    - docs/SERVER_API.md:291
+    - docs/SERVER_API.md:389
+    - docs/SERVER_API.md:395
+    - docs/SERVER_API.md:399
+    - src/ClubShell.Core/Http/ServerClient.cs:343
+    - src/ClubShell.Core/Http/ServerClient.cs:774
+    - src/ClubShell.Core/Http/ServerClient.cs:834
+    - src/ClubShell.Core/Http/RetryPolicy.cs:95
+    - src/ClubShell.Core/Http/RetryPolicy.cs:141
+    - src/ClubShell.Core/Updates/UpdateDownloader.cs:248
+    - src/ClubShell.Agent/Games/Saves/CloudSaveSync.cs:126
+    - src/ClubShell.Agent/Storage/LocalCache.cs:358
+    - tools/MockServer/src/index.ts:138
+    - tools/MockServer/src/index.ts:236
+    - tools/MockServer/src/db.ts:289
+    - tools/MockServer/src/db.ts:456
+    - tools/MockServer/src/routes/games.ts:62
+    - apps/admin/src/api.ts:18
+    - apps/admin/src/api.ts:92
+servers:
+  - url: 'https://{host}/api/v1'
+    description: Центральный сервер клуба (`agent.json → server.baseUrl` включает `/api/v1`).
+    variables:
+      host:
+        default: club.example.uz
+        description: Хост (и при необходимости порт) сервера клуба.
+tags:
+  - name: agents
+    description: Регистрация агента, токены, heartbeat, телеметрия, конфигурация, политики, REST-фолбэк команд.
+  - name: pcs
+    description: ПК клуба (карта мест, «друзья»).
+  - name: auth
+    description: Вход и выход пользователя на ПК (пароль, карта, токен, QR, гость).
+  - name: users
+    description: Профиль пользователя, статистика, достижения, лояльность.
+  - name: sessions
+    description: Игровые сессии — старт, пауза, продление, завершение, события.
+  - name: games
+    description: Каталог игр, пул аккаунтов лаунчеров, облачные сохранения, отчёты о запуске.
+  - name: apps
+    description: Каталог приложений.
+  - name: wallet
+    description: Баланс, история операций, тарифы, пополнение.
+  - name: shop
+    description: Товары и заказы бара.
+  - name: chat
+    description: Чат клуба (ПК, зона, клуб, личные сообщения).
+  - name: booking
+    description: Бронирование мест.
+  - name: tournaments
+    description: Турниры и таблицы лидеров.
+  - name: updates
+    description: Манифесты обновлений агента и шелла.
+  - name: support
+    description: Вызов администратора.
+  - name: anticheat
+    description: Отчёты античита.
+  - name: admin
+    description: Касса и настройка клуба (`apps/admin`, маршруты `/admin/*`), вход персонала по PIN.
+paths: {}
+components:
+  securitySchemes:
+    clubKey:
+      type: apiKey
+      in: header
+      name: X-Club-Key
+      description: |
+        Ключ API клуба (`agent.json → server.clubApiKey`). Используется только для `POST /agents/register`.
+        Отсутствует/неверен — `401 unauthorized`, `details.reason = "clubKey"`.
+      x-source:
+        - docs/SERVER_API.md:36
+        - src/ClubShell.Core/Http/ServerClient.cs:813
+        - tools/MockServer/src/routes/pcs.ts:104
+    agentBearer:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access-токен агента (JWT RS256, `exp` ≈ 1 ч; claims `sub` = pcId, `club`, `hwid`, `role = "agent"`, `iat`, `exp`,
+        `jti`), из `POST /agents/register` / `POST /agents/refresh`. На маршрутах `/api/v1/*` — всегда вместе с подписью
+        `X-Timestamp` + `X-Signature` (см. описание API, §3); без подписи — только при скачивании пакета обновления по
+        `UpdateManifest.url` (с `Range`). Истёк — `401`, `details.reason = "expired"`; неизвестен — `invalid`; ПК удалён —
+        `revoked`.
+      x-source:
+        - docs/SERVER_API.md:37
+        - docs/SERVER_API.md:44
+        - src/ClubShell.Core/Http/ServerClient.cs:822
+        - tools/MockServer/src/db.ts:702
+        - tools/MockServer/src/db.ts:736
+        - src/ClubShell.Core/Updates/UpdateDownloader.cs:248
+        - docs/SERVER_API.md:395
+    publishToken:
+      type: http
+      scheme: bearer
+      description: |
+        Токен публикации релизов шелла (`-Token` / `CLUBSHELL_PUBLISH_TOKEN` скрипта `publish.ps1`, цель `Http`).
+        Выдаётся издателю, не агенту; подписи `X-Timestamp`/`X-Signature` нет. Используется для `POST` и проверочного
+        `GET /updates/{channel}/manifest`, а также для загрузки пакетов `PUT <base>/<channel>/<version>/<file>` вне
+        `/api/v1` (см. `x-note` на пути манифеста).
+      x-source:
+        - tools/scripts/publish.ps1:16
+        - tools/scripts/publish.ps1:191
+        - tools/scripts/publish.ps1:236
+        - tools/scripts/publish.ps1:345
+    userToken:
+      type: apiKey
+      in: header
+      name: X-User-Token
+      description: |
+        Access-токен пользователя (непрозрачный) из `POST /auth/login`, `/auth/guest` или `GET /auth/qr/{token}`.
+        Сервер проверяет, что токен принадлежит пользователю, привязанному к pcId из токена агента. Передаётся только
+        вместе с `agentBearer` и подписью и только когда пользователь вошёл (`ServerClient.Authorize`).
+        Для операций, где пользователь обязателен, отсутствует/недействителен — `401`, `details.reason = "userToken"`,
+        `details.problem` ∈ `invalid` | `expired` | `boundElsewhere` | `revoked` (мок). Для операций, где токен только
+        обогащает ответ (`GET /games`, `GET /games/{id}`, `POST /sessions/{id}/end`, `GET /tournaments`,
+        `GET /tournaments/{id}/leaderboard`, `POST /support/call-admin`), он необязателен: без него (или с
+        недействительным) — обычный ответ без обогащения, `401` недопустим; security —
+        `[{agentBearer: [], userToken: []}, {agentBearer: []}]` (см. описание API, §2).
+      x-source:
+        - docs/SERVER_API.md:78
+        - src/ClubShell.Core/Http/ServerClient.cs:834
+        - tools/MockServer/src/db.ts:446
+        - tools/MockServer/src/db.ts:744
+        - tools/MockServer/src/db.ts:456
+        - tools/MockServer/src/routes/games.ts:62
+        - docs/SERVER_API.md:291
+    staffBearer:
+      type: http
+      scheme: bearer
+      description: |
+        Токен персонала кассы (непрозрачный, в моке `st_<hex>`), выдаётся `POST /admin/login` по PIN; касса хранит его в
+        localStorage и шлёт как `Authorization: Bearer <token>`. Подписи нет. Неверный — `401`, `details.reason = "invalid"`
+        (касса на 401 выходит из учётной записи); не хватает роли — `403`, `details.reason = "ownerOnly"`.
+      x-source:
+        - apps/admin/src/api.ts:89
+        - tools/MockServer/src/routes/club.ts:63
+        - tools/MockServer/src/routes/club.ts:136
+  parameters:
+    XTimestamp:
+      name: X-Timestamp
+      in: header
+      required: true
+      description: |
+        Unix-время в секундах (десятичная строка) по часам агента с учётом выученного смещения сервера. Входит в подпись.
+        Вне окна ±300 с — `401`, `details.reason = "clockSkew"` + `X-Server-Time`.
+      schema:
+        type: string
+        pattern: '^[0-9]{1,19}$'
+      example: '1789992930'
+      x-source:
+        - src/ClubShell.Core/Security/Signing.cs:22
+        - src/ClubShell.Core/Http/ServerClient.cs:827
+        - docs/SERVER_API.md:53
+    XSignature:
+      name: X-Signature
+      in: header
+      required: true
+      description: |
+        lowercase hex `HMAC-SHA256(base64decode(signingSecret), X-Timestamp + METHOD + PATH + hex(SHA256(body)))`,
+        PATH с префиксом `/api/v1` и query ровно как отправлено. Алгоритм и тестовые векторы — в описании API, §3.
+      schema:
+        type: string
+        pattern: '^[0-9a-f]{64}$'
+      example: 50428126405b54687a7cb8f813b7bbde31a74b8e5dddf1aa9aa596cc532abaa2
+      x-source:
+        - src/ClubShell.Core/Security/Signing.cs:88
+        - src/ClubShell.Core/Http/ServerClient.cs:829
+        - docs/SERVER_API.md:54
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        UUID ключа идемпотентности. Сервер хранит его 24 ч (в пределах METHOD + PATH) и на повтор возвращает исходный
+        успешный ответ с `Idempotent-Replayed: true`; ответы с ошибкой не сохраняются. Агент отправляет ключ всегда для
+        создающих/списывающих POST и только такие POST повторяет автоматически.
+      schema:
+        type: string
+        format: uuid
+      x-source:
+        - docs/SERVER_API.md:20
+        - src/ClubShell.Core/Http/RetryPolicy.cs:34
+        - src/ClubShell.Core/Http/ServerClient.cs:758
+        - tools/MockServer/src/db.ts:478
+    IdempotencyKeyOptional:
+      name: Idempotency-Key
+      in: header
+      required: false
+      description: |
+        То же, что `IdempotencyKey`, но необязательный: для создающих/списывающих POST, клиент которых ключ не шлёт
+        (например, касса `apps/admin` не отправляет `Idempotency-Key`). Без ключа идемпотентности нет.
+      schema:
+        type: string
+        format: uuid
+      x-source:
+        - docs/SERVER_API.md:20
+        - apps/admin/src/api.ts:89
+    XTraceId:
+      name: X-Trace-Id
+      in: header
+      required: false
+      description: |
+        UUID трассировки; агент шлёт всегда (для вызовов из шелла = `id` IPC-конверта). Сервер возвращает его в заголовке
+        ответа `X-Trace-Id` и в `error.traceId`; при отсутствии генерирует свой.
+      schema:
+        type: string
+        format: uuid
+      x-source:
+        - docs/SERVER_API.md:21
+        - src/ClubShell.Core/Http/ServerClient.cs:749
+        - tools/MockServer/src/index.ts:244
+    XAgentVersion:
+      name: X-Agent-Version
+      in: header
+      required: false
+      description: Semver агента (без build-метаданных после `+`); агент шлёт в каждом запросе. Основание для 426.
+      schema:
+        type: string
+      example: 1.4.2
+      x-source:
+        - docs/SERVER_API.md:22
+        - src/ClubShell.Core/Http/ServerClient.cs:750
+        - src/ClubShell.Core/Http/ServerClient.cs:30
+    XShellVersion:
+      name: X-Shell-Version
+      in: header
+      required: false
+      description: Semver шелла; до `auth.hello` шелла — `0.0.0`. Агент шлёт в каждом запросе.
+      schema:
+        type: string
+      example: 1.4.2
+      x-source:
+        - docs/SERVER_API.md:22
+        - src/ClubShell.Core/Http/ServerClient.cs:751
+        - src/ClubShell.Core/Http/ServerClient.cs:115
+    IfNoneMatch:
+      name: If-None-Match
+      in: header
+      required: false
+      description: ETag из предыдущего ответа (как есть, в кавычках). Совпадение — `304 Not Modified` без тела.
+      schema:
+        type: string
+      example: '"3f2a9c"'
+      x-source:
+        - docs/SERVER_API.md:26
+        - src/ClubShell.Core/Http/ServerClient.cs:763
+        - tools/MockServer/src/db.ts:460
+    AcceptLanguage:
+      name: Accept-Language
+      in: header
+      required: false
+      description: Язык локализуемых полей `title`/`description`; агент шлёт `ru`, `uz` или `en` (или не шлёт).
+      schema:
+        type: string
+      example: ru
+      x-source:
+        - docs/SERVER_API.md:23
+        - src/ClubShell.Core/Http/ServerClient.cs:753
+    PcId:
+      name: pcId
+      in: path
+      required: true
+      description: |
+        Идентификатор ПК. Для `/agents/{pcId}/*` совпадает с `sub` токена агента, иначе `403`,
+        `details.reason = "pcMismatch"`; для `/pcs/{pcId}` (карта мест, «друзья») и `/admin/*` — любой ПК клуба.
+      schema:
+        type: string
+        format: uuid
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:81
+        - tools/MockServer/src/db.ts:439
+        - tools/MockServer/src/routes/pcs.ts:244
+        - docs/SERVER_API.md:227
+    UserId:
+      name: userId
+      in: path
+      required: true
+      description: Идентификатор пользователя. Для пользовательских маршрутов совпадает с владельцем `X-User-Token`, иначе `403`, `details.reason = "notOwner"`.
+      schema:
+        type: string
+        format: uuid
+      x-source:
+        - src/ClubShell.Core/Http/Endpoints.cs:105
+        - tools/MockServer/src/db.ts:446
+    Page:
+      name: page
+      in: query
+      required: false
+      description: |
+        Номер страницы, с 1. Значение < 1 или не число сервер не отклоняет, а приводит к 1 (как мок; см. описание API, §7).
+      schema:
+        type: integer
+        format: int32
+        default: 1
+      x-source:
+        - docs/SERVER_API.md:19
+        - tools/MockServer/src/db.ts:289
+    PageSize:
+      name: pageSize
+      in: query
+      required: false
+      description: |
+        Размер страницы; по умолчанию 50, максимум 200, если операция не указывает иное (например, `GET /games` — до
+        1000). Сервер не отклоняет значения вне диапазона, а нормализует (как мок): 0 или не число → по умолчанию;
+        < 0 → 1; больше максимума → максимум. Применённое значение возвращается в `pageSize` ответа.
+      schema:
+        type: integer
+        format: int32
+        default: 50
+      x-source:
+        - docs/SERVER_API.md:19
+        - docs/SERVER_API.md:305
+        - tools/MockServer/src/db.ts:289
+  headers:
+    XServerTime:
+      description: |
+        Текущее время сервера, ISO-8601 UTC с миллисекундами. Сервер отдаёт его в каждом ответе (как мок); агент обязательно
+        читает его в `401` с `details.reason = "clockSkew"`, чтобы скорректировать смещение и повторить запрос.
+      required: true
+      schema:
+        type: string
+        format: date-time
+      example: '2026-09-21T10:15:30.123Z'
+      x-source:
+        - src/ClubShell.Core/Security/Signing.cs:28
+        - src/ClubShell.Core/Http/ServerClient.cs:566
+        - docs/SERVER_API.md:62
+        - tools/MockServer/src/index.ts:248
+    XTraceIdResponse:
+      description: Эхо `X-Trace-Id` запроса (или сгенерированный сервером UUID); то же значение, что `error.traceId`.
+      required: true
+      schema:
+        type: string
+      example: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:21
+        - src/ClubShell.Core/Http/ServerClient.cs:563
+        - tools/MockServer/src/index.ts:247
+    ETag:
+      description: Тег версии представления в форме RFC 9110 (`"…"` или `W/"…"`); агент возвращает его в `If-None-Match`.
+      required: true
+      schema:
+        type: string
+        pattern: '^(W/)?".*"$'
+      example: '"3f2a9c"'
+      x-source:
+        - docs/SERVER_API.md:26
+        - src/ClubShell.Core/Http/ServerClient.cs:659
+        - tools/MockServer/src/db.ts:461
+    RetryAfter:
+      description: Через сколько секунд можно повторить запрос; равно `error.details.retryAfterSec`. Агент учитывает при автоматическом повторе.
+      required: true
+      schema:
+        type: integer
+        format: int32
+        minimum: 1
+      example: 12
+      x-source:
+        - docs/SERVER_API.md:24
+        - src/ClubShell.Core/Http/RetryPolicy.cs:103
+        - tools/MockServer/src/index.ts:195
+    IdempotentReplayed:
+      description: '`true`, если ответ повторён из хранилища идемпотентности по `Idempotency-Key`.'
+      required: false
+      schema:
+        type: string
+        enum:
+          - 'true'
+      x-source:
+        - tools/MockServer/src/db.ts:488
+  responses:
+    NotModified:
+      description: |
+        Представление не изменилось с `If-None-Match`; тела нет. Агент использует закэшированную копию и сохраняет ETag.
+      headers:
+        ETag:
+          $ref: '#/components/headers/ETag'
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      x-source:
+        - src/ClubShell.Core/Http/ServerClient.cs:663
+        - tools/MockServer/src/db.ts:470
+    BadRequest:
+      description: |
+        Некорректный запрос.
+        - `validation` — `details: { field, reason }`; `field` — JSON-путь (`minutes`, `items[2].qty`, `body`);
+          известные `reason`: `required`, `format`, `enum`, `min`, `max`, `range`, `past`, `alignment`, `tooOld`,
+          `unknown`, `taken`, `unsupported`, `digits4to8`, `self`, `expired`, `exhausted`, `discountAtCheckout`,
+          `maxDuration` (бронь длиннее максимума, `field = "to"`, + `details.maxMinutes`),
+          для тела целиком — `json` | `parse` | `schema`.
+        - `protocolError` — нарушение формата/кадрирования.
+        Агент не повторяет.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            validation:
+              value:
+                error:
+                  code: validation
+                  message: 'Invalid minutes: max'
+                  details:
+                    field: minutes
+                    reason: max
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:25
+        - src/ClubShell.Contracts/Ipc/IpcErrors.cs:152
+        - docs/IPC_PROTOCOL.md:126
+        - tools/MockServer/src/db.ts:74
+        - tools/MockServer/src/index.ts:176
+        - tools/MockServer/src/routes/chat.ts:247
+    Unauthorized:
+      description: |
+        `unauthorized`; `details.reason` обязателен:
+        - `expired` — токен агента истёк (агент: `POST /agents/refresh` и повтор); на refresh — refresh-токен истёк;
+        - `clockSkew` — `X-Timestamp` вне ±300 с (агент: смещение по `X-Server-Time`, один повтор);
+        - `signature` — подпись отсутствует/неверна, `details.problem` ∈ `missing` | `mismatch` (повтор кортежа
+          `X-Timestamp`/`X-Signature` в v1 ответом `401` не отклоняется — см. описание API, §3);
+        - `userToken` — нет/недействителен `X-User-Token` (агент токен агента не обновляет),
+          `details.problem` ∈ `invalid` | `expired` | `boundElsewhere` | `revoked`;
+        - `invalid` — неизвестный токен агента или персонала; `missing` — нет `Authorization`;
+        - `revoked` | `reused` — refresh-токен отозван / уже использован (агент регистрируется заново);
+        - `clubKey` — нет/неверный `X-Club-Key` при регистрации;
+        - `badCredentials` — неверные данные входа, `details.attemptsLeft`; `qrNotConfirmed` — QR не подтверждён;
+        - `invalidPin` — неверный PIN персонала (`POST /admin/login`).
+        `pendingApproval` — это `403 forbidden`, не 401.
+      headers:
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            expired:
+              value:
+                error:
+                  code: unauthorized
+                  message: Unauthorized (expired)
+                  details:
+                    reason: expired
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+            clockSkew:
+              value:
+                error:
+                  code: unauthorized
+                  message: Unauthorized (clockSkew)
+                  details:
+                    reason: clockSkew
+                    problem: clockSkew
+                    serverTime: '2026-09-21T10:15:30.123Z'
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+            userToken:
+              value:
+                error:
+                  code: unauthorized
+                  message: Unauthorized (userToken)
+                  details:
+                    reason: userToken
+                    problem: expired
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:40
+        - docs/SERVER_API.md:62
+        - docs/SERVER_API.md:83
+        - docs/SERVER_API.md:149
+        - src/ClubShell.Core/Http/ServerClient.cs:708
+        - src/ClubShell.Core/Abstractions/IServerClient.cs:73
+        - tools/MockServer/src/index.ts:114
+        - tools/MockServer/src/db.ts:77
+        - tools/MockServer/src/routes/pcs.ts:143
+        - tools/MockServer/src/routes/auth.ts:131
+        - tools/MockServer/src/routes/club.ts:74
+    PaymentRequired:
+      description: |
+        `insufficientFunds` — не хватает средств; `details: { required: Money, available: Money }`. Агент не повторяет.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            insufficientFunds:
+              value:
+                error:
+                  code: insufficientFunds
+                  message: Balance too low
+                  details:
+                    required:
+                      amount: 500000
+                      currency: UZS
+                    available:
+                      amount: 120000
+                      currency: UZS
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:92
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:31
+        - src/ClubShell.Contracts/Ipc/IpcErrors.cs:169
+        - tools/MockServer/src/db.ts:83
+    Forbidden:
+      description: |
+        Доступ запрещён.
+        - `forbidden`, `details.reason`: `pendingApproval` (новый ПК ждёт одобрения админа, `details.pcId`),
+          `clubDisabled`, `pcMismatch` (pcId не совпадает с токеном агента), `notOwner`, `banned`, `zoneNotAllowed`,
+          `ageRestricted`, `guestDisabled`, `guest` (действие недоступно гостю), `notMember` (не участник чата),
+          `ownerOnly` (касса: нужна роль владельца).
+        - `policyDenied`, `details.rule`: `tariffZone`, `tariffTime`, `postpaidNotAllowed`, `pcBooked`, `pcMaintenance`,
+          `ageRating`, `muted`, `noShop`, `guestTopup`, `guestBooking`, `guestTournament`, `minorCurfew`, `blacklisted`
+          (опционально `details.field`).
+        - `antiCheatBlocked`, `details: { kind: AntiCheatKind, reason }`.
+        Агент не повторяет; 403 на регистрации — повтор регистрации с backoff.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            pendingApproval:
+              value:
+                error:
+                  code: forbidden
+                  message: PC is pending admin approval
+                  details:
+                    reason: pendingApproval
+                    pcId: 7d2f1c3a-1111-4222-8333-444455556666
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+            policyDenied:
+              value:
+                error:
+                  code: policyDenied
+                  message: Denied by policy rule 'tariffZone'
+                  details:
+                    rule: tariffZone
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:42
+        - docs/SERVER_API.md:143
+        - docs/SERVER_API.md:239
+        - docs/SERVER_API.md:287
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:19
+        - src/ClubShell.Contracts/Ipc/IpcErrors.cs:174
+        - tools/MockServer/src/routes/pcs.ts:99
+        - tools/MockServer/src/db.ts:79
+    NotFound:
+      description: |
+        `notFound` — сущность не найдена; `details.what` (`pc`, `user`, `session`, `tariff`, `game`, `product`, `order`,
+        `booking`, `tournament`, `lease`, `room`, `message`, `qrToken`, `command`, `topupIntent`, `channel`, `component`,
+        `staff`, `ticket`, `promo`, …); неизвестный маршрут — `details.route`. Агент не повторяет.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            notFound:
+              value:
+                error:
+                  code: notFound
+                  message: tariff not found
+                  details:
+                    what: tariff
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:22
+        - tools/MockServer/src/db.ts:76
+        - tools/MockServer/src/index.ts:267
+    Conflict:
+      description: |
+        Конфликт состояния.
+        - `conflict`, `details.reason`: `outOfStock` (`details.productId`, `available`), `slotTaken`, `alreadyStarted`,
+          `full`, `alreadyJoined`, `notOpen`, `notPending`, `alreadyPaused`, `notPaused`, `postpaidSession`, `pcBusy`,
+          `shiftOpen`, `noShift`, `activeSessionElsewhere` (вход при активной сессии на другом ПК,
+          `details: { reason, pcId, pcName }`); регистрация с `hwid` ПК другого клуба.
+        - `sessionNotActive` — `details.session` (при `state = ended` агент считает `POST /sessions/{id}/end` успешным).
+        - `sessionAlreadyActive` — `details: { sessionId?, pcId }`.
+        - `accountPoolExhausted` — `details.launcher`.
+        - `gameNotInstalled`.
+        Агент не повторяет.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            outOfStock:
+              value:
+                error:
+                  code: conflict
+                  message: Conflict (outOfStock)
+                  details:
+                    reason: outOfStock
+                    productId: 1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d
+                    available: 0
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+            sessionAlreadyActive:
+              value:
+                error:
+                  code: sessionAlreadyActive
+                  message: PC already has an open session
+                  details:
+                    sessionId: 9c1e2d3f-4a5b-4c6d-8e7f-a0b1c2d3e4f5
+                    pcId: 7d2f1c3a-1111-4222-8333-444455556666
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:143
+        - docs/SERVER_API.md:239
+        - docs/SERVER_API.md:293
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:28
+        - src/ClubShell.Core/Http/ServerClient.cs:314
+        - tools/MockServer/src/db.ts:80
+        - tools/MockServer/src/routes/auth.ts:62
+    UpgradeRequired:
+      description: |
+        `versionMismatch` — версия агента/шелла (`X-Agent-Version`/`X-Shell-Version`) не поддерживается;
+        `details: { supported: [..], got }`. Агент не повторяет (426 не считается временной ошибкой).
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            versionMismatch:
+              value:
+                error:
+                  code: versionMismatch
+                  message: Version unsupported
+                  details:
+                    supported:
+                      - 1
+                    got: 0
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:111
+        - docs/ARCHITECTURE.md:394
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:73
+        - src/ClubShell.Contracts/Ipc/IpcErrors.cs:190
+    TooManyRequests:
+      description: |
+        `rateLimited` — превышен лимит (600 запросов/мин на токен агента, всплеск 100); `details.retryAfterSec` и заголовок
+        `Retry-After`. Агент повторяет идемпотентные запросы после `Retry-After`.
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/RetryAfter'
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            rateLimited:
+              value:
+                error:
+                  code: rateLimited
+                  message: Too many requests
+                  details:
+                    retryAfterSec: 12
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:24
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:64
+        - src/ClubShell.Core/Http/RetryPolicy.cs:55
+        - tools/MockServer/src/index.ts:93
+    InternalError:
+      description: |
+        `internal` — непредвиденная ошибка сервера (`details` = `null`, текст исключения не раскрывается; корреляция по
+        `traceId`). Агент повторяет идемпотентные запросы; исход учитывается circuit breaker'ом.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            internal:
+              value:
+                error:
+                  code: internal
+                  message: Internal server error
+                  details: null
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:67
+        - src/ClubShell.Core/Http/RetryPolicy.cs:55
+        - tools/MockServer/src/index.ts:188
+    NotImplemented:
+      description: |
+        Операция есть в контракте, но сервер v1 её не реализует (`x-server-status: notImplemented`), в том числе всё,
+        связанное с Telegram (`x-prohibited: telegram`).
+
+        `Retry-After` на 501 не отправлять.
+
+        Код ошибки — **открытый вопрос владельцу**: подходящего `ErrorCode` нет (в `ErrorCode.cs` нет `notImplemented`),
+        а неизвестный `code` агент не распарсит, отбросит конверт и выведет код из статуса (`ErrorCodes.FromHttpStatus`:
+        501 → `serverUnavailable`). Предварительно, до решения, сервер отвечает `error.code = serverUnavailable`,
+        `details: { reason: "notImplemented" }` — агент получает тот же код, что и без конверта. Альтернатива — добавить
+        `notImplemented` в `ErrorCode` (неповторяемый) согласованно с релизом агента (§9).
+
+        Последствия для агента (учитывать при выборе `x-server-status`):
+        - HTTP-уровень: 501 — «временная» ошибка (`RetryPolicy.IsTransient`: любой ≥ 500). `GET`/`PUT`/`DELETE`/`HEAD`
+          и `POST` с `Idempotency-Key` отправляются до 5 попыток, включая первую (4 повтора), с задержкой 0,5…15 с;
+          каждая попытка — отказ общего circuit breaker'а (≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на
+          30 с для всех запросов агента, в том числе к `required`-операциям).
+        - Прикладной уровень: у `serverUnavailable` `IsRetryable = true`, поэтому вместо ошибки срабатывают офлайн-фолбэки
+          агента:
+          - `POST /support/call-admin` — агент перехватывает ошибку, публикует тикет в телеметрию (`kind = "callAdmin"`,
+            данные — `CallAdminTicketRequest`) и возвращает шеллу выдуманный успешный `SysCallAdminResponse` (новый
+            `ticketId`). Пока операция `notImplemented`, сервер v1 должен обрабатывать такие записи
+            `POST /agents/{pcId}/telemetry`, иначе вызов админа молча теряется;
+          - `GET /games/{id}/accounts/lease` — 3 попытки на уровне приложения (× до 5 HTTP-попыток каждая), затем в шелл
+            уходит `accountPoolExhausted` («Account pool unreachable; no cached lease»); освобождение аренды — до 3
+            попыток, затем молча пропускается (аренда истекает на сервере);
+          - `GET /apps` — отдаётся закэшированный каталог, если он есть;
+          - операции без фолбэка — в шелл уходит `serverUnavailable`.
+        - Касса (`apps/admin`) не повторяет: показывает `AdminError` с `error.code`.
+      headers:
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            notImplemented:
+              value:
+                error:
+                  code: serverUnavailable
+                  message: Not implemented in server v1
+                  details:
+                    reason: notImplemented
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:14
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:136
+        - src/ClubShell.Core/Http/ServerClient.cs:589
+        - src/ClubShell.Core/Http/RetryPolicy.cs:42
+        - src/ClubShell.Core/Http/RetryPolicy.cs:112
+        - src/ClubShell.Core/Configuration/AppSettings.cs:242
+        - src/ClubShell.Core/Configuration/AppSettings.cs:258
+        - apps/admin/src/api.ts:104
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:156
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:247
+        - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:257
+        - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:283
+        - src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:109
+    ServiceUnavailable:
+      description: |
+        `serverUnavailable` — сервер или внешний провайдер (например, провайдер пополнения) временно недоступен.
+        Может сопровождаться `Retry-After` (секунды). Агент повторяет идемпотентные запросы; исход учитывается circuit
+        breaker'ом.
+      headers:
+        Retry-After:
+          description: Через сколько секунд повторить; может отсутствовать.
+          required: false
+          schema:
+            type: integer
+            format: int32
+            minimum: 1
+        X-Trace-Id:
+          $ref: '#/components/headers/XTraceIdResponse'
+        X-Server-Time:
+          $ref: '#/components/headers/XServerTime'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ServerErrorEnvelope'
+          examples:
+            serverUnavailable:
+              value:
+                error:
+                  code: serverUnavailable
+                  message: Top-up provider is unavailable
+                  details: null
+                  traceId: 6f1d2c3a-5b4e-4d7f-9a8b-0c1d2e3f4a5b
+      x-source:
+        - docs/SERVER_API.md:361
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:58
+        - src/ClubShell.Core/Http/RetryPolicy.cs:55
