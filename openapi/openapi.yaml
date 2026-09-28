@@ -56,49 +56,60 @@ info:
     \ /agents/refresh`, если он ротирован;\n  агент переключается атомарно). Ключ HMAC — декодированные байты, не строка base64.\n\
     - Окно: `|now − X-Timestamp| ≤ 300 с`. Иначе `401 unauthorized`, `details.reason = \"clockSkew\"` и заголовок\n  `X-Server-Time`\
     \ (ISO-8601 UTC) — агент вычисляет смещение и повторяет запрос один раз.\n- Повторы кортежа (`pcId`, `X-Timestamp`, `X-Signature`).\
-    \ SERVER_API.md §2.2 требует его уникальности в пределах\n  окна, но буквально это ломает агента (приоритет у кода агента):\
-    \ подпись ставится один раз до отправки\n  (`ServerClient.SendOnceAsync` → `Authorize`), а автоматические повторы (408/425/429/5xx/сетевые\
-    \ ошибки, §8) идут\n  внутри конвейера `HttpClient` с теми же `X-Timestamp`/`X-Signature`; nonce в подписи нет, поэтому\
-    \ два одинаковых\n  запроса в одну секунду (и повтор после `POST /agents/refresh` в ту же секунду без ротации `signingSecret`)\
-    \ дают\n  тот же кортеж. `401` на повтор агент принял бы за протухший токен: лишний refresh с ротацией refresh-токена,\
-    \ а\n  затем ошибка ушла бы в шелл. Норма v1:\n  - повтор кортежа **не** отклоняется ответом `401` и не считается ошибкой\
-    \ подписи;\n  - `GET`/`PUT`/`DELETE`/`HEAD` исполняются заново как обычно; `POST` с `Idempotency-Key` проходят через хранилище\n\
-    \    идемпотентности (§5: исходный ответ);\n  - для `POST`/`PATCH` без `Idempotency-Key` (агент их автоматически не повторяет)\
-    \ сервер может лишь журналировать\n    повтор кортежа для аудита, не отклоняя запрос (мок окно повторов не реализует).\n\
-    \  Открытый вопрос владельцу: нужна ли в v1 активная защита от повторов неидемпотентных запросов; если да, отказ\n  должен\
-    \ быть не `401` (вызывает refresh), а, например, `409 conflict`, `details.reason = \"replay\"` (агент 409 не\n  повторяет\
-    \ и токен не обновляет) — по согласованию с агентом.\n- Неверная/отсутствующая подпись — `401`, `details.reason = \"signature\"\
-    `, `details.problem` ∈ `missing` | `mismatch`\n  (мок).\n- Сравнение подписи — за постоянное время; агент шлёт hex в нижнем\
-    \ регистре.\n- Отключение подписи на агенте (`server.signingEnabled = false`) допустимо только против мока; боевой сервер\n\
-    \  запросы режимов `agent`/`user` к маршрутам `/api/v1/*` без подписи отклоняет (загрузки из списка выше под это\n  правило\
-    \ не подпадают).\n\nТестовые векторы (`signingSecret` = `AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=`, т.е. байты `00..1f`,\n\
-    `X-Timestamp` = `1789992930`; проверено Python `hmac` и Node `crypto`, как в моке):\n\n| METHOD | PATH | тело | X-Signature\
-    \ |\n|--------|------|------|-------------|\n| `GET` | `/api/v1/sessions/current?pcId=7d2f1c3a-1111-4222-8333-444455556666`\
-    \ | пусто | `50428126405b54687a7cb8f813b7bbde31a74b8e5dddf1aa9aa596cc532abaa2` |\n| `POST` | `/api/v1/auth/logout` | `{\"\
-    reason\":\"user\"}` | `20046a0e46e3a7681e416ba37d5ce61baf40bfcec560685fa5042fe6f90ee7c4` |\n\n(Пример из SERVER_API.md\
-    \ §2.2 использует секрет, который декодируется в 31 байт, — для проверки не годится.)\n\n## 4. Конверт ошибок\n\nЛюбой\
-    \ не-2xx ответ (кроме 304) — `ServerErrorEnvelope`:\n`{ \"error\": { \"code\": ErrorCode, \"message\": string, \"details\"\
-    : object | null, \"traceId\": string } }`.\nКлюч `details` присутствует всегда (`null`, если деталей нет); `traceId` =\
-    \ `X-Trace-Id` запроса.\n`code` — строго одно из значений `ErrorCode`: неизвестное значение агент не распарсит, отбросит\
-    \ конверт целиком и\nвыведет код из HTTP-статуса (`ErrorCodes.FromHttpStatus`: 400→validation, 401→unauthorized, 402→insufficientFunds,\n\
-    403→forbidden, 404→notFound, 408/504→timeout, 409→conflict, 426→versionMismatch, 429→rateLimited,\nпрочие ≥500→serverUnavailable).\n\
+    \ SERVER_API.md §2.2 требует его уникальности в пределах\n  окна. Агент с club-shell `feat/shell-changes` (SHELL_CHANGES\
+    \ п. 2) подписывает **каждую попытку** заново:\n  подпись ставит `RequestSigningHandler` внутри конвейера повторов, а\
+    \ повтор в ту же секунду получает\n  `X-Timestamp` = предыдущий + 1 (не больше нескольких секунд впереди часов агента),\
+    \ так что автоматические\n  повторы (§8) уже не совпадают. Формат заголовков не изменился. Совпасть по-прежнему могут\
+    \ два **разных**\n  логических запроса с одинаковыми методом, путём и телом в одну секунду (два `GET /agents/{pcId}/commands`\
+    \ или\n  `GET /agents/{pcId}/config`; повтор после `POST /agents/refresh` в ту же секунду без ротации `signingSecret`):\n\
+    \  nonce в подписи нет. У старых агентов повторы идут с той же подписью. `401` на повтор агент принял бы за\n  протухший\
+    \ токен: лишний refresh с ротацией refresh-токена, а затем ошибка ушла бы в шелл. Норма v1:\n  - повтор кортежа **не**\
+    \ отклоняется ответом `401` и не считается ошибкой подписи;\n  - `GET`/`PUT`/`DELETE`/`HEAD` исполняются заново как обычно;\
+    \ `POST` с `Idempotency-Key` проходят через хранилище\n    идемпотентности (§5: исходный ответ);\n  - для `POST`/`PATCH`\
+    \ без `Idempotency-Key` (агент их автоматически не повторяет) сервер может лишь журналировать\n    повтор кортежа для\
+    \ аудита, не отклоняя запрос (мок окно повторов не реализует).\n  Открытый вопрос владельцу: нужна ли в v1 активная защита\
+    \ от повторов неидемпотентных запросов; если да, отказ\n  должен быть не `401` с причиной, вызывающей refresh (агент обновляет\
+    \ токен на любой `401`, кроме\n  `clockSkew`/`userToken`), а, например, `409 conflict`, `details.reason = \"replay\"`\
+    \ (агент 409 не повторяет и\n  токен не обновляет) — по согласованию с агентом. Варианты сузить проверку: только изменяющие\
+    \ методы; исключить\n  запросы с `Idempotency-Key` (их и так отсекает хранилище идемпотентности); записывать кортеж только\
+    \ после\n  окончательного не-5xx ответа; nonce в подписи — изменение провода, только в новой версии.\n- Неверная/отсутствующая\
+    \ подпись — `401`, `details.reason = \"signature\"`, `details.problem` ∈ `missing` | `mismatch`\n  (мок).\n- Сравнение\
+    \ подписи — за постоянное время; агент шлёт hex в нижнем регистре.\n- Отключение подписи на агенте (`server.signingEnabled\
+    \ = false`) допустимо только против мока; боевой сервер\n  запросы режимов `agent`/`user` к маршрутам `/api/v1/*` без\
+    \ подписи отклоняет (загрузки из списка выше под это\n  правило не подпадают).\n\nТестовые векторы (`signingSecret` =\
+    \ `AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=`, т.е. байты `00..1f`,\n`X-Timestamp` = `1789992930`; проверено Python\
+    \ `hmac` и Node `crypto`, как в моке):\n\n| METHOD | PATH | тело | X-Signature |\n|--------|------|------|-------------|\n\
+    | `GET` | `/api/v1/sessions/current?pcId=7d2f1c3a-1111-4222-8333-444455556666` | пусто | `50428126405b54687a7cb8f813b7bbde31a74b8e5dddf1aa9aa596cc532abaa2`\
+    \ |\n| `POST` | `/api/v1/auth/logout` | `{\"reason\":\"user\"}` | `20046a0e46e3a7681e416ba37d5ce61baf40bfcec560685fa5042fe6f90ee7c4`\
+    \ |\n\n(Пример из SERVER_API.md §2.2 использует секрет, который декодируется в 31 байт, — для проверки не годится.)\n\n\
+    ## 4. Конверт ошибок\n\nЛюбой не-2xx ответ (кроме 304) — `ServerErrorEnvelope`:\n`{ \"error\": { \"code\": ErrorCode,\
+    \ \"message\": string, \"details\": object | null, \"traceId\": string } }`.\nКлюч `details` присутствует всегда (`null`,\
+    \ если деталей нет); `traceId` = `X-Trace-Id` запроса.\n`code` — строго одно из значений `ErrorCode`. Код незнакомого\
+    \ агенту значения выводится из HTTP-статуса\n(`ErrorCodes.FromHttpStatus`: 400→validation, 401→unauthorized, 402→insufficientFunds,\
+    \ 403→forbidden,\n404→notFound, 408/504→timeout, 409→conflict, 426→versionMismatch, 429→rateLimited, 501→notImplemented,\n\
+    прочие ≥500→serverUnavailable). Агент с club-shell `feat/shell-changes` при этом сохраняет `message`, `details`\nи `traceId`\
+    \ из тела (`ServerClient.ParseServerError`); старые агенты отбрасывают конверт целиком, а 501 у них\nдаёт `serverUnavailable`.\n\
     \n| HTTP | error.code |\n|------|------------|\n| 400 | `validation` (`details: { field, reason }`), `protocolError` |\n\
     | 401 | `unauthorized` (`details.reason`) |\n| 402 | `insufficientFunds` (`details: { required: Money, available: Money\
     \ }`) |\n| 403 | `forbidden` (`details.reason`), `policyDenied` (`details.rule`), `antiCheatBlocked` (`details: { kind,\
     \ reason }`) |\n| 404 | `notFound` (`details.what`) |\n| 409 | `conflict` (`details.reason`), `sessionNotActive`, `sessionAlreadyActive`,\
     \ `accountPoolExhausted`, `gameNotInstalled` |\n| 426 | `versionMismatch` (`details: { supported, got }`) |\n| 429 | `rateLimited`\
-    \ (`details.retryAfterSec`) + `Retry-After` |\n| 500 | `internal` |\n| 501 | см. ответ `NotImplemented` |\n| 503 | `serverUnavailable`\
-    \ |\n\n## 5. Idempotency-Key\n\n`POST`, которые создают или списывают, принимают `Idempotency-Key: <uuid>`; для `/sessions`,\
-    \ `/sessions/{id}/extend`,\n`/sessions/{id}/events`, `/shop/orders`, `/wallet/{userId}/topup-intent`, `/booking/reserve`,\
-    \ `/chat/{roomId}/messages`,\n`/support/call-admin` агент отправляет его всегда. Сервер хранит ключ 24 ч в пределах METHOD\
-    \ + PATH (как мок) и на\nповтор возвращает исходный ответ (тот же статус и тело) с заголовком `Idempotent-Replayed: true`.\
-    \ Ответы с ошибкой не\nсохраняются — повтор исполняется заново (мок, `db.ts` `idempotent`). Только POST с этим заголовком\
-    \ агент считает\nбезопасным для автоматического повтора.\n\n## 6. ETag / If-None-Match\n\n`GET /games`, `/apps`, `/tariffs`,\
-    \ `/shop/products`, `/agents/{pcId}/policies`, `/agents/{pcId}/config` отдают `ETag`.\nАгент сохраняет значение заголовка\
-    \ как есть (в кавычках) и присылает его в `If-None-Match`; `304 Not Modified` без тела\nозначает «использовать кэш». ETag\
-    \ обязан быть в форме RFC 9110 (`\"…\"` или `W/\"…\"`): некавыченное значение .NET не\nраспознаёт, и агент никогда не\
-    \ пришлёт `If-None-Match`.\n\n## 7. Трассировка, версии, локаль, лимиты, пагинация\n\n- `X-Trace-Id: <uuid>` — генерирует\
-    \ агент (для вызовов из шелла = `id` IPC-конверта); сервер эхо-возвращает его в\n  заголовке ответа и в `error.traceId`;\
+    \ (`details.retryAfterSec`) + `Retry-After` |\n| 500 | `internal` |\n| 501 | `notImplemented` (см. ответ `NotImplemented`)\
+    \ |\n| 503 | `serverUnavailable` |\n\n## 5. Idempotency-Key\n\n`POST`, которые создают или списывают, принимают `Idempotency-Key:\
+    \ <uuid>`; для `/sessions`, `/sessions/{id}/extend`,\n`/sessions/{id}/events`, `/shop/orders`, `/wallet/{userId}/topup-intent`,\
+    \ `/booking/reserve`, `/chat/{roomId}/messages`,\n`/support/call-admin` агент отправляет его всегда. Сервер хранит ключ\
+    \ 24 ч в пределах METHOD + PATH (как мок) и на\nповтор возвращает исходный ответ (тот же статус и тело) с заголовком `Idempotent-Replayed:\
+    \ true`. Ответы с ошибкой не\nсохраняются — повтор исполняется заново (мок, `db.ts` `idempotent`). Только POST с этим\
+    \ заголовком агент считает\nбезопасным для автоматического повтора.\n\nКасса (`apps/admin`, club-shell `feat/shell-changes`,\
+    \ SHELL_CHANGES п. 15) шлёт `Idempotency-Key` на денежных\n`POST /admin/sessions`, `/admin/sessions/extend`, `/admin/sessions/end`,\
+    \ `/admin/wallet/topup`,\n`/admin/promo/redeem`, `/admin/products/{id}/receive`, `/admin/shift/close`: один ключ на действие\
+    \ кассира; тот\nже ключ — при повторе того же тела после сетевой ошибки или 5xx; после любого 2xx или 4xx — новый ключ.\
+    \ Сама\nкасса автоматически не повторяет — повтор делает кассир.\n\n## 6. ETag / If-None-Match\n\n`GET /games`, `/apps`,\
+    \ `/tariffs`, `/shop/products`, `/agents/{pcId}/policies`, `/agents/{pcId}/config` отдают `ETag`.\nАгент сохраняет значение\
+    \ заголовка как есть (в кавычках) и присылает его в `If-None-Match`; `304 Not Modified` без тела\nозначает «использовать\
+    \ кэш». ETag обязан быть в форме RFC 9110 (`\"…\"` или `W/\"…\"`): некавыченное значение .NET не\nраспознаёт, и агент\
+    \ никогда не пришлёт `If-None-Match`.\n\n## 7. Трассировка, версии, локаль, лимиты, пагинация\n\n- `X-Trace-Id: <uuid>`\
+    \ — генерирует агент (для вызовов из шелла = `id` IPC-конверта); сервер эхо-возвращает его в\n  заголовке ответа и в `error.traceId`;\
     \ если заголовка нет — генерирует сам.\n- `X-Agent-Version`, `X-Shell-Version` (semver; до `auth.hello` шелла — `0.0.0`)\
     \ и\n  `User-Agent: ClubShellAgent/<ver> (Windows NT 10.0)` агент шлёт в каждом запросе. Неподдерживаемая версия —\n \
     \ `426 Upgrade Required`, `error.code = versionMismatch`; агент 426 не повторяет.\n- `Accept-Language: ru | uz | en` —\
@@ -109,29 +120,37 @@ info:
     \ (как мок,\n  `db.ts` `paginate`): `page` < 1 или не число → 1; `pageSize` = 0 или не число → по умолчанию; `pageSize`\
     \ < 0 → 1;\n  `pageSize` больше максимума → максимум.\n- Сжатие: `Accept-Encoding: gzip, br`; ответы > 1 КиБ сжимаются.\n\
     \n## 8. Повторы и circuit breaker агента (что должен учитывать сервер)\n\nАгент повторяет `GET`/`PUT`/`DELETE`/`HEAD`\
-    \ и `POST` с `Idempotency-Key` на 408/425/429/**любой 5xx** и сетевые ошибки:\nдо 5 попыток, включая первую (4 повтора),\
-    \ экспоненциальная задержка 0,5…15 с с джиттером, `Retry-After` учитывается. Все такие исходы (включая\n501) считаются\
-    \ отказами общего circuit breaker: ≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на 30 с для\n**всех** запросов\
-    \ агента к серверу. Тайм-аут одного запроса — 15 с. Прочие 4xx агент не повторяет.\n\n## 9. Совместимость\n\n- Добавлять\
+    \ и `POST` с `Idempotency-Key` на 408/425/429/**5xx, кроме 501**, и сетевые\nошибки: до 5 попыток, включая первую (4 повтора),\
+    \ экспоненциальная задержка 0,5…15 с с джиттером, `Retry-After`\nучитывается; каждая попытка подписывается заново (§3).\
+    \ Все такие исходы считаются отказами общего circuit breaker:\n≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь\
+    \ на 30 с для **всех** запросов агента к серверу. Тайм-аут\nодного запроса — 15 с. Прочие 4xx агент не повторяет.\n\n\
+    `501` (`notImplemented`) агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 1) не повторяет и в circuit\nbreaker\
+    \ не засчитывает (`RetryPolicy.IsTransient`), а `ErrorCode.notImplemented` считает окончательной ошибкой\n(не `IsRetryable`).\
+    \ Старые агенты считают 501 временной ошибкой: повторяют и засчитывают каждую попытку.\n\n## 9. Совместимость\n\n- Добавлять\
     \ поля в ответы и необязательные поля в запросы можно всегда (в схемах нет `additionalProperties: false`).\n- Удалять,\
     \ переименовывать, менять тип/смысл поля, делать обязательное поле необязательным/nullable, добавлять\n  обязательное\
-    \ поле запроса — только в `/api/v2`.\n- Новые значения enum (включая `ErrorCode`) ломают текущего агента: конвертер enum\
-    \ не имеет запасного значения, и\n  весь ответ (или конверт ошибки) не десериализуется. Добавлять только согласованно\
-    \ с релизом агента или в `/api/v2`.\n\n## 10. Статус реализации: x-server-status, x-prohibited\n\n- У каждой операции\
+    \ поле запроса — только в `/api/v2`.\n- Новые значения enum. У enum с `x-agent-fallback: unknown` агент с club-shell `feat/shell-changes`\n\
+    \  (SHELL_CHANGES п. 3) читает незнакомую строку как `unknown` и не роняет ответ (числа и `null` по-прежнему\n  отвергаются).\
+    \ Само значение `unknown` на провод не входит: сервер его не шлёт, а на входе отвечает на него\n  `400 validation` (`reason\
+    \ = enum`), как на любое неизвестное значение. У остальных enum (в том числе `ErrorCode`)\n  и у старых агентов незнакомая\
+    \ строка ломает разбор всего ответа (у `ErrorCode` — только кода: §4).\n  Каждое добавленное значение помечается в схеме\
+    \ `x-enum-added: { <значение>: <кто его понимает и что делают\n  старые потребители> }`; добавлять только согласованно\
+    \ с релизом потребителя или в `/api/v2`.\n\n## 10. Статус реализации: x-server-status, x-prohibited\n\n- У каждой операции\
     \ `x-server-status`: `required` — сервер v1 реализует; `notImplemented` — операция описана, чтобы\n  зафиксировать контракт\
     \ клиента, но сервер v1 её не реализует и отвечает `501 Not Implemented` с `ServerErrorEnvelope`\n  (ответ `NotImplemented`).\
     \ Путь при этом существует: 404 на такие операции не отдаётся.\n- `x-prohibited: telegram` — Telegram в продукте запрещён.\
-    \ Такие операции — `notImplemented`; такие поля сервер не\n  хранит и не использует, на входе принимает и игнорирует,\
-    \ в ответах отдаёт пустое значение того же типа\n  (`\"\"`/`false`), а не опускает поле, если потребитель объявил его\
-    \ обязательным.\n\n## 11. Касса `/admin/*`: CORS и тела ответов\n\nКасса — браузерное SPA на другом origin (dev: `http://localhost:1421`,\
-    \ API — `VITE_ADMIN_API`, по умолчанию\n`http://localhost:8080/api/v1`); `fetch` шлёт `Authorization: Bearer …` и `Content-Type:\
-    \ application/json`, поэтому\nбраузер делает preflight. Сервер для `/api/v1/admin/*` обязан:\n- отвечать на preflight\
-    \ `OPTIONS` (`204`, без авторизации) для методов `GET`, `POST`, `PUT`, `PATCH`, `DELETE`;\n- отдавать `Access-Control-Allow-Origin`\
-    \ для origin кассы (настраиваемый список; мок отражает любой origin) и\n  `Vary: Origin`;\n- `Access-Control-Allow-Headers`:\
-    \ как минимум `Authorization`, `Content-Type` (мок разрешает любые);\n- `Access-Control-Expose-Headers: ETag, X-Trace-Id,\
-    \ X-Server-Time, Retry-After` (как мок).\n\nCORS-заголовки нужны и на ответах с ошибкой (401/403/…), иначе касса не прочитает\
-    \ `ServerErrorEnvelope`.\nКасса на любом 2xx вызывает `res.json()`, поэтому операции `/admin/*` отвечают JSON-телом, а\
-    \ не `204` без тела.\n"
+    \ Такие операции — `notImplemented`; такие поля сервер не\n  хранит и не использует, на входе принимает и игнорирует.\
+    \ Касса club-shell `feat/shell-changes` (SHELL_CHANGES\n  п. 17) Telegram-поля не читает и не шлёт, поэтому они необязательны\
+    \ и `deprecated`: сервер их не отдаёт\n  (удаление из схемы — в `/api/v2`, правило совместимости §9).\n\n## 11. Касса\
+    \ `/admin/*`: CORS и тела ответов\n\nКасса — браузерное SPA на другом origin (dev: `http://localhost:1421`, API — `VITE_ADMIN_API`,\
+    \ по умолчанию\n`http://localhost:8080/api/v1`); `fetch` шлёт `Authorization: Bearer …` и `Content-Type: application/json`,\
+    \ поэтому\nбраузер делает preflight. Сервер для `/api/v1/admin/*` обязан:\n- отвечать на preflight `OPTIONS` (`204`, без\
+    \ авторизации) для методов `GET`, `POST`, `PUT`, `PATCH`, `DELETE`;\n- отдавать `Access-Control-Allow-Origin` для origin\
+    \ кассы (настраиваемый список; мок отражает любой origin) и\n  `Vary: Origin`;\n- `Access-Control-Allow-Headers`: как\
+    \ минимум `Authorization`, `Content-Type`, `Idempotency-Key` (касса шлёт его\n  на денежных операциях, §5; мок разрешает\
+    \ любые);\n- `Access-Control-Expose-Headers: ETag, X-Trace-Id, X-Server-Time, Retry-After` (как мок).\n\nCORS-заголовки\
+    \ нужны и на ответах с ошибкой (401/403/…), иначе касса не прочитает `ServerErrorEnvelope`.\nКасса на любом 2xx вызывает\
+    \ `res.json()`, поэтому операции `/admin/*` отвечают JSON-телом, а не `204` без тела.\n"
   x-source:
   - docs/SERVER_API.md:10
   - docs/SERVER_API.md:32
@@ -169,6 +188,13 @@ info:
   - tools/MockServer/src/routes/games.ts:62
   - apps/admin/src/api.ts:18
   - apps/admin/src/api.ts:92
+  - src/ClubShell.Core/Http/RequestSigningHandler.cs:12
+  - src/ClubShell.Core/Http/RetryPolicy.cs:57
+  - src/ClubShell.Core/Http/RetryPolicy.cs:164
+  - src/ClubShell.Core/Http/ServerClient.cs:645
+  - src/ClubShell.Contracts/Errors/ErrorCode.cs:141
+  - src/ClubShell.Contracts/Serialization/JsonDefaults.cs:112
+  - apps/admin/src/api.ts:142
 servers:
 - url: https://{host}/api/v1
   description: Центральный сервер клуба (`agent.json → server.baseUrl` включает `/api/v1`).
@@ -262,12 +288,20 @@ paths:
       - admin
       operationId: adminAddClient
       summary: Зарегистрировать клиента
-      description: 'Создаёт пользователя-участника (member, нулевые балансы) и его профиль клуба. Логин уникален без учёта
-        регистра
+      description: 'Создаёт пользователя-участника (member, нулевые балансы) и его профиль клуба с паролем и, при необходимости,
 
-        (`400 validation`, `field = username`, `reason = taken`). Поле `telegram` запрещено — принимается и
+        картой, чтобы клиент мог войти на ПК (SHELL_CHANGES п. 18). Касса club-shell `feat/shell-changes` всегда шлёт
 
-        игнорируется.
+        `password` (введённый или сгенерированный временный, показывается кассиру один раз). Без `password` сервер
+
+        ставит случайный пароль, которого никто не знает. Поле `telegram` запрещено — принимается и игнорируется.
+
+
+        Ошибки `400 validation`: `field = username`, `reason = taken` (логин занят без учёта регистра);
+
+        `field = password`, `reason = min` (короче 4 символов); `field = cardId`, `reason = taken` (карта у другого
+
+        клиента).
 
         '
       x-server-status: required
@@ -275,9 +309,9 @@ paths:
       - owner
       - cashier
       x-source:
-      - apps/admin/src/api.ts:530
-      - apps/admin/src/pages/ClientsPage.tsx:291
-      - tools/MockServer/src/routes/club.ts:413
+      - apps/admin/src/api.ts:608
+      - apps/admin/src/pages/ClientsPage.tsx:359
+      - tools/MockServer/src/routes/club.ts:447
       security:
       - staffBearer: []
       parameters:
@@ -329,9 +363,11 @@ paths:
 
         кассиру `403 forbidden`, `details.reason = "ownerOnly"`). Смена группы (флаг `discount` при большой скидке) и
 
-        чёрного списка пишутся в журнал контроля. `telegram` запрещён — принимается и игнорируется.
+        чёрного списка пишутся в журнал контроля. `telegram` запрещён — принимается и игнорируется (касса club-shell
 
-        Нет клиента — `404`, `details.what = "user"`.
+        `feat/shell-changes` его не шлёт). Пароль и карту этот маршрут не меняет — для них
+
+        `POST /admin/clients/{id}/password` и `/card`. Нет клиента — `404`, `details.what = "user"`.
 
         '
       x-server-status: required
@@ -341,10 +377,9 @@ paths:
       x-owner-only-fields:
       - blacklisted
       x-source:
-      - apps/admin/src/api.ts:538
+      - apps/admin/src/api.ts:621
       - apps/admin/src/pages/ClientsPage.tsx:129
-      - tools/MockServer/src/routes/club.ts:449
-      - tools/MockServer/src/routes/club.ts:463
+      - tools/MockServer/src/routes/club.ts:485
       security:
       - staffBearer: []
       parameters:
@@ -375,6 +410,142 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
           description: '`forbidden`, `details.reason = "ownerOnly"` — `blacklisted` меняет только владелец.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /admin/clients/{id}/card:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      description: Идентификатор клиента (пользователя).
+      schema:
+        type: string
+        format: uuid
+    post:
+      tags:
+      - admin
+      operationId: adminBindClientCard
+      summary: Привязать или отвязать клубную карту
+      description: '«Привязать карту» в кассе (SHELL_CHANGES п. 18): карта для входа на ПК (`POST /auth/login`, `kind = card`).
+
+        `cardId` = null или пустая строка — отвязать. Ответ — карточка клиента после изменения. Журнал контроля —
+
+        `clientCard` с `meta.cardId`.
+
+
+        Ошибки: `400 validation`, `field = cardId`, `reason = taken` — карта уже у другого клиента (без учёта регистра);
+
+        нет клиента или это гость — `404`, `details.what = "user"`.
+
+        '
+      x-server-status: required
+      x-server-note: 'required: вход по карте (`POST /auth/login`, `kind = card`) в v1 required, а потерянную или новую карту
+        иначе привязать нельзя — при регистрации карта задаётся только один раз. Касса этой ветки вызывает маршрут кнопкой
+        «Привязать карту».'
+      x-roles:
+      - owner
+      - cashier
+      x-source:
+      - apps/admin/src/api.ts:619
+      - apps/admin/src/pages/ClientsPage.tsx:164
+      - tools/MockServer/src/routes/club.ts:535
+      security:
+      - staffBearer: []
+      parameters:
+      - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminClientCardRequest'
+      responses:
+        '200':
+          description: Карточка клиента после изменения.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /admin/clients/{id}/password:
+    parameters:
+    - name: id
+      in: path
+      required: true
+      description: Идентификатор клиента (пользователя).
+      schema:
+        type: string
+        format: uuid
+    post:
+      tags:
+      - admin
+      operationId: adminSetClientPassword
+      summary: Задать клиенту новый пароль
+      description: '«Сбросить пароль» в кассе (SHELL_CHANGES п. 18): касса генерирует временный пароль, отправляет его сюда
+        и
+
+        показывает кассиру один раз, чтобы тот передал его клиенту. Прежний пароль перестаёт действовать. Журнал
+
+        контроля — `clientPassword`.
+
+
+        Ошибки: `400 validation`, `field = password`, `reason` ∈ `required` | `min` (4–64 символа); нет клиента или это
+
+        гость — `404`, `details.what = "user"`.
+
+        '
+      x-server-status: required
+      x-server-note: 'required: единственный способ восстановить вход клиенту, созданному на кассе или забывшему пароль (вход
+        по паролю, `POST /auth/login`, в v1 required). Касса этой ветки вызывает маршрут кнопкой «Сбросить пароль».'
+      x-roles:
+      - owner
+      - cashier
+      x-source:
+      - apps/admin/src/api.ts:617
+      - apps/admin/src/pages/ClientsPage.tsx:179
+      - tools/MockServer/src/routes/club.ts:524
+      security:
+      - staffBearer: []
+      parameters:
+      - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminClientPasswordRequest'
+      responses:
+        '200':
+          description: Пароль изменён.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':
@@ -436,11 +607,11 @@ paths:
 
         промокоды, счастливые часы, лояльность, ограничения, каталог, баннеры, правила, склад, автоматизация,
 
-        уведомления, вебхуки, пороги контроля, ключ API. Читают все сотрудники (кассе нужны группы клиентов).
+        уведомления, вебхуки, пороги контроля. Читают все сотрудники (кассе нужны группы клиентов), поэтому секретов в
 
-        Telegram-поля `notifications` запрещены (x-prohibited: telegram): всегда `""`/false. Ключ API — предложение
+        ответе нет: ключа API (`apiKey`) сервер не отдаёт — владелец читает его `GET /admin/club/api-key`
 
-        контракта: кассиру `""` (мок отдаёт любому сотруднику).
+        (SHELL_CHANGES п. 16). Telegram-поля `notifications` запрещены и не отдаются (SHELL_CHANGES п. 17).
 
         '
       x-server-status: required
@@ -448,10 +619,10 @@ paths:
       - owner
       - cashier
       x-source:
-      - apps/admin/src/api.ts:517
+      - apps/admin/src/api.ts:595
       - apps/admin/src/settings.ts:29
       - apps/admin/src/pages/ClientsPage.tsx:382
-      - tools/MockServer/src/routes/club.ts:249
+      - tools/MockServer/src/routes/club.ts:289
       security:
       - staffBearer: []
       parameters:
@@ -484,16 +655,18 @@ paths:
 
         повышает версию конфигурации агентов и каталога игр. После успеха касса перечитывает `GET /admin/club`.
 
-        Telegram-поля принимаются и игнорируются.
+        Telegram-поля (их шлёт старая касса) принимаются и игнорируются; касса club-shell `feat/shell-changes` шлёт
+
+        `notifications` только с `bigTopupAt`.
 
         '
       x-server-status: required
       x-roles:
       - owner
       x-source:
-      - apps/admin/src/api.ts:518
+      - apps/admin/src/api.ts:596
       - apps/admin/src/settings.ts:60
-      - tools/MockServer/src/routes/club.ts:277
+      - tools/MockServer/src/routes/club.ts:316
       security:
       - staffBearer: []
       parameters:
@@ -527,6 +700,52 @@ paths:
         '500':
           $ref: '#/components/responses/InternalError'
   /admin/club/api-key:
+    get:
+      tags:
+      - admin
+      operationId: adminApiKey
+      summary: Текущий ключ API клуба (только владелец)
+      description: 'Текущий ключ `ck_…` для интеграций. Только владелец: ключ действует как токен владельца на `/admin/*`,
+        поэтому
+
+        кассиру — `403 forbidden`, `details.reason = "ownerOnly"`. Касса club-shell `feat/shell-changes`
+
+        (SHELL_CHANGES п. 16) показывает ключ на странице «Интеграции» только отсюда: в `GET /admin/club` его больше нет.
+
+        '
+      x-server-status: required
+      x-server-note: 'required: после того как `GET /admin/club` перестал отдавать ключ, это единственный способ владельцу
+        увидеть действующий ключ, не заменяя его (замена ломает уже настроенные интеграции). Реализация тривиальна.'
+      x-roles:
+      - owner
+      x-source:
+      - apps/admin/src/api.ts:597
+      - apps/admin/src/pages/IntegrationsPage.tsx:73
+      - tools/MockServer/src/routes/club.ts:375
+      security:
+      - staffBearer: []
+      parameters:
+      - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Текущий ключ.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminApiKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
     post:
       tags:
       - admin
@@ -542,10 +761,10 @@ paths:
       x-roles:
       - owner
       x-source:
-      - apps/admin/src/api.ts:519
-      - apps/admin/src/pages/IntegrationsPage.tsx:140
-      - tools/MockServer/src/routes/club.ts:341
-      - tools/MockServer/src/routes/club.ts:69
+      - apps/admin/src/api.ts:598
+      - apps/admin/src/pages/IntegrationsPage.tsx:128
+      - tools/MockServer/src/routes/club.ts:380
+      - tools/MockServer/src/routes/club.ts:71
       security:
       - staffBearer: []
       parameters:
@@ -840,9 +1059,9 @@ paths:
       description: 'Выдаёт токен персонала по PIN активного сотрудника. Режим `none` (токена ещё нет). Ответ — токен, сотрудник
         и
 
-        открытая смена клуба. Касса хранит токен в localStorage и шлёт как `Authorization: Bearer`. Выхода (logout) в
+        открытая смена клуба. Касса хранит токен в localStorage и шлёт как `Authorization: Bearer`. Токен перестаёт
 
-        контракте нет: касса просто забывает токен; токен перестаёт действовать при отключении сотрудника.
+        действовать после `POST /admin/logout` и при отключении сотрудника.
 
 
         Ошибки: неверный PIN — `401 unauthorized`, `details.reason = "invalidPin"` (касса на 401 этого маршрута не
@@ -896,6 +1115,59 @@ paths:
           description: '`unauthorized`, `details.reason = "invalidPin"` — нет активного сотрудника с таким PIN.'
         '500':
           $ref: '#/components/responses/InternalError'
+  /admin/logout:
+    post:
+      tags:
+      - admin
+      operationId: adminLogout
+      summary: Выход персонала (отзыв токена)
+      description: 'Отзывает токен персонала из `Authorization: Bearer`: дальнейшие запросы с ним — `401`, `details.reason
+        =
+
+        "invalid"`. Кнопка «Выйти» кассы club-shell `feat/shell-changes` (SHELL_CHANGES п. 16) вызывает маршрут и, не
+
+        дожидаясь ответа, забывает токен локально. Тело — пустой объект `{}`. Всегда `200 { ok: true }`, в том числе для
+
+        неизвестного или уже отозванного токена (повторный выход безвреден), поэтому `401` здесь нет. Ключ API клуба
+
+        `ck_…` этим маршрутом не отзывается (для него — `POST /admin/club/api-key`).
+
+        '
+      x-server-status: required
+      x-server-note: 'required: без отзыва токен персонала бессрочен — украденный из localStorage кассы токен работает, пока
+        сотрудника не отключат (docs/OPEN_QUESTIONS.md, admin). Реализация тривиальна (удалить токен из хранилища), а касса
+        этой ветки вызывает маршрут при каждом выходе.'
+      x-roles:
+      - owner
+      - cashier
+      x-source:
+      - apps/admin/src/api.ts:582
+      - apps/admin/src/App.tsx:426
+      - tools/MockServer/src/routes/club.ts:175
+      security:
+      - staffBearer: []
+      parameters:
+      - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Токен отозван (или уже не действовал).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '500':
+          $ref: '#/components/responses/InternalError'
   /admin/me:
     get:
       tags:
@@ -941,26 +1213,23 @@ paths:
       - admin
       operationId: adminTestNotification
       summary: Тестовое уведомление в Telegram (запрещено)
-      description: 'В моке — тестовое сообщение Telegram-боту владельца (и вебхукам, подписанным на `ruleFired`). Telegram
-        в
+      description: 'Прежний мок слал тестовое сообщение Telegram-боту владельца. Telegram в продукте запрещён: сервер не реализует
 
-        продукте запрещён: сервер v1 не реализует, отвечает `501` (`serverUnavailable`,
+        маршрут и отвечает `501 notImplemented`. Касса и мок club-shell `feat/shell-changes` (SHELL_CHANGES п. 17)
 
-        `details.reason = "notImplemented"`). Касса вызывает маршрут только при сохранённых токене бота и chat id, а
+        маршрут не вызывают и не содержат; операция остаётся в контракте только до `/api/v2` (удалять операции можно
 
-        сервер их всегда отдаёт пустыми — поэтому на практике вызова не будет.
+        только в новой версии) — для старых сборок кассы.
 
         '
       x-server-status: notImplemented
       x-prohibited: telegram
       x-roles:
       - owner
+      deprecated: true
       x-source:
-      - apps/admin/src/api.ts:520
-      - apps/admin/src/pages/IntegrationsPage.tsx:90
-      - apps/admin/src/pages/IntegrationsPage.tsx:99
-      - tools/MockServer/src/routes/club.ts:348
-      - tools/MockServer/src/club.ts:564
+      - tools/MockServer/src/club.ts:5
+      - apps/admin/src/pages/IntegrationsPage.tsx:240
       security:
       - staffBearer: []
       parameters:
@@ -973,7 +1242,7 @@ paths:
               type: object
       responses:
         '200':
-          description: (Мок) уведомление отправлено.
+          description: (Прежний мок) уведомление отправлено.
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/XTraceIdResponse'
@@ -1866,14 +2135,15 @@ paths:
       - owner
       - cashier
       x-source:
-      - apps/admin/src/api.ts:514
+      - apps/admin/src/api.ts:592
       - apps/admin/src/pages/ShiftPage.tsx:149
-      - tools/MockServer/src/routes/club.ts:222
+      - tools/MockServer/src/routes/club.ts:260
       - tools/MockServer/src/control.ts:209
       security:
       - staffBearer: []
       parameters:
       - $ref: '#/components/parameters/XTraceId'
+      - $ref: '#/components/parameters/IdempotencyKeyOptional'
       requestBody:
         required: true
         content:
@@ -1888,6 +2158,8 @@ paths:
               $ref: '#/components/headers/XTraceIdResponse'
             X-Server-Time:
               $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
@@ -2539,11 +2811,17 @@ paths:
       summary: Ожидающие команды (REST-фолбэк WebSocket)
       description: 'Неподтверждённые и непросроченные команды для ПК, старые первыми (каждый элемент — кадр `command` WS без
 
-        `type`). Агент вызывает маршрут после heartbeat с `pendingCommands > 0`; дубли отсекает по `id` (24 ч);
+        `type`). Агент вызывает маршрут после heartbeat с `pendingCommands > 0`; дубли отсекает по `id` (24 ч) и
 
-        просроченные подтверждает с ошибкой `timeout`. Каждую команду подтверждает
+        отвечает на них ack первого выполнения; просроченные подтверждает с ошибкой `timeout`. Каждую команду
 
-        `POST /agents/{pcId}/commands/{commandId}/ack`.
+        подтверждает `POST /agents/{pcId}/commands/{commandId}/ack`.
+
+        `name` — строка (SHELL_CHANGES п. 3): незнакомое имя агент с club-shell `feat/shell-changes` подтверждает
+
+        `ack { ok: false, error.code: notFound }` и выполняет остальные команды пачки. У старых агентов незнакомое
+
+        имя роняет разбор всего ответа — сервер шлёт только имена `ServerCommandType`.
 
         '
       x-server-status: required
@@ -2551,7 +2829,9 @@ paths:
       - src/ClubShell.Core/Http/Endpoints.cs:93
       - src/ClubShell.Core/Abstractions/IServerClient.cs:138
       - src/ClubShell.Core/Http/ServerClient.cs:187
-      - src/ClubShell.Agent/Server/Heartbeat.cs:261
+      - src/ClubShell.Agent/Server/Heartbeat.cs:318
+      - src/ClubShell.Agent/Server/Heartbeat.cs:361
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:171
       - docs/SERVER_API.md:182
       - tools/MockServer/src/routes/pcs.ts:214
       - tools/MockServer/src/ws.ts:113
@@ -2683,7 +2963,13 @@ paths:
 
         `refreshConfig`. Клиент поддерживает `If-None-Match`/`304`, но текущий агент для конфига `If-None-Match` не
 
-        шлёт и всегда ждёт `200` с телом. GET повторяется агентом на 408/425/429/5xx.
+        шлёт и всегда ждёт `200` с телом. GET повторяется агентом на 408/425/429/5xx (кроме 501).
+
+        Агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 4 и 8) применяет блок `shell` первым и отдельно от
+
+        оверлея `agent.json`, а последний применённый конфиг хранит в `<paths.cache>/server-config.json` и применяет
+
+        при старте службы, до первого heartbeat (подробнее — `AgentServerConfig`).
 
         '
       x-server-status: required
@@ -2692,7 +2978,8 @@ paths:
       - src/ClubShell.Core/Abstractions/IServerClient.cs:132
       - src/ClubShell.Core/Http/ServerClient.cs:179
       - src/ClubShell.Core/Http/ServerClient.cs:659
-      - src/ClubShell.Agent/Server/CommandReceiver.cs:527
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:539
+      - src/ClubShell.Core/Configuration/SettingsLoader.cs:504
       - docs/SERVER_API.md:26
       - docs/SERVER_API.md:199
       - tools/MockServer/src/routes/pcs.ts:204
@@ -2764,6 +3051,12 @@ paths:
 
         сверки сессии, агент её не выполняет — см. `x-discrepancy`).
 
+        Агент с club-shell `feat/shell-changes` добавляет в тело необязательные `gamesVolume` (кто монтирует том
+
+        библиотеки игр и смонтирован ли он) и `antiCheat` (Vanguard, Secure Boot, TPM) — SHELL_CHANGES п. 9 и 14;
+
+        сервер может их игнорировать, старые агенты их не шлют.
+
         Ошибки агент только логирует; автоматических HTTP-повторов нет (POST без `Idempotency-Key`).
 
         '
@@ -2780,6 +3073,7 @@ paths:
       - src/ClubShell.Core/Abstractions/IServerClient.cs:126
       - src/ClubShell.Core/Http/ServerClient.cs:163
       - src/ClubShell.Agent/Server/Heartbeat.cs:163
+      - src/ClubShell.Agent/Server/Heartbeat.cs:179
       - src/ClubShell.Agent/Server/Heartbeat.cs:218
       - docs/SERVER_API.md:151
       - docs/SERVER_API.md:180
@@ -2918,15 +3212,21 @@ paths:
 
         каждые `telemetry.uploadIntervalSec` (по умолчанию 60 с). Пока выгрузка не удаётся, агент копит до 120 замеров и
 
-        до 1024 событий и шлёт их одной пачкой без деления — отказ `400` на валидной пачке заблокирует выгрузку.
+        до 1024 событий. Агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 6) кладёт в пачку не больше 100
+
+        событий (остальные — в следующих пачках); пачку, на которую сервер ответил 4xx, кроме 401/408/429, отбрасывает;
+
+        после прочих неудач отступает экспоненциально (от `uploadIntervalSec` до 15 мин). Старые агенты шлют до 1024
+
+        событий одной пачкой без деления — отказ `400` на валидной пачке у них блокирует выгрузку.
 
         Среди событий бывает `kind = "callAdmin"` с `data` = `CallAdminTicketRequest` — вызов администратора, не
 
-        доставленный через `POST /support/call-admin` (временная ошибка/офлайн). Пока `POST /support/call-admin`
+        доставленный через `POST /support/call-admin` (временная ошибка, офлайн или `501 notImplemented`). Пока
 
-        не реализован (`notImplemented`: 501 агент считает временной ошибкой), это единственный канал вызова
+        `POST /support/call-admin` не реализован, это единственный канал вызова администратора — сервер v1 должен
 
-        администратора — сервер v1 должен разбирать такие события, иначе вызовы молча теряются.
+        разбирать такие события, иначе вызовы молча теряются.
 
         Автоматических HTTP-повторов нет (POST без `Idempotency-Key`); неотправленное остаётся до следующей попытки.
 
@@ -2936,10 +3236,12 @@ paths:
       - src/ClubShell.Core/Http/Endpoints.cs:84
       - src/ClubShell.Core/Abstractions/IServerClient.cs:129
       - src/ClubShell.Core/Http/ServerClient.cs:172
-      - src/ClubShell.Agent/Server/TelemetryReporter.cs:96
-      - src/ClubShell.Agent/Server/TelemetryReporter.cs:294
-      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:48
-      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:99
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:213
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:225
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:311
+      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:49
+      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:255
       - docs/SERVER_API.md:186
       - docs/SERVER_API.md:197
       - tools/MockServer/src/routes/pcs.ts:184
@@ -2971,7 +3273,9 @@ paths:
           description: '`validation` — нарушена форма пачки (`details.field`: `samples`, `events`, `samples[i]`, …). Сервер
             обязан
 
-            принимать до 120 `samples` и до 1024 `events` (агент пачку не делит).
+            принимать до 120 `samples` и до 1024 `events` (старые агенты пачку не делят; агент с club-shell
+
+            `feat/shell-changes` шлёт до 100 событий и пачку с ответом 4xx отбрасывает).
 
             '
         '401':
@@ -2997,7 +3301,11 @@ paths:
 
         `anticheatViolation`. `pcId` тела должен совпадать с ПК из токена агента. Ошибки агент только логирует; POST без
 
-        `Idempotency-Key` автоматически не повторяется — отчёт теряется.
+        `Idempotency-Key` автоматически не повторяется — отчёт теряется. Пока операция `notImplemented`, сервер может
+
+        выключить вызов: `AgentServerConfig.anticheat = { "reportViolations": false }` (агент с club-shell
+
+        `feat/shell-changes`, SHELL_CHANGES п. 4); WS-событие при этом остаётся.
 
         '
       x-server-status: notImplemented
@@ -3006,6 +3314,7 @@ paths:
       - src/ClubShell.Core/Abstractions/IServerClient.cs:325
       - src/ClubShell.Core/Http/ServerClient.cs:536
       - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:338
+      - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:354
       - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:361
       - docs/SERVER_API.md:403
       - docs/SERVER_API.md:548
@@ -3060,9 +3369,11 @@ paths:
 
         (иначе IPC `apps.list` отдаёт пустой список, `GameHandlers.cs:87`), поэтому сервер v1 выключает `features.apps`
 
-        в `GET /agents/{pcId}/config` (`shell.features`). При временной ошибке (в том числе `501`) и наличии кэша агент
+        в `GET /agents/{pcId}/config` (`shell.features`). При временной ошибке и наличии кэша агент отдаёт кэш; на
 
-        отдаёт кэш.
+        `501` агент с club-shell `feat/shell-changes` отдаёт шеллу `notImplemented` (без повторов и без кэша), старые
+
+        агенты считают 501 временной ошибкой.
 
 
         Контракт клиента: режим `agent`, `ETag`/`If-None-Match`; ответ `AppsListResponse`, `allowed` считается сервером
@@ -4129,20 +4440,28 @@ paths:
       - games
       operationId: leaseAccount
       summary: Аренда аккаунта лаунчера из пула клуба
-      description: '**Не реализуется в сервере v1.** Пул аккаунтов клуба — открытый продуктовый вопрос Q8. Кроме того, текущий
+      description: '**Не реализуется в сервере v1.** Пул аккаунтов клуба — открытый продуктовый вопрос Q8. Старые агенты
 
-        агент подставляет расшифрованный пароль аренды в командную строку лаунчера (`AccountInjector.cs`: Steam
+        подставляли расшифрованный пароль аренды в командную строку лаунчера (Steam `-login <user> <pass>`, Epic
 
-        `-login <user> <pass>`, Epic `-AUTH_PASSWORD=<pass>`), а пароль в командной строке лаунчера в продукте запрещён.
+        `-AUTH_PASSWORD=<pass>`), а это в продукте запрещено. Агент с club-shell `feat/shell-changes` (SHELL_CHANGES
+
+        п. 10-11) пароля туда не кладёт: Steam и Epic получают сессию из `extra.files` (Steam — с автологином в профиле
+
+        kiosk), Epic — одноразовый exchange-код (`extra.authType = "exchangeCode"`), иначе лаунчер стартует без учётных
+
+        данных; пароль — только при `games.accountPool.allowPasswordOnCommandLine = true` (по умолчанию false).
 
 
-        Чтобы агент вообще не обращался к маршруту, сервер v1 обязан отдавать `requiresAccount: false` у всех игр и
+        Чтобы агент вообще не обращался к маршруту, сервер v1 отдаёт `requiresAccount: false` у всех игр и
 
-        `games.accountPool.enabled: false` в `GET /agents/{pcId}/config`. Иначе запуск такой игры вызывает этот GET
+        `games.accountPool.enabled: false` в `GET /agents/{pcId}/config`; у агента с club-shell `feat/shell-changes`
 
-        (`501` → `serverUnavailable` → до 5 HTTP-попыток × 3 попытки `AccountPool`, всё в общий circuit breaker), и
+        пул и так выключен по умолчанию (SHELL_CHANGES п. 5). Если запрос всё же придёт: агент с этой ветки на `501`
 
-        запуск заканчивается `accountPoolExhausted`.
+        сразу отдаёт шеллу ошибку `notImplemented` (без повторов), старые агенты — до 5 HTTP-попыток × 3 попытки
+
+        `AccountPool` в общий circuit breaker и затем `accountPoolExhausted`.
 
 
         Контракт клиента (на будущее): режим `user`; `sessionId` — открытая сессия этого пользователя; ответ
@@ -4394,18 +4713,29 @@ paths:
       summary: Отчёт о запуске или завершении игры
       description: "Режим `agent`. Агент шлёт отчёт после каждой попытки запуска (`phase = launch`, при неудаче `result.ok\
         \ = false`\nи `result.error`) и после выхода из игры (`phase = exit`, `result.ok = true`, `exitCode`, `playedSec`).\
-        \ Ответ\n`204` без тела (агент принимает любой 2xx).\n\n- Без `Idempotency-Key`: агент POST не повторяет, любую ошибку\
-        \ только логирует — отчёт теряется. Сервер не\n  должен рассчитывать на доставку каждого отчёта.\n- Успешный `phase\
-        \ = launch` обновляет «последний запуск» пользователя (`Game.lastPlayedAt` для `userId`, мок).\n- Мок проверяет только\
-        \ наличие полей и значения enum (`launcher`, `phase`), существование `sessionId`/`userId`\n  не проверяет. Нет игры\
-        \ — `404`, `details.what = \"game\"`.\n"
+        \ Ответ\n`204` без тела (агент принимает любой 2xx).\n\n- Без `Idempotency-Key`: HTTP-повторов нет. Агент с club-shell\
+        \ `feat/shell-changes` (SHELL_CHANGES п. 6) кладёт\n  недоставленный отчёт в офлайн-очередь (`cache/offline.db`, таблица\
+        \ `reports`, до `offline.maxQueue`) и\n  повторяет его вместе с outbox — после сетевой ошибки, тайм-аута, отмены и\
+        \ ошибок с кодом `timeout`,\n  `rateLimited`, `serverUnavailable`, `agentOffline`, `unauthorized`, `forbidden` (по\
+        \ статусу: `408`, `429`,\n  `401`, `403`, `5xx` без распознанного кода, кроме `501`); прочие отказы (`4xx`, `internal`,\
+        \ `notImplemented`)\n  только логирует и отбрасывает. Если потерялся ответ, сервер получит тот же отчёт\n  (`phase\
+        \ = launch` или `exit`) повторно — обработка должна это терпеть (например, дедупликация по\n  `sessionId` + `phase`\
+        \ + `result.startedAt`). Очередь отчётов входит в `HeartbeatRequest.offlineQueue`.\n  Старые агенты отчёт не повторяли\
+        \ — он терялся. Сервер не должен рассчитывать на доставку каждого отчёта.\n- `injectionError` (агент с club-shell\
+        \ `feat/shell-changes`, SHELL_CHANGES п. 10) — почему лаунчер при\n  аренде аккаунта подготовлен не чисто; сервер\
+        \ может поле игнорировать.\n- `antiCheat.kind` для Riot-игры без пометки античита в каталоге агент с этой ветки пишет\
+        \ как `vanguard`\n  (SHELL_CHANGES п. 14).\n- Успешный `phase = launch` обновляет «последний запуск» пользователя\
+        \ (`Game.lastPlayedAt` для `userId`, мок).\n- Мок проверяет только наличие полей и значения enum (`launcher`, `phase`),\
+        \ существование `sessionId`/`userId`\n  не проверяет. Нет игры — `404`, `details.what = \"game\"`.\n"
       x-server-status: required
       x-source:
       - src/ClubShell.Core/Http/Endpoints.cs:144
       - src/ClubShell.Core/Abstractions/IServerClient.cs:228
       - src/ClubShell.Core/Http/ServerClient.cs:373
-      - src/ClubShell.Agent/Games/GameLaunchService.cs:469
-      - src/ClubShell.Agent/Games/GameSessionTracker.cs:230
+      - src/ClubShell.Agent/Games/GameLaunchService.cs:489
+      - src/ClubShell.Agent/Games/GameSessionTracker.cs:235
+      - src/ClubShell.Agent/Session/OfflineSessionStore.cs:473
+      - src/ClubShell.Agent/Session/OfflineSessionStore.cs:868
       - docs/SERVER_API.md:330
       - tools/MockServer/src/routes/games.ts:172
       security:
@@ -4561,24 +4891,28 @@ paths:
 
         старте), кэширует ответ на 60 с; при любой ошибке синтезирует сведения о ПК локально (ошибку не кэширует).
 
-        `hwid` отдаётся только для собственного ПК вызывающего агента. GET повторяется агентом на 408/425/429/5xx,
+        `hwid` отдаётся только для собственного ПК вызывающего агента. GET повторяется агентом на 408/425/429/5xx;
 
-        в том числе на 501 (см. `x-open-question`).
+        старые агенты — в том числе на 501 (см. `x-open-question`), агент с club-shell `feat/shell-changes` 501 не
+
+        повторяет.
 
         '
       x-server-status: required
       x-server-note: 'Решение владельца 2026-09-27: реализуется в v1 — агент вызывает его при каждом старте шелла, 501 повторяется
         агентом (docs/SHELL_CHANGES.md п. 1).'
-      x-open-question: 'Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55
-        — любой статус ≥ 500) и повторяет GET до 5 попыток (RetryPolicy.cs:66-71, AppSettings.cs:242); каждая попытка проходит
-        через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155: FailureRatio 0,8, MinimumThroughput
-        5, окно и размыкание 30 с — AppSettings.cs:258, 262). Ошибка не кэшируется (SystemHandlers.cs:446-454), поэтому каждый
-        некэшированный sys.pcInfo (шелл зовёт его при каждой загрузке: apps/shell/src/store/settings.ts:139, store/index.ts:374)
-        даёт 5 отказов подряд; если в 30-секундном окне был лишь 1 успешный запрос (5/6 ≥ 0,8), цепь размыкается на 30 с и
-        required-операции (heartbeat, сессии, вход) получают serverUnavailable. Загрузка шелла (bootstrapStores ждёт loadSystem)
-        к тому же задерживается на время повторов с backoff, а итоговый ответ IPC sys.pcInfo (C# PcInfo) агент всё равно синтезирует
-        локально. Варианты: владелец делает операцию required (данные ПК у сервера v1 и так есть для register/heartbeat) или
-        сервер v1 отвечает на неё хотя бы минимальной реализацией вместо 501.'
+      x-open-question: '[Для агентов с club-shell feat/shell-changes снято: 501 не повторяется и не засчитывается circuit
+        breaker''ом, SHELL_CHANGES п. 1. Решение required остаётся — ради старых агентов.] Статус notImplemented (по правилам)
+        вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55 — любой статус ≥ 500) и повторяет GET до 5 попыток
+        (RetryPolicy.cs:66-71, AppSettings.cs:242); каждая попытка проходит через один общий для всех запросов агента circuit
+        breaker (RetryPolicy.cs:112-120 и 155: FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с — AppSettings.cs:258,
+        262). Ошибка не кэшируется (SystemHandlers.cs:446-454), поэтому каждый некэшированный sys.pcInfo (шелл зовёт его при
+        каждой загрузке: apps/shell/src/store/settings.ts:139, store/index.ts:374) даёт 5 отказов подряд; если в 30-секундном
+        окне был лишь 1 успешный запрос (5/6 ≥ 0,8), цепь размыкается на 30 с и required-операции (heartbeat, сессии, вход)
+        получают serverUnavailable. Загрузка шелла (bootstrapStores ждёт loadSystem) к тому же задерживается на время повторов
+        с backoff, а итоговый ответ IPC sys.pcInfo (C# PcInfo) агент всё равно синтезирует локально. Варианты: владелец делает
+        операцию required (данные ПК у сервера v1 и так есть для register/heartbeat) или сервер v1 отвечает на неё хотя бы
+        минимальной реализацией вместо 501.'
       x-source:
       - src/ClubShell.Core/Http/Endpoints.cs:99
       - src/ClubShell.Core/Abstractions/IServerClient.cs:147
@@ -5431,11 +5765,13 @@ paths:
         новые первыми.
 
 
-        Внимание: шелл вызывает IPC `shop.orders` при каждом входе пользователя, а агент **не** проверяет
+        Шелл вызывает IPC `shop.orders` при каждом входе пользователя. Агент с club-shell `feat/shell-changes`
 
-        `features.shop` для этого IPC — маршрут будет вызываться и при выключенном магазине (см. открытый вопрос группы).
+        (SHELL_CHANGES п. 4) проверяет `features.shop`: при выключенном магазине отвечает шеллу `policyDenied`
 
-        Агент не повторяет на уровне IPC; шелл показывает ошибку в списке заказов.
+        (`rule = features.shop`) и на сервер не ходит. Старые агенты флаг не проверяли — маршрут вызывался при каждом
+
+        входе и при выключенном магазине. Агент не повторяет на уровне IPC; шелл показывает ошибку в списке заказов.
 
         '
       x-server-status: notImplemented
@@ -5443,7 +5779,8 @@ paths:
       - src/ClubShell.Core/Http/Endpoints.cs:63
       - src/ClubShell.Core/Abstractions/IServerClient.cs:266
       - src/ClubShell.Core/Http/ServerClient.cs:439
-      - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:789
+      - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:800
+      - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:803
       - apps/shell/src/store/index.ts:47
       - docs/SERVER_API.md:370
       - tools/MockServer/src/routes/shop.ts:140
@@ -5733,29 +6070,35 @@ paths:
         клиентским `ticketId` и без `queuePosition`.
 
 
-        Пока маршрут не реализован (`notImplemented`), 501 агент считает временной ошибкой (`serverUnavailable`),
+        Пока маршрут не реализован (`notImplemented`), вызовы администратора приходят на сервер только как события
 
-        поэтому вызовы администратора приходят на сервер только как события телеметрии `kind = "callAdmin"` в
+        телеметрии `kind = "callAdmin"` в `POST /agents/{pcId}/telemetry` — сервер v1 должен их разбирать (см.
 
-        `POST /agents/{pcId}/telemetry` — сервер v1 должен их разбирать (см. `x-open-question`).
+        `x-open-question`): агент с club-shell `feat/shell-changes` уводит тикет в телеметрию и на
+
+        `501 notImplemented` (без повторов, SystemHandlers.cs:248), старые агенты — после повторов 501 как
+
+        `serverUnavailable`.
 
         '
       x-server-status: notImplemented
-      x-open-question: 'Статус notImplemented (по правилам) вредит агенту. POST несёт Idempotency-Key, поэтому на 501 (временная
-        ошибка: RetryPolicy.cs:55, 71) агент делает до 5 попыток (AppSettings.cs:242) через один общий для всех запросов агента
-        circuit breaker (RetryPolicy.cs:112-120 и 155: FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с — AppSettings.cs:258,
-        262): при ≤ 1 успешном запросе в 30-секундном окне 5 отказов подряд размыкают цепь на 30 с для всех запросов агента,
-        включая required. Затем код serverUnavailable (IsRetryable, ErrorCode.cs:156-163) уводит тикет в телеметрию (SystemHandlers.cs:247-253),
-        а шелл получает выдуманный успешный тикет: пока маршрут не реализован, вызов администратора доходит до сервера только
-        как событие kind = "callAdmin" в POST /agents/{pcId}/telemetry, и если сервер v1 такие события не разбирает, вызов
-        молча теряется. Варианты: владелец делает операцию required либо явно закрепляет за сервером v1 обработку события
-        callAdmin в телеметрии.'
+      x-open-question: '[Для агентов с club-shell feat/shell-changes снята часть про повторы и circuit breaker (SHELL_CHANGES
+        п. 1); вопрос об обработке события callAdmin в телеметрии остаётся.] Статус notImplemented (по правилам) вредит агенту.
+        POST несёт Idempotency-Key, поэтому на 501 (временная ошибка: RetryPolicy.cs:55, 71) агент делает до 5 попыток (AppSettings.cs:242)
+        через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155: FailureRatio 0,8, MinimumThroughput
+        5, окно и размыкание 30 с — AppSettings.cs:258, 262): при ≤ 1 успешном запросе в 30-секундном окне 5 отказов подряд
+        размыкают цепь на 30 с для всех запросов агента, включая required. Затем код serverUnavailable (IsRetryable, ErrorCode.cs:156-163)
+        уводит тикет в телеметрию (SystemHandlers.cs:247-253), а шелл получает выдуманный успешный тикет: пока маршрут не
+        реализован, вызов администратора доходит до сервера только как событие kind = "callAdmin" в POST /agents/{pcId}/telemetry,
+        и если сервер v1 такие события не разбирает, вызов молча теряется. Варианты: владелец делает операцию required либо
+        явно закрепляет за сервером v1 обработку события callAdmin в телеметрии.'
       x-source:
       - src/ClubShell.Core/Http/Endpoints.cs:75
       - src/ClubShell.Core/Abstractions/IServerClient.cs:322
       - src/ClubShell.Core/Http/ServerClient.cs:529
       - src/ClubShell.Core/Http/ServerClient.cs:834
       - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:238
+      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:248
       - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253
       - docs/SERVER_API.md:399
       - tools/MockServer/src/routes/pcs.ts:251
@@ -6187,17 +6530,23 @@ paths:
 
         `manifest.url` требует того же Bearer-токена агента и поддерживает `Range`. GET повторяется агентом на
 
-        408/425/429/5xx, в том числе на 501 (см. `x-open-question`).
+        408/425/429/5xx; старые агенты — в том числе на 501 (см. `x-open-question`). Проверку по расписанию сервер
+
+        может выключить: `AgentServerConfig.updates.enabled = false` (агент с club-shell `feat/shell-changes`,
+
+        SHELL_CHANGES п. 4).
 
         '
       x-server-status: required
       x-server-note: 'Решение владельца 2026-09-27: сервер v1 всегда отвечает 204 («обновлений нет»), пока агент считает 501
         временной ошибкой (docs/SHELL_CHANGES.md п. 1). Раздача обновлений не реализована.'
-      x-open-question: 'Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55
-        — любой статус ≥ 500) и повторяет GET до 5 попыток (RetryPolicy.cs:66-71, AppSettings.cs:242); каждая попытка проходит
-        через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155: FailureRatio 0,8, MinimumThroughput
-        5, окно и размыкание 30 с — AppSettings.cs:258, 262). Проверка обновлений идёт при старте (AgentUpdater.cs:229), каждые
-        updates.checkIntervalSec (по умолчанию 3600 с; UpdateChecker.cs:144-152) и по IPC update.check (AgentUpdater.cs:97),
+      x-open-question: '[Для агентов с club-shell feat/shell-changes снято: 501 не повторяется и не засчитывается circuit
+        breaker''ом (SHELL_CHANGES п. 1), а проверку по расписанию выключает updates.enabled = false. Решение «всегда 204»
+        остаётся — ради старых агентов.] Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой
+        (RetryPolicy.cs:55 — любой статус ≥ 500) и повторяет GET до 5 попыток (RetryPolicy.cs:66-71, AppSettings.cs:242);
+        каждая попытка проходит через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155: FailureRatio
+        0,8, MinimumThroughput 5, окно и размыкание 30 с — AppSettings.cs:258, 262). Проверка обновлений идёт при старте (AgentUpdater.cs:229),
+        каждые updates.checkIntervalSec (по умолчанию 3600 с; UpdateChecker.cs:144-152) и по IPC update.check (AgentUpdater.cs:97),
         по двум компонентам подряд — agent, затем shell (UpdateChecker.cs:135-136), т. е. 2 × 5 отказов за один прогон. В
         тихом 30-секундном окне успешных запросов обычно 1-2 (heartbeat раз в 30 с, телеметрия раз в 60 с), так что 10/12
         ≥ 0,8 (при 1 успехе — уже 5/6): цепь размыкается, и на 30 с required-операции (heartbeat, сессии, вход) получают serverUnavailable.
@@ -7059,11 +7408,15 @@ components:
 
         (касса на 401 выходит из учётной записи); не хватает роли — `403`, `details.reason = "ownerOnly"`.
 
+        Кнопка «Выйти» кассы вызывает `POST /admin/logout`: токен отзывается, дальнейшие запросы с ним — `401 invalid`.
+
         '
       x-source:
       - apps/admin/src/api.ts:89
+      - apps/admin/src/api.ts:582
       - tools/MockServer/src/routes/club.ts:63
       - tools/MockServer/src/routes/club.ts:136
+      - tools/MockServer/src/routes/club.ts:175
     userToken:
       type: apiKey
       in: header
@@ -7130,10 +7483,16 @@ components:
       name: Idempotency-Key
       in: header
       required: false
-      description: 'То же, что `IdempotencyKey`, но необязательный: для создающих/списывающих POST, клиент которых ключ не
-        шлёт
+      description: 'То же, что `IdempotencyKey`, но необязательный: клиент может ключ не прислать, и тогда идемпотентности
+        нет.
 
-        (например, касса `apps/admin` не отправляет `Idempotency-Key`). Без ключа идемпотентности нет.
+        Касса `apps/admin` с club-shell `feat/shell-changes` шлёт его на семи денежных маршрутах (`POST /admin/sessions`,
+
+        `/admin/sessions/extend`, `/admin/sessions/end`, `/admin/wallet/topup`, `/admin/promo/redeem`,
+
+        `/admin/products/{id}/receive`, `/admin/shift/close`): один UUID v4 на действие кассира, тот же при повторе того
+
+        же тела после сетевой ошибки или 5xx (описание API, §5). Старые сборки кассы и агент на других POST ключ не шлют.
 
         '
       schema:
@@ -7141,7 +7500,9 @@ components:
         format: uuid
       x-source:
       - docs/SERVER_API.md:20
-      - apps/admin/src/api.ts:89
+      - apps/admin/src/api.ts:118
+      - apps/admin/src/api.ts:142
+      - tools/MockServer/src/routes/admin.ts:9
     IfNoneMatch:
       name: If-None-Match
       in: header
@@ -7537,24 +7898,25 @@ components:
       - tools/MockServer/src/index.ts:267
     NotImplemented:
       description: "Операция есть в контракте, но сервер v1 её не реализует (`x-server-status: notImplemented`), в том числе\
-        \ всё,\nсвязанное с Telegram (`x-prohibited: telegram`).\n\n`Retry-After` на 501 не отправлять.\n\nКод ошибки — **открытый\
-        \ вопрос владельцу**: подходящего `ErrorCode` нет (в `ErrorCode.cs` нет `notImplemented`),\nа неизвестный `code` агент\
-        \ не распарсит, отбросит конверт и выведет код из статуса (`ErrorCodes.FromHttpStatus`:\n501 → `serverUnavailable`).\
-        \ Предварительно, до решения, сервер отвечает `error.code = serverUnavailable`,\n`details: { reason: \"notImplemented\"\
-        \ }` — агент получает тот же код, что и без конверта. Альтернатива — добавить\n`notImplemented` в `ErrorCode` (неповторяемый)\
-        \ согласованно с релизом агента (§9).\n\nПоследствия для агента (учитывать при выборе `x-server-status`):\n- HTTP-уровень:\
-        \ 501 — «временная» ошибка (`RetryPolicy.IsTransient`: любой ≥ 500). `GET`/`PUT`/`DELETE`/`HEAD`\n  и `POST` с `Idempotency-Key`\
-        \ отправляются до 5 попыток, включая первую (4 повтора), с задержкой 0,5…15 с;\n  каждая попытка — отказ общего circuit\
-        \ breaker'а (≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на\n  30 с для всех запросов агента, в том числе\
-        \ к `required`-операциям).\n- Прикладной уровень: у `serverUnavailable` `IsRetryable = true`, поэтому вместо ошибки\
-        \ срабатывают офлайн-фолбэки\n  агента:\n  - `POST /support/call-admin` — агент перехватывает ошибку, публикует тикет\
-        \ в телеметрию (`kind = \"callAdmin\"`,\n    данные — `CallAdminTicketRequest`) и возвращает шеллу выдуманный успешный\
-        \ `SysCallAdminResponse` (новый\n    `ticketId`). Пока операция `notImplemented`, сервер v1 должен обрабатывать такие\
-        \ записи\n    `POST /agents/{pcId}/telemetry`, иначе вызов админа молча теряется;\n  - `GET /games/{id}/accounts/lease`\
-        \ — 3 попытки на уровне приложения (× до 5 HTTP-попыток каждая), затем в шелл\n    уходит `accountPoolExhausted` («Account\
-        \ pool unreachable; no cached lease»); освобождение аренды — до 3\n    попыток, затем молча пропускается (аренда истекает\
-        \ на сервере);\n  - `GET /apps` — отдаётся закэшированный каталог, если он есть;\n  - операции без фолбэка — в шелл\
-        \ уходит `serverUnavailable`.\n- Касса (`apps/admin`) не повторяет: показывает `AdminError` с `error.code`.\n"
+        \ всё,\nсвязанное с Telegram (`x-prohibited: telegram`).\n\n`Retry-After` на 501 не отправлять.\n\nКод ошибки — `notImplemented`\
+        \ (добавлен в `ErrorCode` по SHELL_CHANGES п. 1, см. `ErrorCode.x-enum-added`),\n`details` — `null` или `{ reason:\
+        \ \"notImplemented\" }`. Старый агент неизвестный код не распарсит, отбросит конверт\nи выведет код из статуса: 501\
+        \ → `serverUnavailable` — тот же код, что давал прежний временный вариант\n(`error.code = serverUnavailable`, `details.reason\
+        \ = notImplemented`), поэтому переходного режима не нужно.\n\nПоследствия для агента с club-shell `feat/shell-changes`:\n\
+        - HTTP-уровень: 501 не повторяется и не засчитывается circuit breaker'ом (`RetryPolicy.IsTransient`).\n- Прикладной\
+        \ уровень: `notImplemented` не `IsRetryable` — офлайн-фолбэки агента не срабатывают, ошибка\n  окончательная:\n  -\
+        \ `POST /support/call-admin` — исключение: агент и на `notImplemented` публикует тикет в телеметрию\n    (`kind =\
+        \ \"callAdmin\"`, данные — `CallAdminTicketRequest`) и возвращает шеллу успешный `SysCallAdminResponse`\n    с новым\
+        \ `ticketId`. Пока операция `notImplemented`, сервер v1 должен обрабатывать такие записи\n    `POST /agents/{pcId}/telemetry`,\
+        \ иначе вызов админа молча теряется;\n  - `GET /games/{id}/accounts/lease` — сразу ошибка в шелл (без повторов `AccountPool`);\
+        \ освобождение аренды не\n    повторяется (аренда истекает на сервере). Пул по умолчанию выключен (SHELL_CHANGES п.\
+        \ 5);\n  - `GET /apps` и прочие операции — в шелл уходит `notImplemented` (кэша у никогда не работавшей операции нет).\n\
+        \nСтарые агенты (до `feat/shell-changes`): 501 — «временная» ошибка (любой ≥ 500): `GET`/`PUT`/`DELETE`/`HEAD` и\n\
+        `POST` с `Idempotency-Key` уходят до 5 попыток с задержкой 0,5…15 с, каждая — отказ общего circuit breaker'а\n(≥ 80\
+        \ % отказов при ≥ 5 запросах за 30 с размыкают цепь на 30 с для всех запросов агента); у `serverUnavailable`\n`IsRetryable\
+        \ = true`, поэтому срабатывают офлайн-фолбэки (кэш `GET /apps`, 3 попытки лиза, телеметрия\n`callAdmin`). Учитывать\
+        \ при выборе `x-server-status` для операций, которые вызывают старые агенты.\n\nКасса (`apps/admin`) не повторяет:\
+        \ показывает `AdminError` с `error.code`.\n"
       headers:
         X-Trace-Id:
           $ref: '#/components/headers/XTraceIdResponse'
@@ -7568,7 +7930,7 @@ components:
             notImplemented:
               value:
                 error:
-                  code: serverUnavailable
+                  code: notImplemented
                   message: Not implemented in server v1
                   details:
                     reason: notImplemented
@@ -7583,10 +7945,13 @@ components:
       - src/ClubShell.Core/Configuration/AppSettings.cs:258
       - apps/admin/src/api.ts:104
       - src/ClubShell.Contracts/Errors/ErrorCode.cs:156
-      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:247
-      - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:257
+      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:248
+      - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:252
       - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:283
       - src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:109
+      - src/ClubShell.Contracts/Errors/ErrorCode.cs:76
+      - src/ClubShell.Contracts/Errors/ErrorCode.cs:152
+      - src/ClubShell.Core/Http/RetryPolicy.cs:57
     NotModified:
       description: 'Представление не изменилось с `If-None-Match`; тела нет. Агент использует закэшированную копию и сохраняет
         ETag.
@@ -7819,10 +8184,22 @@ components:
         secret:
           type: string
           contentEncoding: base64
-          description: Зашифрованный пароль или токен (base64 nonce||ciphertext||tag).
+          description: Зашифрованный пароль, токен или одноразовый exchange-код Epic (extra.authType = exchangeCode); base64
+            nonce||ciphertext||tag. Пароль агент с club-shell feat/shell-changes в командную строку лаунчера не кладёт (SHELL_CHANGES
+            п. 11), кроме games.accountPool.allowPasswordOnCommandLine = true (по умолчанию false).
         extra:
-          description: Специфичные для лаунчера дополнительные данные (steamGuardSecret, authenticatorSeed, region); в C#
-            — JsonElement? (любое значение или null/отсутствует).
+          description: 'Специфичные для лаунчера дополнительные данные; в C# — JsonElement? (любое значение или null/отсутствует).
+            Ключи, которые читает агент: steamGuardSecret, authenticatorSeed, region; files — файлы сессии лаунчера (путь
+            с %LOCALAPPDATA%/%APPDATA%/%USERPROFILE% → содержимое), которые агент кладёт в профиль игрока перед запуском:
+            Riot, Battle.net и прочие, а с club-shell feat/shell-changes — также Steam (например, %LOCALAPPDATA%\Steam\local.vdf;
+            автологин ставится в профиле kiosk) и Epic; authType — только Epic: "exchangeCode" означает, что secret — одноразовый
+            exchange-код Epic, лаунчер получает -AUTH_LOGIN=unused -AUTH_PASSWORD=<код> -AUTH_TYPE=exchangecode. Без files
+            и без exchange-кода Steam и Epic стартуют без учётных данных (игрок входит сам), а LaunchReport.injectionError
+            об этом сообщает. Повторно использованная аренда несёт уже потраченный exchange-код — Epic покажет форму входа.'
+          x-source:
+          - src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:69
+          - src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:144
+          - src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:359
         expiresAt:
           type: string
           format: date-time
@@ -7833,7 +8210,8 @@ components:
           - type: 'null'
           description: Пакет сохранений, который нужно восстановить перед запуском, если есть.
       x-csharp: src/ClubShell.Contracts/Games/LaunchRequest.cs:122
-      x-prohibited-note: пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён
+      x-prohibited-note: пул аккаунтов клуба — открытый продуктовый вопрос Q8 (у агента с club-shell feat/shell-changes выключен
+        по умолчанию); пароль в командной строке лаунчера запрещён — агент кладёт туда только exchange-код Epic
     AccountLeaseRelease:
       type: object
       description: Тело POST /games/{id}/accounts/{leaseId}/release.
@@ -7934,19 +8312,23 @@ components:
       - image
       - video
       description: Тип рекламного носителя — image (картинка) или video.
-      x-csharp: src/ClubShell.Contracts/Ipc/IpcMessage.cs:1203
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Ipc/IpcMessage.cs:1209
     AdminApiKeyResponse:
       type: object
-      description: Новый ключ API клуба; прежний перестаёт действовать сразу.
+      description: 'Ключ API клуба: текущий (`GET /admin/club/api-key`) или новый после замены (`POST`; прежний перестаёт
+        действовать сразу). Только владельцу.'
       required:
       - apiKey
       properties:
         apiKey:
           type: string
+          x-sensitive: true
           description: Ключ `ck_<32 hex>`.
       x-source:
-      - apps/admin/src/api.ts:519
-      - tools/MockServer/src/routes/club.ts:343
+      - apps/admin/src/api.ts:597
+      - apps/admin/src/api.ts:598
+      - tools/MockServer/src/routes/club.ts:375
     AdminAuditAction:
       type: string
       enum:
@@ -7962,9 +8344,17 @@ components:
       - stockReceive
       - stockEdit
       - pcCommand
-      description: Действие персонала в журнале. pcCommand — команда ПК с кассы и перевод тикета ремонта (`meta.kind = repair`).
+      - clientPassword
+      - clientCard
+      description: Действие персонала в журнале. pcCommand — команда ПК с кассы и перевод тикета ремонта (`meta.kind = repair`);
+        clientPassword — кассир задал клиенту новый пароль; clientCard — привязал или отвязал карту (`meta.cardId`).
+      x-enum-added:
+        clientPassword: 'club-shell feat/shell-changes (SHELL_CHANGES п. 18): касса этой ветки подписывает значение (ControlPage.tsx:40);
+          старая касса показывает пустую подпись действия.'
+        clientCard: 'club-shell feat/shell-changes (SHELL_CHANGES п. 18): касса этой ветки подписывает значение (ControlPage.tsx:41);
+          старая касса показывает пустую подпись действия.'
       x-source:
-      - apps/admin/src/api.ts:306
+      - apps/admin/src/api.ts:347
       - tools/MockServer/src/club.ts:177
     AdminAuditEntry:
       type: object
@@ -8253,7 +8643,6 @@ components:
       - blacklisted
       - phone
       - birthYear
-      - telegram
       - spent
       - visits
       - level
@@ -8302,8 +8691,18 @@ components:
           description: Год рождения (для ограничений несовершеннолетних); null — неизвестен.
         telegram:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: Telegram клиента. Запрещено — сервер не хранит, всегда `""`.
+          description: Telegram клиента. Запрещено — сервер не хранит и не отдаёт; касса club-shell `feat/shell-changes` поле
+            не читает (SHELL_CHANGES п. 17). Свойство оставлено как `deprecated` до `/api/v2`.
+        cardId:
+          type:
+          - string
+          - 'null'
+          maxLength: 64
+          description: 'Номер клубной карты для входа на ПК (`POST /auth/login`, `kind = card`); null — карты нет. Уникален
+            без учёта регистра. Задаётся при регистрации или `POST /admin/clients/{id}/card`. Касса club-shell `feat/shell-changes`
+            (SHELL_CHANGES п. 18) объявляет `cardId?: string | null`: старый сервер поле не отдаёт.'
         spent:
           type: integer
           format: int64
@@ -8322,12 +8721,31 @@ components:
           type: string
           description: Название уровня.
       x-source:
-      - apps/admin/src/api.ts:425
-      - tools/MockServer/src/routes/club.ts:79
+      - apps/admin/src/api.ts:498
+      - tools/MockServer/src/routes/club.ts:86
       - tools/MockServer/src/club.ts:71
+    AdminClientCardRequest:
+      type: object
+      description: 'Тело `POST /admin/clients/{id}/card`: привязать клубную карту к клиенту или отвязать её.'
+      required:
+      - cardId
+      properties:
+        cardId:
+          type:
+          - string
+          - 'null'
+          maxLength: 64
+          description: Номер карты; пробелы по краям обрезаются. null или пустая строка — отвязать карту. Уже у другого клиента
+            (без учёта регистра) — `400 validation`, `field = cardId`, `reason = taken`.
+      x-source:
+      - apps/admin/src/api.ts:619
+      - tools/MockServer/src/routes/club.ts:117
+      - tools/MockServer/src/routes/club.ts:535
     AdminClientCreateRequest:
       type: object
-      description: Регистрация клиента на кассе (роль member, нулевой баланс).
+      description: Регистрация клиента на кассе (роль member, нулевой баланс). Касса club-shell `feat/shell-changes` (SHELL_CHANGES
+        п. 18) всегда шлёт `password` — введённый кассиром или сгенерированный временный, который касса показывает один раз,
+        — и при необходимости `cardId`.
       required:
       - displayName
       - username
@@ -8363,16 +8781,31 @@ components:
         telegram:
           type: string
           maxLength: 64
+          deprecated: true
           x-prohibited: telegram
-          description: Telegram клиента. Запрещено — сервер принимает и игнорирует.
+          description: Telegram клиента. Запрещено — сервер принимает и игнорирует; касса club-shell `feat/shell-changes`
+            не шлёт.
         password:
           type: string
+          minLength: 4
           maxLength: 64
-          description: Пароль входа на ПК. Касса не шлёт; мок принимает и по умолчанию ставит `demo`. Как клиент, созданный
-            на кассе, получает учётные данные, — открытый вопрос.
+          x-sensitive: true
+          description: Пароль входа на ПК (`POST /auth/login`, `kind = password`). Короче 4 символов — `400 validation`, `field
+            = password`, `reason = min`. Нет поля — сервер ставит случайный пароль, которого никто не знает (выдать его можно
+            только сбросом `POST /admin/clients/{id}/password`); прежнего пароля по умолчанию `demo` больше нет.
+        cardId:
+          type:
+          - string
+          - 'null'
+          maxLength: 64
+          description: Номер клубной карты для входа на ПК; пробелы по краям обрезаются, пусто или null — без карты. Уже привязан
+            к другому клиенту (без учёта регистра) — `400 validation`, `field = cardId`, `reason = taken`.
       x-source:
-      - apps/admin/src/api.ts:530
-      - tools/MockServer/src/routes/club.ts:413
+      - apps/admin/src/api.ts:608
+      - apps/admin/src/pages/ClientsPage.tsx:359
+      - tools/MockServer/src/routes/club.ts:447
+      - tools/MockServer/src/routes/club.ts:110
+      - tools/MockServer/src/routes/club.ts:117
     AdminClientGroup:
       type: object
       description: Группа клиентов со скидкой.
@@ -8414,6 +8847,23 @@ components:
       x-source:
       - apps/admin/src/api.ts:529
       - tools/MockServer/src/routes/club.ts:397
+    AdminClientPasswordRequest:
+      type: object
+      description: 'Тело `POST /admin/clients/{id}/password`: новый пароль входа клиента. Касса генерирует временный пароль
+        и показывает его кассиру один раз (SHELL_CHANGES п. 18).'
+      required:
+      - password
+      properties:
+        password:
+          type: string
+          minLength: 4
+          maxLength: 64
+          x-sensitive: true
+          description: Новый пароль (4–64 символа; короче — `400 validation`, `reason = min`; нет — `reason = required`).
+      x-source:
+      - apps/admin/src/api.ts:617
+      - tools/MockServer/src/routes/club.ts:110
+      - tools/MockServer/src/routes/club.ts:524
     AdminClientResponse:
       type: object
       description: Карточка клиента после изменения.
@@ -8459,8 +8909,10 @@ components:
           - string
           - 'null'
           maxLength: 64
+          deprecated: true
           x-prohibited: telegram
-          description: Telegram клиента. Запрещено — сервер принимает и игнорирует.
+          description: Telegram клиента. Запрещено — сервер принимает и игнорирует; касса club-shell `feat/shell-changes`
+            не шлёт.
         birthYear:
           type:
           - integer
@@ -8475,9 +8927,9 @@ components:
           - owner
           description: Чёрный список (только владелец).
       x-source:
-      - apps/admin/src/api.ts:538
+      - apps/admin/src/api.ts:621
       - apps/admin/src/pages/ClientsPage.tsx:120
-      - tools/MockServer/src/routes/club.ts:449
+      - tools/MockServer/src/routes/club.ts:485
     AdminClubEvent:
       type: string
       enum:
@@ -8498,8 +8950,9 @@ components:
       - tools/MockServer/src/club.ts:165
     AdminClubSettings:
       type: object
-      description: Документ настроек клуба, который редактирует владелец. Читать может любой сотрудник (кассе нужны группы
-        клиентов), менять — владелец (`PATCH /admin/club`). Деньги — тийины.
+      description: 'Документ настроек клуба, который редактирует владелец. Читать может любой сотрудник (кассе нужны группы
+        клиентов), менять — владелец (`PATCH /admin/club`). Деньги — тийины. Секретов в документе нет: ключ API клуба владелец
+        читает отдельно, `GET /admin/club/api-key`.'
       required:
       - branding
       - features
@@ -8519,7 +8972,6 @@ components:
       - notifications
       - webhooks
       - control
-      - apiKey
       - events
       properties:
         branding:
@@ -8579,14 +9031,16 @@ components:
         apiKey:
           type: string
           readOnly: true
-          description: 'Ключ API клуба `ck_<32 hex>` для интеграций: принимается как токен владельца (`Authorization: Bearer
-            ck_…`) на `/admin/*`. Меняется только `POST /admin/club/api-key`. Отдаётся любому сотруднику, как в моке (см.
-            `x-open-question`).'
-          x-open-question: '`GET /admin/club` доступен любому сотруднику (tools/MockServer/src/routes/club.ts:250 `requireStaff(req)`),
-            а мок кладёт в ответ `apiKey: c.apiKey` (routes/club.ts:271). Ключ действует как токен владельца, то есть кассир
-            может повысить себя до владельца. Предложение: кассиру отдавать `""` (касса показывает ключ только на странице
-            «Интеграции», которая ownerOnly — apps/admin/src/App.tsx:138, pages/IntegrationsPage.tsx:88). Норма контракта
-            не меняется до решения владельца.'
+          deprecated: true
+          x-sensitive: true
+          description: 'Ключ API клуба `ck_<32 hex>` (действует как токен владельца на `/admin/*`). Сервер его здесь **не
+            отдаёт** (SHELL_CHANGES п. 16): документ читает любой сотрудник, а ключ повышал бы кассира до владельца. Владелец
+            читает ключ через `GET /admin/club/api-key`. Касса club-shell `feat/shell-changes` берёт ключ оттуда, а это поле
+            читает только как запасной вариант от старого сервера (`apiKey?: string`). Свойство оставлено как `deprecated`
+            до `/api/v2`.'
+          x-source:
+          - apps/admin/src/api.ts:333
+          - apps/admin/src/pages/IntegrationsPage.tsx:93
         events:
           type: array
           readOnly: true
@@ -8594,9 +9048,9 @@ components:
             $ref: '#/components/schemas/AdminClubEvent'
           description: Справочник всех событий клуба (для выбора подписок вебхука).
       x-source:
-      - apps/admin/src/api.ts:269
+      - apps/admin/src/api.ts:313
       - tools/MockServer/src/club.ts:232
-      - tools/MockServer/src/routes/club.ts:249
+      - tools/MockServer/src/routes/club.ts:289
     AdminClubSettingsPatch:
       type: object
       description: 'Частичное изменение документа настроек: каждый присутствующий ключ верхнего уровня целиком заменяет сохранённый
@@ -9573,73 +10027,77 @@ components:
       - tools/MockServer/src/routes/admin.ts:69
     AdminNotifications:
       type: object
-      description: 'Уведомления владельцу. В моке — Telegram-бот; Telegram в продукте запрещён, поэтому `telegramBotToken`,
-        `telegramChatId` и `events` сервер не хранит и не использует: на входе игнорирует, в ответе отдаёт `""` и все ключи
-        `events` = false (касса объявляет поля обязательными). Работает только `bigTopupAt`.'
+      description: 'Уведомления владельцу: только порог `bigTopupAt`. Telegram в продукте запрещён: `telegramBotToken`, `telegramChatId`
+        и `events` сервер не хранит, не использует и не отдаёт. Касса club-shell `feat/shell-changes` (SHELL_CHANGES п. 17)
+        объявляет `notifications?: { bigTopupAt: number }` и Telegram-полей не читает; поля оставлены в схеме как `deprecated`
+        до `/api/v2` (правило совместимости). Мок с этой ветки отдаёт только `bigTopupAt` (документ клуба v4 удаляет сохранённые
+        настройки Telegram).'
       required:
-      - telegramBotToken
-      - telegramChatId
-      - events
       - bigTopupAt
       properties:
         telegramBotToken:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: 'Токен Telegram-бота. Запрещено: всегда `""`. (Мок хранит, в GET отдаёт `••••`, а `••••` в PATCH сохраняет
-            прежний токен.)'
+          description: Токен Telegram-бота. Запрещено — сервер не отдаёт.
         telegramChatId:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: Chat id Telegram. Запрещено — всегда `""`.
+          description: Chat id Telegram. Запрещено — сервер не отдаёт.
         events:
           type: object
+          deprecated: true
           propertyNames:
             $ref: '#/components/schemas/AdminClubEvent'
           additionalProperties:
             type: boolean
           x-prohibited: telegram
-          description: Какие события слать в Telegram, ключи — `AdminClubEvent` (в моке гейтят только отправку в Telegram;
-            вебхуки подписываются своими `events`). Запрещено — сервер отдаёт все ключи = false.
+          description: Какие события слать в Telegram (прежний мок). Запрещено — сервер не отдаёт; вебхуки подписываются своими
+            `events`.
         bigTopupAt:
           type: integer
           format: int64
           minimum: 0
           description: Порог «крупного пополнения», тийины (событие `bigTopup` и флаг контроля `bigCash`).
       x-source:
-      - apps/admin/src/api.ts:285
-      - tools/MockServer/src/club.ts:256
-      - tools/MockServer/src/club.ts:561
-      - tools/MockServer/src/routes/club.ts:268
-      - tools/MockServer/src/routes/club.ts:323
+      - apps/admin/src/api.ts:330
+      - tools/MockServer/src/club.ts:394
+      - tools/MockServer/src/routes/club.ts:289
     AdminNotificationsInput:
       type: object
-      description: '`notifications` в теле `PATCH /admin/club`. Все поля необязательны. Telegram-поля сервер игнорирует (Telegram
-        запрещён); отсутствующий или нечисловой `bigTopupAt` оставляет прежнее значение. Касса шлёт объект целиком, как `AdminNotifications`.'
+      description: '`notifications` в теле `PATCH /admin/club`. Все поля необязательны. Касса club-shell `feat/shell-changes`
+        шлёт `{ bigTopupAt }`; Telegram-поля (их шлёт старая касса) сервер принимает и игнорирует (Telegram запрещён); отсутствующий
+        или нечисловой `bigTopupAt` оставляет прежнее значение.'
       properties:
         telegramBotToken:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: Игнорируется. (Мок сохраняет; `••••` — оставить прежний токен.)
+          description: Игнорируется.
         telegramChatId:
           type: string
+          deprecated: true
           x-prohibited: telegram
           description: Игнорируется.
         events:
           type: object
+          deprecated: true
           propertyNames:
             $ref: '#/components/schemas/AdminClubEvent'
           additionalProperties:
             type: boolean
           x-prohibited: telegram
-          description: Игнорируется. (Мок сливает с сохранёнными ключами.)
+          description: Игнорируется.
         bigTopupAt:
           type: integer
           format: int64
           minimum: 0
           description: Новый порог «крупного пополнения», тийины; отсутствует — прежний. Мок знак не проверяет.
       x-source:
-      - apps/admin/src/api.ts:285
-      - tools/MockServer/src/routes/club.ts:323
+      - apps/admin/src/api.ts:330
+      - apps/admin/src/pages/IntegrationsPage.tsx:245
+      - tools/MockServer/src/routes/club.ts:316
     AdminOccupancy:
       type: object
       description: Загрузка зала.
@@ -11409,17 +11867,21 @@ components:
       description: "Серверные переопределения конфигурации ПК: ответ GET /agents/{pcId}/config (SERVER_API §4.1) и поле\n\
         config в ответе POST /agents/register (агент его не применяет, только сохраняет pcId).\nКогда агент запрашивает: после\
         \ первого heartbeat, при каждой смене HeartbeatResponse.configVersion и по\nкоманде refreshConfig; If-None-Match для\
-        \ config не шлёт (всегда ждёт 200). Переопределения агент держит\nтолько в памяти (SettingsLoader.cs:287, на диск\
-        \ не пишет): после перезапуска до первого heartbeat\n(session.heartbeatSec) действует чистый agent.json, и службы,\
-        \ читающие настройку только при старте\n(например, GamesShareMounter), серверного значения не видят.\nКак применяет\
-        \ (SettingsLoader.ApplyServerOverrides → SettingsJson.FromServerConfig):\n1) из pcName, zone, session, offline, games,\
-        \ storage, telemetry, remoteAdmin, updates и wsUrl (→ server.wsUrl)\n   строится оверлей agent.json; разделы-JsonElement\
-        \ берутся, только если это JSON-объект;\n2) глубокое слияние поверх agent.json: объекты сливаются рекурсивно, массивы/скаляры/null\
-        \ заменяют,\n   ключи сравниваются без учёта регистра; незнакомые ключи игнорируются;\n3) результат читается как AgentSettings\
-        \ (AppSettings.cs) и валидируется (диапазоны, обязательные строки,\n   URL). Любая ошибка типа/диапазона отвергает\
-        \ ВЕСЬ оверлей (остаётся прежний снимок), и блок shell тогда\n   тоже не применяется;\n4) блок shell пишется в shell.json\
-        \ (см. ShellConfigOverride).\nПоля number и themes агент сейчас не использует; секреты (пароли шары и т.п.) в конфиге\
-        \ не передаются."
+        \ config не шлёт (всегда ждёт 200). Агент с club-shell\nfeat/shell-changes (SHELL_CHANGES п. 8) сохраняет последний\
+        \ применённый конфиг целиком в\n<paths.cache>/server-config.json и применяет его при старте службы, до первого heartbeat\n\
+        (SettingsLoader.cs:504): серверные настройки (storage.gamesShare, флаги фич, wsUrl и прочие) действуют с\nзагрузки.\
+        \ Старые агенты держали переопределения только в памяти: до первого heartbeat действовал чистый\nagent.json.\nКак\
+        \ применяет (CommandReceiver.RefreshServerConfigAsync → SettingsLoader.ApplyServerOverrides →\nSettingsJson.FromServerConfig):\n\
+        1) блок shell пишется в shell.json (см. ShellConfigOverride) — первым и отдельно от оверлея agent.json;\n2) из pcName,\
+        \ zone, session, offline, games, storage, telemetry, remoteAdmin, anticheat, updates и wsUrl\n   (→ server.wsUrl)\
+        \ строится оверлей agent.json; разделы-JsonElement берутся, только если это JSON-объект;\n3) глубокое слияние поверх\
+        \ agent.json: объекты сливаются рекурсивно, массивы/скаляры/null заменяют,\n   ключи сравниваются без учёта регистра;\
+        \ незнакомые ключи игнорируются;\n4) результат читается как AgentSettings (AppSettings.cs) и валидируется (диапазоны,\
+        \ обязательные строки,\n   URL). Любая ошибка типа/диапазона отвергает ВЕСЬ оверлей agent.json (остаётся прежний снимок)\
+        \ и не пишется\n   в кэш.\nУмолчания агента club-shell feat/shell-changes для функций, которым нужны эндпоинты сервера,\
+        \ выключены до\nвключения сервером (SHELL_CHANGES п. 4, 5, 12): games.accountPool.enabled, games.cloudSave.enabled\
+        \ и\nremoteAdmin.allowRemoteInput — false; флаги features — см. ShellConfigOverride.features.\nПоля number и themes\
+        \ агент сейчас не использует; секреты (пароли шары и т.п.) в конфиге не передаются."
       required:
       - version
       - pcName
@@ -11444,7 +11906,7 @@ components:
         session:
           description: 'Частичный agent.json → session (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
             прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — SessionSettings.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:361
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:379
           x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:354
           properties:
             warningMinutes:
@@ -11486,7 +11948,7 @@ components:
         offline:
           description: 'Частичный agent.json → offline (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
             прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — OfflineSettings.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:362
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:380
           x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:377
           properties:
             enabled:
@@ -11526,8 +11988,10 @@ components:
         games:
           description: 'Частичный agent.json → games (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
             прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — GamesSettings. accountPool.enabled=false
-            и cloudSave.enabled=false отключают вызовы /games/{id}/accounts/* (лиз аккаунтов и выгрузка сейвов).'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:363
+            и cloudSave.enabled=false отключают вызовы /games/{id}/accounts/* (лиз аккаунтов и выгрузка сейвов). У агента
+            с club-shell feat/shell-changes оба по умолчанию false (SHELL_CHANGES п. 5; у старых агентов true): сервер включает
+            их, только когда реализует /games/{id}/accounts/*.'
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:381
           x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:403
           x-source:
           - src/ClubShell.Agent/Games/GameLaunchService.cs:204
@@ -11563,44 +12027,60 @@ components:
             accountPool:
               type: object
               description: Пул аккаунтов (AccountPoolSettings).
-              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:434
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:438
               properties:
                 enabled:
                   type: boolean
-                  description: Использовать пул; false — игры с requiresAccount не запускаются, лиз не запрашивается.
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:437
+                  default: false
+                  description: Использовать пул; false — игры с requiresAccount не запускаются, лиз не запрашивается. По умолчанию
+                    false (club-shell feat/shell-changes; у старых агентов true).
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:441
                 leaseTtlSec:
                   type: integer
                   format: int32
                   minimum: 60
                   maximum: 604800
                   description: TTL лиза, с.
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:441
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:445
                 releaseOnExit:
                   type: boolean
                   description: Освобождать лиз при выходе из игры.
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:444
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:448
+                allowPasswordOnCommandLine:
+                  type: boolean
+                  default: false
+                  x-prohibited-note: пароль аккаунта в командной строке лаунчера в продукте запрещён (README, правило 5)
+                  description: 'Крайняя мера: класть пароль арендованного аккаунта в командную строку лаунчера (Steam -login,
+                    Epic -AUTH_PASSWORD), если в аренде нет файлов сессии (extra.files) или exchange-кода Epic. Пароль видит
+                    любой процесс сессии игрока, поэтому по умолчанию false, а каждое использование агент пишет в лог как
+                    предупреждение. Сервер v1 не включает. Club-shell feat/shell-changes (SHELL_CHANGES п. 11); старые агенты
+                    ключ не знают и клали пароль в командную строку всегда.'
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:455
+                  x-source:
+                  - src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:144
             cloudSave:
               type: object
               description: Облачные сохранения (CloudSaveSettings).
-              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:448
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:459
               properties:
                 enabled:
                   type: boolean
-                  description: Облачные сохранения включены.
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:451
+                  default: false
+                  description: Облачные сохранения включены. По умолчанию false (club-shell feat/shell-changes; у старых агентов
+                    true).
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:462
                 root:
                   type: string
                   minLength: 1
                   description: Локальный каталог бандлов (относительно ProgramData).
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:455
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:466
                 maxMb:
                   type: integer
                   format: int32
                   minimum: 1
                   maximum: 100000
                   description: Максимальный размер бандла, МБ.
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:459
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:470
             launchers:
               type: object
               description: Клиенты лаунчеров (LaunchersSettings). Значение — LauncherSettings { exePath } (AppSettings.cs:463,
@@ -11680,121 +12160,95 @@ components:
                       description: Путь к исполняемому файлу лаунчера.
                       x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:467
         storage:
-          description: 'Частичный agent.json → storage (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
-
-            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — StorageSettings →
-
-            GamesShareSettings → IscsiSettings из AppSettings.cs.
-
-            Как агент применяет (GamesShareMounter): включить или выключить шару с сервера нельзя. Серверные
-
-            переопределения живут только в памяти (SettingsLoader.cs:287, на диск не пишутся) и после рестарта
-
-            приходят не раньше первого heartbeat, а GamesShareMounter.StartAsync проверяет enabled один раз при
-
-            старте хоста по локальному agent.json и на смену настроек не подписан. Поэтому серверный
-
-            gamesShare.enabled=true монтирование не включит, а enabled=false не остановит уже запущенный цикл.
-
-            Если в локальном agent.json enabled=true, с сервера реально действуют uncPath, driveLetter,
-
-            credentialsRef и iscsi: они читаются заново при каждой попытке монтирования (GamesShareMounter.cs:129;
-
-            цикл повторяет её каждые 30 с при успехе и с backoff до 2 мин при неудаче). mountRetries агент берёт один
-
-            раз при запуске цикла, поэтому серверное значение тоже фактически не действует.
-
-            Учётные данные шары с сервера не передаются: credentialsRef — путь к локальному DPAPI-файлу
-
-            { username, password } на ПК. Мок шлёт storage: null.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:364
-          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:505
+          description: "Частичный agent.json → storage (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,\n\
+            прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — StorageSettings →\nGamesShareSettings\
+            \ из AppSettings.cs.\nКак применяет агент с club-shell feat/shell-changes (GamesShareMounter, SHELL_CHANGES п.\
+            \ 7-9):\n- установлен ClubDisklessHelper (club-shell docs/DISKLESS.md) — том библиотеки ведёт он, агент\n  storage.gamesShare\
+            \ не применяет (heartbeat gamesVolume.owner = disklessHelper);\n- иначе агент подписан на смену настроек: enabled,\
+            \ uncPath, driveLetter, credentialsRef и mountRetries с\n  сервера действуют сразу, без перезапуска службы. При\
+            \ смене uncPath или driveLetter старая буква\n  отключается немедленно, даже если с тома запущена игра, поэтому\
+            \ новые пути публиковать между сессиями;\n- исправное подключение только проверяется (каждые 30 с), а не переподключается;\
+            \ остановка, перезапуск и\n  обновление службы диск не отключают;\n- iscsi != null — агент ничего не монтирует\
+            \ (fail closed) и пишет ошибку в лог: игровой том по iSCSI\n  (только чтение) — работа ClubDisklessHelper;\n-\
+            \ серверный конфиг кэшируется на диске и применяется с загрузки (см. описание AgentServerConfig).\nУчётные данные\
+            \ шары с сервера не передаются: credentialsRef — путь к локальному DPAPI-файлу\n{ username, password } на ПК.\
+            \ Мок шлёт storage: null. Старые агенты: enabled читался один раз при старте\nслужбы, iscsi монтировался, при\
+            \ остановке службы диск отключался."
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:382
+          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:531
           x-source:
           - src/ClubShell.Core/Configuration/SettingsLoader.cs:180
-          - src/ClubShell.Core/Configuration/SettingsLoader.cs:287
-          - src/ClubShell.Core/Configuration/SettingsLoader.cs:402
-          - src/ClubShell.Agent/DependencyInjection.cs:327
-          - src/ClubShell.Agent/DependencyInjection.cs:330
-          - src/ClubShell.Agent/Server/Heartbeat.cs:132
-          - src/ClubShell.Agent/Server/CommandReceiver.cs:527
-          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:78
-          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:87
+          - src/ClubShell.Core/Configuration/SettingsLoader.cs:504
+          - src/ClubShell.Core/Configuration/SettingsLoader.cs:540
+          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:105
           - src/ClubShell.Agent/Storage/GamesShareMounter.cs:129
-          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:219
-          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:247
-          x-open-question: 'Управлять сетевым хранилищем с сервера сейчас нельзя: storage.gamesShare.enabled и mountRetries
-            из AgentServerConfig агент фактически игнорирует (GamesShareMounter.cs:87 проверяет enabled один раз в StartAsync,
-            до первого heartbeat и GET config; :219 читает mountRetries один раз). Если серверное управление шарой нужно,
-            агенту требуется подписка на смену настроек (IOptionsMonitor.OnChange) или сохранение серверных переопределений
-            на диск.'
+          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:137
+          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:220
+          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:442
           properties:
             gamesShare:
               type: object
-              description: Сетевое хранилище игр — SMB-шара или iSCSI-таргет (storage.gamesShare).
-              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:513
+              description: Сетевое хранилище игр — SMB-шара (storage.gamesShare).
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:539
               properties:
                 enabled:
                   type: boolean
-                  description: 'Монтировать хранилище при старте службы. Действует только значение из локального agent.json:
-                    агент читает флаг один раз в StartAsync, до получения серверного конфига, поэтому монтирование серверное
-                    значение не включает и не выключает (см. описание storage). Побочный эффект серверного false: при остановке
-                    службы UnmountAsync не отключит диск (GamesShareMounter.cs:341).'
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:516
+                  description: Подключать SMB-шару. С сервера включается и выключается сразу (агент подписан на смену настроек).
+                    Старые агенты читали флаг один раз при старте службы, до серверного конфига.
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:542
                   x-source:
-                  - src/ClubShell.Agent/Storage/GamesShareMounter.cs:87
-                  - src/ClubShell.Agent/Storage/GamesShareMounter.cs:341
+                  - src/ClubShell.Agent/Storage/GamesShareMounter.cs:442
                 uncPath:
                   type: string
-                  description: UNC-путь SMB-шары, напр. \\nas01\games (в JSON обратные слэши экранируются). Не используется
-                    при iscsi != null.
+                  description: UNC-путь SMB-шары, напр. \\nas01\games (в JSON обратные слэши экранируются).
                   examples:
                   - \\nas01\games
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:519
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:545
                 driveLetter:
                   type: string
                   minLength: 1
                   maxLength: 1
                   description: Буква диска (один символ, A–Z; по умолчанию G).
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:523
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:549
                 credentialsRef:
                   type: string
-                  description: Путь (относительно ProgramData) к DPAPI-файлу { username, password } на ПК; для iSCSI те же
-                    данные идут как CHAP. Пусто — без учётных данных. Обычно не переопределять.
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:526
+                  description: Путь (относительно ProgramData) к DPAPI-файлу { username, password } на ПК. Пусто — без учётных
+                    данных. Обычно не переопределять.
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:552
                 mountRetries:
                   type: integer
                   format: int32
                   minimum: 1
                   maximum: 20
                   description: 'Порог неудачных попыток подряд, после которого агент пишет ошибку в лог. Это не лимит: цикл
-                    монтирования повторяет попытки бесконечно (backoff 5 с → 2 мин). Значение читается один раз при запуске
-                    цикла, поэтому серверное значение фактически не действует. Вне диапазона 1–20 весь оверлей отвергается.'
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:530
+                    монтирования повторяет попытки бесконечно (backoff 5 с → 2 мин). Вне диапазона 1–20 весь оверлей отвергается.'
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:556
                   x-source:
-                  - src/ClubShell.Agent/Storage/GamesShareMounter.cs:219
-                  - src/ClubShell.Agent/Storage/GamesShareMounter.cs:247
+                  - src/ClubShell.Agent/Storage/GamesShareMounter.cs:288
                 iscsi:
                   type:
                   - object
                   - 'null'
-                  description: iSCSI-таргет вместо SMB; null — использовать SMB (null в оверлее заменяет значение).
-                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:537
+                  description: 'Устаревший слот iSCSI. Агент с club-shell feat/shell-changes iSCSI не монтирует: любое значение,
+                    кроме null, — агент не подключает ничего (fail closed) и пишет ошибку; игровой том по iSCSI ведёт ClubDisklessHelper.
+                    Ключ разбирается, чтобы старые файлы проходили валидацию. null — SMB.'
+                  x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:563
                   properties:
                     portal:
                       type: string
                       minLength: 1
-                      description: Портал host[:port] (порт по умолчанию 3260).
-                      x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:541
+                      description: Портал host[:port]; агент только пишет его в лог.
+                      x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:570
                     targetIqn:
                       type: string
                       minLength: 1
-                      description: IQN таргета.
-                      x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:545
+                      description: IQN таргета; агент только пишет его в лог.
+                      x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:573
                     readOnly:
                       type: boolean
-                      description: Перед использованием пометить диски таргета только для чтения — обязательно для LUN, который
-                        монтируют несколько ПК одновременно.
-                      x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:552
+                      deprecated: true
+                      description: Не читается агентом с club-shell feat/shell-changes (ключ пропускается). У старых агентов
+                        — пометить диски таргета только для чтения после логина.
         updates:
           oneOf:
           - $ref: '#/components/schemas/UpdatesConfigOverride'
@@ -11803,7 +12257,7 @@ components:
         telemetry:
           description: 'Частичный agent.json → telemetry (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
             прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — TelemetrySettings.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:366
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:384
           x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:597
           properties:
             enabled:
@@ -11834,35 +12288,76 @@ components:
         remoteAdmin:
           description: 'Частичный agent.json → remoteAdmin (C#: JsonElement? — любое JSON-значение; в оверлей идёт только
             объект, прочее, включая null, игнорируется, SettingsLoader.cs:198). Рекомендуемая форма — RemoteAdminSettings.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:367
-          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:640
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:385
+          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:664
           properties:
             allowScreenCapture:
               type: boolean
               description: Разрешить скриншоты.
-              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:643
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:667
             allowRemoteInput:
               type: boolean
-              description: Разрешить удалённый ввод.
-              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:646
+              default: false
+              description: Разрешить удалённый ввод. По умолчанию false (club-shell feat/shell-changes, SHELL_CHANGES п. 12;
+                у старых агентов true). Даже при true агент отбрасывает ввод, пока запущена отслеживаемая им игра с античитом
+                (Game.antiCheat != none), — синтетический ввод под Vanguard/FACEIT/EAC грозит флагом.
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:670
+              x-source:
+              - src/ClubShell.Agent/Remote/RemoteInput.cs:81
+              - src/ClubShell.Agent/Remote/RemoteInput.cs:372
             captureFps:
               type: integer
               format: int32
               minimum: 1
               maximum: 60
               description: Частота кадров захвата.
-              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:650
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:674
             captureQuality:
               type: integer
               format: int32
               minimum: 1
               maximum: 100
               description: Качество JPEG.
-              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:654
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:678
             showIndicator:
               type: boolean
               description: Показывать индикатор удалённого управления.
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:681
+        anticheat:
+          description: 'Частичный agent.json → anticheat (C#: JsonElement? — любое JSON-значение; в оверлей идёт только объект,
+            прочее, включая null, игнорируется, SettingsLoader.cs:183). Сливается так же, как telemetry и remoteAdmin, например
+            { "reportViolations": false }. Club-shell feat/shell-changes (SHELL_CHANGES п. 4); старые агенты поле не знают.
+            Неверный тип или диапазон отвергает весь оверлей agent.json.'
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:389
+          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:640
+          properties:
+            checkIntervalSec:
+              type: integer
+              format: int32
+              minimum: 5
+              maximum: 86400
+              description: Интервал проверок античит-монитора, с.
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:644
+            requireSecureBoot:
+              type: boolean
+              description: Требовать UEFI Secure Boot.
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:647
+            requireTpm:
+              type: boolean
+              description: Требовать TPM.
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:650
+            requireHvci:
+              type: boolean
+              description: Требовать HVCI (иначе hvciOff — только запись в лог, не нарушение).
               x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:657
+            reportViolations:
+              type: boolean
+              default: true
+              description: Отправлять находки POST /anticheat/report. false — только WS-событие anticheatViolation и лог;
+                так сервер выключает вызов, пока операция notImplemented.
+              x-csharp: src/ClubShell.Core/Configuration/AppSettings.cs:660
+              x-source:
+              - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:354
         shell:
           oneOf:
           - $ref: '#/components/schemas/ShellConfigOverride'
@@ -11887,10 +12382,13 @@ components:
           x-source:
           - src/ClubShell.Core/Configuration/AppSettings.cs:744
           - src/ClubShell.Core/Configuration/SettingsLoader.cs:188
-      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:356
+      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:374
       x-source:
       - src/ClubShell.Core/Configuration/SettingsLoader.cs:102
       - src/ClubShell.Core/Configuration/SettingsLoader.cs:163
+      - src/ClubShell.Core/Configuration/SettingsLoader.cs:284
+      - src/ClubShell.Core/Configuration/SettingsLoader.cs:401
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:539
       - src/ClubShell.Core/Configuration/SettingsLoader.cs:389
       - src/ClubShell.Core/Configuration/SettingsLoader.cs:513
       - src/ClubShell.Core/Configuration/AppSettings.cs:733
@@ -11906,6 +12404,7 @@ components:
       - deny
       description: 'Семантика ProcessAllowlistPolicy.patterns — allow: запускаться могут только совпавшие процессы; deny:
         совпавшие убиваются.'
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:68
     AntiCheatAction:
       type: string
@@ -11990,8 +12489,13 @@ components:
       - faceit
       - ricochet
       description: 'Античит, от которого зависит игра: none — нет, eac — Easy Anti-Cheat, battlEye — BattlEye, vanguard —
-        Riot Vanguard (драйвер ядра, нужны Secure Boot/TPM), faceit — клиент FACEIT, ricochet — Activision Ricochet.'
-      x-csharp: src/ClubShell.Contracts/Games/LauncherType.cs:35
+        Riot Vanguard (драйвер ядра, нужны Secure Boot/TPM), faceit — клиент FACEIT, ricochet — Activision Ricochet. Игру
+        с launcher = riot и antiCheat = none агент с club-shell feat/shell-changes считает vanguard (SHELL_CHANGES п. 14):
+        проверяет Vanguard перед запуском и пишет vanguard в LaunchReport.antiCheat.kind.'
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Games/LauncherType.cs:38
+      x-source:
+      - src/ClubShell.Agent/Games/GameLaunchService.cs:377
     AntiCheatPolicy:
       type: object
       description: Политика античита.
@@ -12403,7 +12907,8 @@ components:
       - expired
       description: 'Жизненный цикл брони: reserved — забронировано, ждёт подтверждения/депозита; confirmed — подтверждено;
         cancelled — отменено; expired — истекло неиспользованным.'
-      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:283
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:295
     Bracket:
       type: object
       description: Турнирная сетка.
@@ -12618,7 +13123,8 @@ components:
       - system
       - admin
       description: Вид сообщения чата — обычное сообщение пользователя, системное, от персонала клуба.
-      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:209
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:218
     ChatPostRequest:
       type: object
       description: Тело POST /chat/{roomId}/messages; отправляется с Idempotency-Key.
@@ -12826,7 +13332,9 @@ components:
       - nvme
       - network
       - unknown
-      description: Физический тип диска (unknown — не удалось определить).
+      description: Физический тип диска (unknown — не удалось определить). Незнакомую строку агент с club-shell feat/shell-changes
+        тоже читает как unknown (здесь unknown — обычное значение enum).
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Pc/HardwareInfo.cs:8
     EndSessionCommand:
       type: object
@@ -12865,11 +13373,13 @@ components:
       - internal
       - protocolError
       - versionMismatch
+      - notImplemented
       description: 'Код ошибки; один и тот же набор в REST-конверте (error.code), IPC (IpcError.code) и шелле. Сервер обязан
-        использовать только эти значения: неизвестную строку агент не распарсит, весь конверт будет отброшен, код выведется
-        из HTTP-статуса (x-from-http-status), а message и details потеряются. HTTP-статус ответа должен совпадать с x-http-status.
-        agentOffline, protocolError (для IPC-кадров) и timeout в основном порождает сам агент; «не реализовано» (501) передаётся
-        как serverUnavailable c details.reason = notImplemented.'
+        использовать только эти значения. ErrorCode остаётся строгим (x-agent-fallback нет): код, которого агент не знает,
+        выводится из HTTP-статуса (x-from-http-status); агент с club-shell feat/shell-changes сохраняет при этом message,
+        details и traceId (ServerClient.cs:645), старые агенты отбрасывают конверт целиком. HTTP-статус ответа должен совпадать
+        с x-http-status. agentOffline, protocolError (для IPC-кадров) и timeout в основном порождает сам агент; «не реализовано»
+        (501) — notImplemented.'
       x-enum-descriptions:
         unauthorized: Не аутентифицирован, неверный/истёкший токен или учётные данные (401).
         forbidden: Аутентифицирован, но нет прав (роль, привязка, возможность) (403).
@@ -12894,6 +13404,13 @@ components:
         internal: Непредвиденная ошибка; details = TraceDetails (500).
         protocolError: Нарушение формата конверта/кадра (400).
         versionMismatch: Версия протокола/приложения не поддерживается; details = VersionMismatchDetails (426).
+        notImplemented: 'Операция есть в контракте, но этот сервер её не реализует (501, ответ NotImplemented); details =
+          null или ReasonDetails (reason = notImplemented). Не повторяется: агент не ретраит 501 и не засчитывает его в circuit
+          breaker (RetryPolicy.cs:57), IsRetryable = false.'
+      x-enum-added:
+        notImplemented: 'club-shell feat/shell-changes (SHELL_CHANGES п. 1): агент, шелл (Rust/TS после ContractsGen) и касса
+          знают значение. Старый агент код не распарсит, отбросит конверт и по статусу 501 выведет serverUnavailable — то
+          же, что давал прежний временный вариант (serverUnavailable + details.reason = notImplemented).'
       x-http-status:
         unauthorized: 401
         forbidden: 403
@@ -12915,6 +13432,7 @@ components:
         internal: 500
         protocolError: 400
         versionMismatch: 426
+        notImplemented: 501
       x-from-http-status:
         description: Обратное отображение, которым агент пользуется, когда тело ответа не распарсилось как ServerErrorEnvelope
           (ErrorCodes.FromHttpStatus).
@@ -12927,6 +13445,7 @@ components:
         '409': conflict
         '426': versionMismatch
         '429': rateLimited
+        '501': notImplemented
         '504': timeout
         '>=500': serverUnavailable
         other: internal
@@ -12952,17 +13471,22 @@ components:
         versionMismatch: VersionMismatchDetails
         rateLimited: RateLimitDetails
         serverUnavailable: ReasonDetails
+        notImplemented: null | ReasonDetails (reason = notImplemented)
         internal: TraceDetails
       x-discrepancy: 'notFound: в C# у IpcError.NotFound(what) details нет (null), NameDetails создаётся только в IpcError.UnknownMessage
         для IPC (IpcErrors.cs:46-49; в ack команды на сервер не попадает: неизвестное имя команды агент подтверждает notFound
-        без details — RealtimeClient.cs:379; ветка UnknownMessage в CommandReceiver.cs:266 недостижима — switch покрывает
-        все значения ServerCommandType); мок на REST шлёт details = { what } (db.ts:76); SERVER_API.md форму details для notFound
-        не задаёт. В контракте: REST details = null или свободный объект; ни агент, ни шелл details.what не читают (агент
-        передаёт details шеллу как есть).'
+        без details — по WS RealtimeClient.cs:361, по REST-пути Heartbeat.cs:361; ветка UnknownMessage в CommandReceiver недостижима
+        — switch покрывает все значения ServerCommandType); мок на REST шлёт details = { what } (db.ts:76); SERVER_API.md
+        форму details для notFound не задаёт. В контракте: REST details = null или свободный объект; ни агент, ни шелл details.what
+        не читают (агент передаёт details шеллу как есть).'
       x-csharp: src/ClubShell.Contracts/Errors/ErrorCode.cs:14
       x-source:
-      - src/ClubShell.Contracts/Errors/ErrorCode.cs:78
-      - src/ClubShell.Core/Http/ServerClient.cs:589
+      - src/ClubShell.Contracts/Errors/ErrorCode.cs:76
+      - src/ClubShell.Contracts/Errors/ErrorCode.cs:141
+      - src/ClubShell.Contracts/Errors/ErrorCode.cs:162
+      - src/ClubShell.Core/Http/ServerClient.cs:615
+      - src/ClubShell.Core/Http/ServerClient.cs:645
+      - src/ClubShell.Core/Http/RetryPolicy.cs:57
       - docs/IPC_PROTOCOL.md:117
       - src/ClubShell.Core/Http/ServerClient.cs:314
       - src/ClubShell.Core/Http/ServerClient.cs:574
@@ -13327,6 +13851,17 @@ components:
       - tools/MockServer/src/routes/games.ts:60
       - tools/MockServer/src/db.ts:1565
       - tools/MockServer/src/routes/club.ts:129
+    GamesVolumeOwner:
+      type: string
+      enum:
+      - none
+      - agent
+      - disklessHelper
+      description: 'Кто монтирует том библиотеки игр (heartbeat gamesVolume.owner): none — никто (storage.gamesShare выключен,
+        ClubDisklessHelper не установлен, только локальные диски); agent — агент подключает SMB-шару storage.gamesShare; disklessHelper
+        — ClubDisklessHelper (iSCSI только для чтения, club-shell docs/DISKLESS.md), он сообщает о томе своему серверу. Только
+        агент -> сервер, поэтому x-agent-fallback нет.'
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:806
     GpuInfo:
       type: object
       description: Видеокарта.
@@ -13431,6 +13966,64 @@ components:
           items:
             $ref: '#/components/schemas/PeripheralInfo'
       x-csharp: src/ClubShell.Contracts/Pc/HardwareInfo.cs:123
+    HeartbeatAntiCheat:
+      type: object
+      description: Предусловия античитов в heartbeat (club-shell feat/shell-changes); null или отсутствие поля — неизвестно.
+        Сервер по ним может скрывать Riot-игры (Vanguard) на ПК, где их нельзя запустить.
+      properties:
+        vanguardInstalled:
+          type:
+          - boolean
+          - 'null'
+          description: Драйвер Riot Vanguard (служба vgk) установлен и его образ на месте.
+        vanguardLoaded:
+          type:
+          - boolean
+          - 'null'
+          description: Драйвер vgk загружен (грузится при старте ОС; после свежей установки нужна перезагрузка).
+        secureBoot:
+          type:
+          - boolean
+          - 'null'
+          description: Включён UEFI Secure Boot (проверяется на каждом heartbeat).
+        tpm:
+          type:
+          - boolean
+          - 'null'
+          description: Есть TPM (агент запоминает первый ответ WMI до перезапуска).
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:834
+      x-source:
+      - src/ClubShell.Agent/Server/Heartbeat.cs:222
+    HeartbeatGamesVolume:
+      type: object
+      description: Том библиотеки игр в heartbeat (club-shell feat/shell-changes).
+      required:
+      - owner
+      properties:
+        owner:
+          $ref: '#/components/schemas/GamesVolumeOwner'
+        mounted:
+          type:
+          - boolean
+          - 'null'
+          description: Подключён и читается. owner = none — false; owner = disklessHelper — не передаётся (агент не видит
+            монтирование помощника); owner = agent — false, пока задан storage.gamesShare.iscsi (агент iSCSI не монтирует).
+        driveLetter:
+          type:
+          - string
+          - 'null'
+          minLength: 1
+          maxLength: 1
+          description: Буква, которую подключает агент (G); только при owner = agent.
+        since:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Когда mounted последний раз менялся; null — не менялся с запуска агента.
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:823
+      x-source:
+      - src/ClubShell.Agent/Storage/GamesShareMounter.cs:164
     HeartbeatRequest:
       type: object
       description: Тело POST /agents/{pcId}/heartbeat (каждые session.heartbeatSec).
@@ -13479,13 +14072,29 @@ components:
         offlineQueue:
           type: integer
           format: int32
-          description: Размер outbox.
+          description: 'Размер outbox: события сессий (без dead-letter) плюс отложенные launch-report (OfflineSessionStore.cs:455).'
         shellConnected:
           type: boolean
           description: Жив ли канал к шеллу (named pipe).
-      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:774
+        gamesVolume:
+          oneOf:
+          - $ref: '#/components/schemas/HeartbeatGamesVolume'
+          - type: 'null'
+          description: Кто монтирует том библиотеки игр и смонтирован ли он (SHELL_CHANGES п. 9) — чтобы панель видела, у
+            кого том отвалился. Шлёт агент с club-shell feat/shell-changes; старые агенты поле не шлют. Сервер может его игнорировать.
+          x-source:
+          - src/ClubShell.Agent/Storage/GamesShareMounter.cs:164
+        antiCheat:
+          oneOf:
+          - $ref: '#/components/schemas/HeartbeatAntiCheat'
+          - type: 'null'
+          description: Предусловия античитов на ПК (SHELL_CHANGES п. 14) — чтобы сервер скрывал Riot-игры на ПК без Vanguard.
+            Шлёт агент с club-shell feat/shell-changes; старые агенты поле не шлют. Сервер может его игнорировать.
+          x-source:
+          - src/ClubShell.Agent/Server/Heartbeat.cs:222
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:790
       x-source:
-      - src/ClubShell.Agent/Server/Heartbeat.cs:163
+      - src/ClubShell.Agent/Server/Heartbeat.cs:179
     HeartbeatResponse:
       type: object
       description: 'Ответ POST /agents/{pcId}/heartbeat. Агент: policyVersion больше применённой — перечитывает политику;
@@ -13570,8 +14179,8 @@ components:
     IpcError:
       type: object
       description: Ошибка в формате IPC. На сервер приходит в CommandAck.error / WsAck.error, когда агент не смог выполнить
-        команду (например, notFound для неизвестной команды, validation при отсутствии обязательного payload, timeout для
-        просроченной/вытесненной команды, internal при исключении обработчика).
+        команду (например, notFound для неизвестной команды — по WS и по REST-пути, validation при отсутствии обязательного
+        payload, timeout для просроченной/вытесненной команды, internal при исключении обработчика).
       required:
       - code
       - message
@@ -13655,7 +14264,9 @@ components:
       x-csharp: src/ClubShell.Contracts/Ipc/IpcErrors.cs:188
     LaunchReport:
       type: object
-      description: Тело POST /games/{id}/launch-report (SERVER_API §4.6).
+      description: Тело POST /games/{id}/launch-report (SERVER_API §4.6). Агент с club-shell feat/shell-changes повторяет
+        отчёт из офлайн-очереди, если он не доставлен (см. операцию sendLaunchReport), поэтому сервер может получить один
+        и тот же отчёт (phase = launch или exit) повторно.
       required:
       - sessionId
       - userId
@@ -13703,7 +14314,18 @@ components:
           format: int32
           minimum: 0
           description: Сыграно секунд (phase = exit; мок требует >= 0).
-      x-csharp: src/ClubShell.Contracts/Games/LaunchRequest.cs:194
+        injectionError:
+          type:
+          - string
+          - 'null'
+          description: 'Только phase = launch при запуске с арендой аккаунта Steam или Epic: почему лаунчер подготовлен не
+            чисто — не удалось сбросить автологин Steam в профиле kiosk, не удалось убрать запомненный вход Epic, или в аренде
+            нет ни файлов сессии, ни exchange-кода, и лаунчер стартовал без учётных данных. Несколько причин — через "; ".
+            Нет поля — подготовка прошла чисто. Club-shell feat/shell-changes (SHELL_CHANGES п. 10); сервер может поле игнорировать.'
+          x-source:
+          - src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:41
+          - src/ClubShell.Agent/Games/GameLaunchService.cs:491
+      x-csharp: src/ClubShell.Contracts/Games/LaunchRequest.cs:198
     LaunchReportPhase:
       type: string
       enum:
@@ -13808,6 +14430,7 @@ components:
       - exe
       description: 'Лаунчер/магазин, которым запускается игра: steam (steam://rungameid/<appid>), epic (Epic Games Launcher),
         battleNet, riot (Riot Client), ea (EA app), ubisoft (Ubisoft Connect), exe (прямой исполняемый файл без лаунчера).'
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Games/LauncherType.cs:9
     LeaderboardEntry:
       type: object
@@ -13846,8 +14469,10 @@ components:
       - en
       - ru
       - uz
-      description: Язык интерфейса — английский, русский, узбекский.
-      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:30
+      description: Язык интерфейса — английский, русский, узбекский. Незнакомый язык в серверном конфиге (AgentServerConfig.shell.locale)
+        агент с club-shell feat/shell-changes игнорирует (PolicyHandlers.cs:164).
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:33
     LockCommand:
       type: object
       description: Payload команды lock (payload может быть null — тогда все поля пустые).
@@ -14111,7 +14736,8 @@ components:
       - error
       - success
       description: Важность уведомления — информация, предупреждение, ошибка, успех.
-      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:164
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:170
     OfflineQueueFlushedEvent:
       type: object
       description: Payload события offlineQueueFlushed — outbox агента выгружен после офлайна.
@@ -14353,6 +14979,7 @@ components:
       - delivering
       x-cancellable-states:
       - pending
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Shop/Order.cs:9
       x-csharp-helpers: src/ClubShell.Contracts/Shop/Order.cs:31
     OsInfo:
@@ -14480,6 +15107,7 @@ components:
       - booked
       description: 'Статус места/ПК на карте клуба: offline — агент недоступен; free — онлайн без сессии; busy — идёт сессия;
         locked — сессия заблокирована или блокировка админом; maintenance — выведен из работы; booked — забронирован.'
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Pc/PcStatus.cs:8
     PcStatusChangedPush:
       type: object
@@ -14725,6 +15353,7 @@ components:
       - time
       description: 'Категория товара: food — горячая еда; drink — напитки; snack — снеки; service — услуги (например, аренда
         гарнитуры); merch — мерч; time — пакеты времени, продаваемые через магазин.'
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Shop/Product.cs:9
     ProfileAchievementsResponse:
       type: object
@@ -14848,6 +15477,7 @@ components:
       - expired
       description: 'Состояние QR-входа: pending — ещё не отсканирован; scanned — отсканирован, ждёт подтверждения в приложении;
         confirmed — подтверждён, в QrLoginStatus.auth лежит AuthResponse (однократное чтение); expired — истёк или уже использован.'
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Users/AuthRequest.cs:29
     RateLimitDetails:
       type: object
@@ -15233,9 +15863,9 @@ components:
       x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:156
     ServerCommandEnvelope:
       type: object
-      description: Команда в очереди, как её отдаёт GET /agents/{pcId}/commands. Имя вне ServerCommandType ломает разбор всего
-        ответа у агента (JsonException -> protocolError, ни одна команда пачки не выполнится) — отдавать только известные
-        имена. После выполнения агент шлёт POST /agents/{pcId}/commands/{id}/ack с CommandAck.
+      description: 'Команда в очереди, как её отдаёт GET /agents/{pcId}/commands. После выполнения агент шлёт POST /agents/{pcId}/commands/{id}/ack
+        с CommandAck для каждого элемента пачки: неизвестное имя — ack { ok: false, error.code: notFound }, просроченная —
+        timeout, остальные выполняются (Heartbeat.cs:318-375).'
       required:
       - id
       - ts
@@ -15250,7 +15880,15 @@ components:
           format: date-time
           description: Время выдачи на сервере.
         name:
-          $ref: '#/components/schemas/ServerCommandType'
+          type: string
+          description: 'Имя команды — значение ServerCommandType. В C# строка, как WsFrame.name (club-shell feat/shell-changes,
+            SHELL_CHANGES п. 3): незнакомое имя агент подтверждает ack notFound и выполняет остальные команды пачки. Агенты
+            до feat/shell-changes разбирали name как enum ServerCommandType: незнакомое имя роняло разбор всей пачки (protocolError),
+            ни одна команда не выполнялась. Поэтому сервер шлёт только имена ServerCommandType, новые — по правилу x-enum-added.'
+          examples:
+          - lock
+          - message
+          - reboot
         payload:
           description: Payload по типу (ServerCommandType.x-payload-schemas); null или отсутствует, если данных нет.
         issuedBy:
@@ -15270,10 +15908,11 @@ components:
           - 'null'
           format: date-time
           description: Срок годности; просроченную команду агент подтверждает ack с ошибкой timeout.
-      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:205
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:216
       x-source:
-      - src/ClubShell.Agent/Server/Heartbeat.cs:261
-      - src/ClubShell.Agent/Server/Heartbeat.cs:278
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:179
+      - src/ClubShell.Agent/Server/Heartbeat.cs:318
+      - src/ClubShell.Agent/Server/Heartbeat.cs:361
       - tools/MockServer/src/ws.ts:153
     ServerCommandType:
       type: string
@@ -15298,9 +15937,12 @@ components:
       - setVolume
       - refreshConfig
       description: 'Тип команды сервер -> агент (WS-кадр command, поле name; REST GET /agents/{pcId}/commands, поле name).
-        Payload и результат ack по типу — x-payload-schemas / x-result-schemas (null — нет payload / результат null). Для
-        команд из x-payload-optional payload может быть null или отсутствовать; для остальных без payload агент отвечает ack
-        { ok: false, error.code: validation, details.field: payload }.'
+        На проводе name — строка (WsFrame.name, ServerCommandEnvelope.name): имя, которого агент не знает, он подтверждает
+        ack { ok: false, error.code: notFound } по обоим путям. Новое имя команды безопасно для агентов с club-shell feat/shell-changes;
+        у старых агентов неизвестное имя в REST-пачке роняет разбор всей пачки — такое имя добавлять с x-enum-added. Payload
+        и результат ack по типу — x-payload-schemas / x-result-schemas (null — нет payload / результат null). Для команд из
+        x-payload-optional payload может быть null или отсутствовать; для остальных без payload агент отвечает ack { ok: false,
+        error.code: validation, details.field: payload }.'
       x-enum-descriptions:
         lock: Заблокировать сессию или показать экран простоя.
         unlock: Разблокировать.
@@ -15366,8 +16008,9 @@ components:
         showAds: null
         setVolume: VolumeState
         refreshConfig: RefreshConfigResult
-      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:88
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:94
       x-source:
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:257
       - src/ClubShell.Agent/Server/CommandReceiver.cs:245
       - src/ClubShell.Agent/Server/CommandReceiver.cs:271
       - src/ClubShell.Agent/Server/CommandReceiver.cs:475
@@ -15376,7 +16019,8 @@ components:
     ServerCommandsResponse:
       type: object
       description: Ответ GET /agents/{pcId}/commands — неподтверждённые непросроченные команды, старые первыми. Агент опрашивает
-        его после каждого heartbeat с pendingCommands > 0 (независимо от состояния WS; дубли отсекаются по id).
+        его после каждого heartbeat с pendingCommands > 0 (независимо от состояния WS; дубли отсекаются по id, на дубль агент
+        отвечает ack первого выполнения).
       required:
       - items
       properties:
@@ -15596,7 +16240,10 @@ components:
       - agentRestart
       - error
       description: 'Почему сессия завершилась: user — пользователем; timeUp — кончилось предоплаченное время; admin — администратором;
-        idle — по простою; agentRestart — агент перезапустился и не смог продолжить; error — внутренняя ошибка.'
+        idle — по простою; agentRestart — агент перезапустился и не смог продолжить; error — внутренняя ошибка. Незнакомое
+        значение агент с club-shell feat/shell-changes читает как unknown, а при завершении сессии отправляет серверу admin
+        (SessionManager.cs:329) — unknown на сервер не уходит.'
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Session/SessionEvent.cs:42
     SessionEndReport:
       type: object
@@ -15799,6 +16446,7 @@ components:
         / в офлайн-хранилище; active — таймер идёт; paused — пауза пользователем, таймер стоит; locked — заблокирована (пользователь
         отошёл / администратор), таймер идёт, если тариф не ставит на паузу при блокировке; ending — время вышло, льготный
         период до принудительного завершения; ended — завершена и рассчитана.'
+      x-agent-fallback: unknown
       x-open-states:
       - starting
       - active
@@ -15911,7 +16559,11 @@ components:
 
         В работающий шелл изменения не пушатся — шелл перечитывает shell.json при следующем старте.
 
-        Если оверлей agent.json из того же AgentServerConfig отвергнут валидацией, этот блок не применяется вовсе.'
+        Агент с club-shell feat/shell-changes применяет этот блок первым и отдельно от оверлея agent.json
+
+        (CommandReceiver.cs:552): ошибка валидации другой секции его не отменяет. У старых агентов отвергнутый оверлей
+
+        agent.json отменял и этот блок.'
       properties:
         locale:
           oneOf:
@@ -15935,11 +16587,17 @@ components:
 
             всё прочее, включая null, молча игнорирует, PolicyHandlers.cs:186). Сервер шлёт объект формы ShellFeatures
 
-            (8 флагов boolean) или не шлёт поле. Непереданные ключи сохраняют прежнее значение (по умолчанию все true).
+            (8 флагов boolean) или не шлёт поле. Непереданные ключи сохраняют прежнее значение shell.json.
 
-            Значения строго boolean: иначе агент читает флаг как true, а шелл отвергает shell.json и включает всё
+            Флаг, которого нет нигде, агент и шелл с club-shell feat/shell-changes (SHELL_CHANGES п. 4) читают так:
 
-            (встроенные умолчания).
+            shop, chat, booking, tournaments, topup — false; profile, apps, callAdmin — true (PolicyHandlers.cs:271,
+
+            config/shell.default.json:56, apps/shell/src/store/settings.ts:35). У старых агентов отсутствующий флаг —
+
+            true. Значения строго boolean: не-boolean агент читает как значение по умолчанию, а шелл отвергает
+
+            shell.json и берёт встроенные умолчания.
 
             Выключенный флаг скрывает вкладку/кнопку в шелле, и экран раздела перестаёт вызывать свои операции.
 
@@ -15951,20 +16609,27 @@ components:
 
             скрывает ещё и экран настроек игрока (ProfileScreen.tsx:367).
 
-            Исключение — x-feature-ungated: эти операции вызываются независимо от флага.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:332
+            GET /shop/orders с club-shell feat/shell-changes тоже закрыт features.shop: при shop = false агент отвечает
+
+            шеллу policyDenied (rule features.shop) без запроса к серверу (SessionHandlers.cs:803). Старые агенты звали
+
+            его при каждом входе игрока независимо от флага.'
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:349
           x-agent-shape: src/ClubShell.Contracts/Ipc/IpcMessage.cs:915
           x-source:
           - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:159
           - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:186
-          - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:270
+          - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:271
+          - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:803
           - apps/shell/src-tauri/src/config.rs:192
           - apps/shell/src/router.tsx:427
           - apps/shell/src/router.tsx:452
+          - apps/shell/src/store/settings.ts:35
           - config/shell.default.json:56
           x-feature-gates:
             shop:
             - GET /shop/products
+            - GET /shop/orders
             - POST /shop/orders
             - GET /shop/orders/{id}
             - POST /shop/orders/{id}/cancel
@@ -15992,21 +16657,6 @@ components:
             - GET /apps
             callAdmin:
             - POST /support/call-admin
-          x-feature-ungated:
-            GET /shop/orders:
-              description: Шелл вызывает shop.orders при каждом входе игрока (loadUserData) без проверки features.shop, а
-                агент в OrdersAsync флаг не проверяет (в отличие от ProductsAsync и OrderAsync). Запрос уходит на сервер даже
-                при shop=false.
-              x-source:
-              - apps/shell/src/store/index.ts:47
-              - apps/shell/src/store/shop.ts:94
-              - apps/shell/src-tauri/src/commands/shop.rs:54
-              - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:785
-              - src/ClubShell.Core/Http/ServerClient.cs:439
-          x-open-question: 'GET /shop/orders имеет статус notImplemented, но агент зовёт его при каждом входе игрока независимо
-            от features.shop (см. x-feature-ungated), так что каждый логин получает 501 (шелл пишет предупреждение в лог,
-            ordersStatus=error). Варианты: сервер v1 отдаёт пустую OrderPage (items: [], total: 0) или операция становится
-            required.'
           x-discrepancy: Мок (tools/MockServer/src/db.ts:691) кладёт в features девятый ключ ads (boolean). Ни C# ShellFeatures
             (IpcMessage.cs:915), ни Rust FeaturesConfig (config.rs:192) такого ключа не знают. Агент копирует его в shell.json
             как есть (PolicyHandlers.cs:194), шелл игнорирует. Реклама выключается через ads.enabled, а не features.ads; в
@@ -16040,7 +16690,7 @@ components:
           description: 'Частичный shell.json → ads (C#: JsonElement? — любое JSON-значение; агент применяет только объект,
             всё прочее, включая null, молча игнорирует, PolicyHandlers.cs:186). Рекомендуемая форма — AdsConfig шелла. Типы
             строгие: неверный тип ломает загрузку shell.json в шелле. Реклама выключается здесь (enabled), а не флагом features.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:333
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:350
           x-agent-shape: apps/shell/src-tauri/src/config.rs:138
           x-source:
           - config/shell.default.json:30
@@ -16067,7 +16717,7 @@ components:
           description: 'Частичный shell.json → idle (C#: JsonElement? — любое JSON-значение; агент применяет только объект,
             всё прочее, включая null, молча игнорирует, PolicyHandlers.cs:186). Рекомендуемая форма — IdleConfig шелла. Неотрицательные
             целые, иначе шелл отвергает shell.json. idle.timeoutSec агент отдаёт в ShellSettings.idleTimeoutSec.'
-          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:334
+          x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:351
           x-agent-shape: apps/shell/src-tauri/src/config.rs:130
           x-source:
           - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:266
@@ -16093,19 +16743,22 @@ components:
           - $ref: '#/components/schemas/ShellClub'
           - type: 'null'
           description: Оформление, баннеры и правила клуба; заменяет shell.json → club целиком (удалённый баннер исчезает).
-      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:329
+      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:346
       x-source:
       - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:159
-      - src/ClubShell.Agent/Server/CommandReceiver.cs:548
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:552
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:570
     ShellFeatures:
       type: object
       description: 'Флаги разделов шелла (shell.json -> features). По REST: ClubSettings.features кассы (GET/PATCH /admin/club)
         — переключатели владельца, которые сервер переносит в AgentServerConfig.shell.features (там C# хранит частичный объект
-        как JsonElement той же формы). Агент читает ровно эти 8 ключей, отсутствующий флаг = true (PolicyHandlers.cs:270).
-        Поведение агента при false, без обращения к серверу: shop, chat, booking, tournaments, topup, callAdmin — IPC-вызов
-        отклоняется ошибкой policyDenied (features.<флаг>); не проверяют флаг shop.orders, chat.markRead, booking.cancel;
-        apps — пустой список без GET /apps; profile агент не проверяет. При callAdmin = true и ошибке сервера (сеть или retryable,
-        в т.ч. 501 -> serverUnavailable) заявка молча уходит в телеметрию kind=callAdmin, шелл получает успешный SysCallAdminResponse.'
+        как JsonElement той же формы). Агент читает ровно эти 8 ключей. Отсутствующий флаг у агента и шелла с club-shell feat/shell-changes
+        (SHELL_CHANGES п. 4): shop, chat, booking, tournaments, topup — false; profile, apps, callAdmin — true (PolicyHandlers.cs:271);
+        у старых агентов — true. Поведение агента при false, без обращения к серверу: shop (с club-shell feat/shell-changes
+        — включая shop.orders), chat, booking, tournaments, topup, callAdmin — IPC-вызов отклоняется ошибкой policyDenied
+        (features.<флаг>); не проверяют флаг chat.markRead, booking.cancel; apps — пустой список без GET /apps; profile агент
+        не проверяет. При callAdmin = true и ошибке сервера (сеть, retryable или 501 notImplemented) заявка молча уходит в
+        телеметрию kind=callAdmin, шелл получает успешный SysCallAdminResponse.'
       required:
       - shop
       - chat
@@ -16140,18 +16793,19 @@ components:
         callAdmin:
           type: boolean
           description: Вызов администратора (sys.callAdmin -> POST /support/call-admin).
-      x-csharp: src/ClubShell.Contracts/Ipc/IpcMessage.cs:915
+      x-csharp: src/ClubShell.Contracts/Ipc/IpcMessage.cs:921
       x-source:
       - apps/admin/src/api.ts:271
       - tools/MockServer/src/routes/club.ts:254
       - tools/MockServer/src/club.ts:291
       - tools/MockServer/src/db.ts:682
-      - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:270
+      - src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:271
+      - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:803
       - src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:87
       - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:686
       - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:1021
-      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:215
-      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:246
+      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:216
+      - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:248
     ShellReplacementPolicy:
       type: object
       description: Замена оболочки (explorer.exe) для киоск-пользователя.
@@ -16406,8 +17060,11 @@ components:
         events:
           type: array
           maxItems: 1024
-          description: 'Диагностические события. Пока выгрузка не удаётся, агент копит до 1024 событий и шлёт их одной пачкой
-            — сервер должен принимать все 1024 (отказ 400 заблокирует выгрузку: агент не делит пачку).'
+          description: Диагностические события. Агент с club-shell feat/shell-changes (SHELL_CHANGES п. 6) кладёт в пачку
+            не больше 100 событий (TelemetryReporter.MaxBatchEvents), остальные — в следующие пачки; копит до 1024. Пачку,
+            на которую сервер ответил 4xx, кроме 401/408/429, агент отбрасывает; после прочих неудач выгрузка отступает экспоненциально
+            (от uploadIntervalSec до 15 мин). Старые агенты шлют до 1024 событий одной пачкой и не делят её — сервер принимает
+            до 1024 (отказ 400 у старого агента блокирует выгрузку).
           items:
             $ref: '#/components/schemas/TelemetryEvent'
         hardware:
@@ -16423,10 +17080,11 @@ components:
           description: Последние ≤ 50 строк лога уровня Warning+, когда events непуст.
           items:
             type: string
-      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:842
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:896
       x-source:
-      - src/ClubShell.Agent/Server/TelemetryReporter.cs:96
-      - src/ClubShell.Agent/Server/TelemetryReporter.cs:290
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:99
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:225
+      - src/ClubShell.Agent/Server/TelemetryReporter.cs:311
     TelemetryEvent:
       type: object
       description: Диагностическое событие агента в пачке телеметрии.
@@ -16454,8 +17112,8 @@ components:
       description: 'Значения TelemetryEvent.kind. В C# — статический класс строковых констант, набор открытый: сервер обязан
         принимать любую строку. x-known-values — константы TelemetryEventKinds; x-emitted-by-agent — что агент реально отправляет
         сейчас (agentHealth, callAdmin, shellClientError в классе констант отсутствуют). callAdmin — офлайн-очередь вызова
-        администратора: data = CallAdminTicketRequest, отправляется, когда POST /support/call-admin недоступен (сеть или ошибка
-        serverUnavailable/timeout/rateLimited, в т.ч. 501).'
+        администратора: data = CallAdminTicketRequest, отправляется, когда POST /support/call-admin недоступен (сеть, ошибка
+        serverUnavailable/timeout/rateLimited или 501 notImplemented).'
       examples:
       - shellCrash
       - shellCrashLoop
@@ -16476,7 +17134,7 @@ components:
         shellCrash: src/ClubShell.Agent/Watchdog/CrashRecovery.cs:180
         shellCrashLoop: src/ClubShell.Agent/Watchdog/CrashRecovery.cs:183
         agentHealth: src/ClubShell.Agent/AgentWorker.cs:443
-        callAdmin: src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253
+        callAdmin: src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:255
         shellClientError: src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:385
       x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:804
     Temperatures:
@@ -16712,7 +17370,8 @@ components:
       - cash
       description: 'Способ пополнения: payme, click — QR / deep link; uzum — Uzum Bank; cash — наличными на кассе (создаёт
         тикет администратору).'
-      x-csharp: src/ClubShell.Contracts/Wallet/Transaction.cs:31
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Wallet/Transaction.cs:34
     TopupStatus:
       type: string
       enum:
@@ -16722,7 +17381,8 @@ components:
       - cancelled
       description: 'Состояние заявки на пополнение: pending — ждёт оплаты; paid — оплачено, баланс обновлён (следом walletUpdated);
         expired — истекла без оплаты; cancelled — отменена пользователем или администратором.'
-      x-csharp: src/ClubShell.Contracts/Wallet/Transaction.cs:48
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Wallet/Transaction.cs:54
     Tournament:
       type: object
       description: 'Турнир (IPC_PROTOCOL §6.16): элемент GET /tournaments, ответ POST /tournaments/{id}/join и полезная нагрузка
@@ -16785,7 +17445,8 @@ components:
       - finished
       description: 'Жизненный цикл турнира: upcoming — анонсирован, регистрация закрыта; registration — идёт регистрация;
         live — идёт; finished — завершён.'
-      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:345
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:360
     TournamentsLeaderboardResponse:
       type: object
       description: Ответ GET /tournaments/{id}/leaderboard?limit= (тот же тип — ответ IPC tournaments.leaderboard). limit
@@ -16942,6 +17603,7 @@ components:
       description: 'Вид операции кошелька: topUp — пополнение (платёжная система или наличные); charge — списание за время
         сессии; refund — возврат неиспользованного предоплаченного времени или отменённого заказа; bonus — промо- начисление;
         purchase — покупка в магазине; adjustment — ручная корректировка администратором.'
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Wallet/Transaction.cs:8
     UpdateApplyResponse:
       type: object
@@ -16969,6 +17631,7 @@ components:
       - stable
       - beta
       description: Канал обновлений.
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:17
     UpdateCommand:
       type: object
@@ -16993,8 +17656,10 @@ components:
       enum:
       - agent
       - shell
-      description: Обновляемый компонент — служба агента или киоск-шелл.
-      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:28
+      description: Обновляемый компонент — служба агента или киоск-шелл. Незнакомое значение агент читает как unknown и такое
+        обновление отклоняет (ack команды update — validation; AgentUpdater.cs:286).
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:31
     UpdateManifest:
       type: object
       description: Описание пакета обновления (GET /updates/{channel}/manifest, payload команды update).
@@ -17050,7 +17715,7 @@ components:
       x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:69
     UpdatesConfigOverride:
       type: object
-      description: 'Серверное переопределение agent.json → updates (форма UpdatesSettings, AppSettings.cs:556). Агент сериализует
+      description: 'Серверное переопределение agent.json → updates (форма UpdatesSettings, AppSettings.cs:577). Агент сериализует
         его без null-полей и сливает поверх agent.json, поэтому null не сбрасывает значение (applyWindow: null окно не убирает).
         Политика (Policy.updates) перекрывает channel/autoInstall.'
       properties:
@@ -17067,14 +17732,23 @@ components:
           minimum: 60
           maximum: 604800
           description: Интервал проверки манифеста, с (диапазон из UpdatesSettings; вне диапазона весь оверлей отвергается).
-          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:563
+          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:587
         applyWindow:
           oneOf:
           - $ref: '#/components/schemas/TimeWindow'
           - type: 'null'
           description: Окно, в которое можно ставить необязательные обновления.
-      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:287
-      x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:556
+        enabled:
+          type:
+          - boolean
+          - 'null'
+          description: 'false — агент не проверяет манифест по расписанию (остаются явные проверки: IPC update.check и команда
+            update); null или нет поля — значение agent.json (по умолчанию true). Club-shell feat/shell-changes (SHELL_CHANGES
+            п. 4); старые агенты поле не знают. Агент применяет закэшированный серверный конфиг при старте, поэтому значение
+            действует с загрузки; только самый первый старт без кэша ещё делает одну проверку.'
+          x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:580
+      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:303
+      x-agent-shape: src/ClubShell.Core/Configuration/AppSettings.cs:577
     UpdatesPolicy:
       type: object
       description: Политика обновлений (перекрывает agent.json → updates).
@@ -17212,6 +17886,7 @@ components:
       - member
       - vip
       - admin
+      x-agent-fallback: unknown
       x-csharp: src/ClubShell.Contracts/Users/UserProfile.cs:13
     UserStats:
       type: object
@@ -17317,7 +17992,9 @@ components:
       x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:303
     WebFilterPolicy:
       type: object
-      description: DNS-фильтр веба.
+      description: 'DNS-фильтр веба. Защищённые домены никогда не блокируются, и их адреса исключаются из правил брандмауэра:
+        встроенный список агента (лаунчеры, античиты), protectedDomains и хост server.baseUrl (WebFilterPolicy.cs:65). Защищён
+        сам домен и все его поддомены.'
       required:
       - enabled
       - blockedDomains
@@ -17342,7 +18019,30 @@ components:
           description: Принудительные фильтрующие DNS-резолверы.
           items:
             type: string
-      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:103
+        blockResolvedIps:
+          type:
+          - boolean
+          - 'null'
+          description: 'Дополнительно закрывать брандмауэром публичные IPv4, в которые резолвятся blockedDomains. null или
+            нет поля — false (club-shell feat/shell-changes, SHELL_CHANGES п. 13): заблокированный сайт на общем адресе CDN
+            (Cloudflare, Akamai, Fastly) иначе отрезает и лаунчеры. Старые агенты поле не знают и закрывают адреса всегда.'
+          x-source:
+          - src/ClubShell.Agent/Policy/WebFilterPolicy.cs:118
+        protectedDomains:
+          type:
+          - array
+          - 'null'
+          description: Домены, которые не блокируются никогда, в дополнение к встроенному списку агента (домен и поддомены;
+            ведущие "*." и "." отбрасываются, не-имена хостов игнорируются). null или нет поля — только встроенный список
+            и хост server.baseUrl. Старые агенты поле не знают.
+          items:
+            type: string
+          x-source:
+          - src/ClubShell.Windows/Network/DnsFilter.cs:147
+          - src/ClubShell.Windows/Network/DnsFilter.cs:171
+      x-csharp: src/ClubShell.Contracts/Pc/PcInfo.cs:114
+      x-source:
+      - src/ClubShell.Agent/Policy/WebFilterPolicy.cs:65
     Weekday:
       type: string
       enum:
@@ -17484,8 +18184,9 @@ components:
       - ping
       - pong
       - push
-      description: Тип WS-кадра. Кадр с неизвестным type агент целиком отбрасывает (JsonException). Входящие ack/event/pong
-        агент игнорирует; на ping отвечает pong с тем же id.
+      description: 'Тип WS-кадра. Кадр с неизвестным type агент отбрасывает: старый агент — по JsonException, агент с club-shell
+        feat/shell-changes читает type как unknown и кадр игнорирует. Входящие ack/event/pong агент игнорирует; на ping отвечает
+        pong с тем же id.'
       x-enum-descriptions:
         command: Сервер -> агент, команда; требует ack.
         ack: Агент -> сервер, подтверждение команды.
@@ -17493,7 +18194,8 @@ components:
         ping: Keepalive-запрос (сервер каждые 20 с).
         pong: Keepalive-ответ (в течение 10 с).
         push: Сервер -> агент, уведомление; без подтверждения.
-      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:528
+      x-agent-fallback: unknown
+      x-csharp: src/ClubShell.Contracts/Commands/ServerCommand.cs:539
       x-source:
       - src/ClubShell.Core/Realtime/RealtimeClient.cs:318
       - src/ClubShell.Core/Realtime/RealtimeClient.cs:339

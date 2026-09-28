@@ -194,6 +194,9 @@ paths:
         - при `pendingCommands > 0` забирает команды `GET /agents/{pcId}/commands` (независимо от состояния WS).
         `pcStatus` и `session` текущий агент не читает: это только взгляд сервера (SERVER_API задумывает `session` для
         сверки сессии, агент её не выполняет — см. `x-discrepancy`).
+        Агент с club-shell `feat/shell-changes` добавляет в тело необязательные `gamesVolume` (кто монтирует том
+        библиотеки игр и смонтирован ли он) и `antiCheat` (Vanguard, Secure Boot, TPM) — SHELL_CHANGES п. 9 и 14;
+        сервер может их игнорировать, старые агенты их не шлют.
         Ошибки агент только логирует; автоматических HTTP-повторов нет (POST без `Idempotency-Key`).
       x-discrepancy: >-
         SERVER_API.md:173 называет pcStatus авторитетным статусом ПК, а SERVER_API.md:178 — session взглядом сервера на
@@ -210,6 +213,7 @@ paths:
         - src/ClubShell.Core/Abstractions/IServerClient.cs:126
         - src/ClubShell.Core/Http/ServerClient.cs:163
         - src/ClubShell.Agent/Server/Heartbeat.cs:163
+        - src/ClubShell.Agent/Server/Heartbeat.cs:179
         - src/ClubShell.Agent/Server/Heartbeat.cs:218
         - docs/SERVER_API.md:151
         - docs/SERVER_API.md:180
@@ -275,21 +279,26 @@ paths:
         Пачка метрик (`samples`, ≤ 120), диагностических событий агента (`events`) и, при изменении/пересканировании,
         инвентаризации (`hardware`); при непустых `events` — хвост лога (`logsTail`, ≤ 50 строк Warning+). Отправляется
         каждые `telemetry.uploadIntervalSec` (по умолчанию 60 с). Пока выгрузка не удаётся, агент копит до 120 замеров и
-        до 1024 событий и шлёт их одной пачкой без деления — отказ `400` на валидной пачке заблокирует выгрузку.
+        до 1024 событий. Агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 6) кладёт в пачку не больше 100
+        событий (остальные — в следующих пачках); пачку, на которую сервер ответил 4xx, кроме 401/408/429, отбрасывает;
+        после прочих неудач отступает экспоненциально (от `uploadIntervalSec` до 15 мин). Старые агенты шлют до 1024
+        событий одной пачкой без деления — отказ `400` на валидной пачке у них блокирует выгрузку.
         Среди событий бывает `kind = "callAdmin"` с `data` = `CallAdminTicketRequest` — вызов администратора, не
-        доставленный через `POST /support/call-admin` (временная ошибка/офлайн). Пока `POST /support/call-admin`
-        не реализован (`notImplemented`: 501 агент считает временной ошибкой), это единственный канал вызова
-        администратора — сервер v1 должен разбирать такие события, иначе вызовы молча теряются.
+        доставленный через `POST /support/call-admin` (временная ошибка, офлайн или `501 notImplemented`). Пока
+        `POST /support/call-admin` не реализован, это единственный канал вызова администратора — сервер v1 должен
+        разбирать такие события, иначе вызовы молча теряются.
         Автоматических HTTP-повторов нет (POST без `Idempotency-Key`); неотправленное остаётся до следующей попытки.
       x-server-status: required
       x-source:
         - src/ClubShell.Core/Http/Endpoints.cs:84
         - src/ClubShell.Core/Abstractions/IServerClient.cs:129
         - src/ClubShell.Core/Http/ServerClient.cs:172
-        - src/ClubShell.Agent/Server/TelemetryReporter.cs:96
-        - src/ClubShell.Agent/Server/TelemetryReporter.cs:294
-        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:48
-        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253
+        - src/ClubShell.Agent/Server/TelemetryReporter.cs:99
+        - src/ClubShell.Agent/Server/TelemetryReporter.cs:213
+        - src/ClubShell.Agent/Server/TelemetryReporter.cs:225
+        - src/ClubShell.Agent/Server/TelemetryReporter.cs:311
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:49
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:255
         - docs/SERVER_API.md:186
         - docs/SERVER_API.md:197
         - tools/MockServer/src/routes/pcs.ts:184
@@ -320,7 +329,8 @@ paths:
           $ref: '#/components/responses/BadRequest'
           description: |
             `validation` — нарушена форма пачки (`details.field`: `samples`, `events`, `samples[i]`, …). Сервер обязан
-            принимать до 120 `samples` и до 1024 `events` (агент пачку не делит).
+            принимать до 120 `samples` и до 1024 `events` (старые агенты пачку не делят; агент с club-shell
+            `feat/shell-changes` шлёт до 100 событий и пачку с ответом 4xx отбрасывает).
         '401':
           $ref: '#/components/responses/Unauthorized'
         '403':
@@ -347,14 +357,18 @@ paths:
         Серверные переопределения `agent.json`/`shell.json` для ПК (`AgentServerConfig`), с `ETag`.
         Агент запрашивает конфиг после первого heartbeat, при смене `HeartbeatResponse.configVersion` и по команде
         `refreshConfig`. Клиент поддерживает `If-None-Match`/`304`, но текущий агент для конфига `If-None-Match` не
-        шлёт и всегда ждёт `200` с телом. GET повторяется агентом на 408/425/429/5xx.
+        шлёт и всегда ждёт `200` с телом. GET повторяется агентом на 408/425/429/5xx (кроме 501).
+        Агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 4 и 8) применяет блок `shell` первым и отдельно от
+        оверлея `agent.json`, а последний применённый конфиг хранит в `<paths.cache>/server-config.json` и применяет
+        при старте службы, до первого heartbeat (подробнее — `AgentServerConfig`).
       x-server-status: required
       x-source:
         - src/ClubShell.Core/Http/Endpoints.cs:87
         - src/ClubShell.Core/Abstractions/IServerClient.cs:132
         - src/ClubShell.Core/Http/ServerClient.cs:179
         - src/ClubShell.Core/Http/ServerClient.cs:659
-        - src/ClubShell.Agent/Server/CommandReceiver.cs:527
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:539
+        - src/ClubShell.Core/Configuration/SettingsLoader.cs:504
         - docs/SERVER_API.md:26
         - docs/SERVER_API.md:199
         - tools/MockServer/src/routes/pcs.ts:204
@@ -477,15 +491,20 @@ paths:
       summary: Ожидающие команды (REST-фолбэк WebSocket)
       description: |
         Неподтверждённые и непросроченные команды для ПК, старые первыми (каждый элемент — кадр `command` WS без
-        `type`). Агент вызывает маршрут после heartbeat с `pendingCommands > 0`; дубли отсекает по `id` (24 ч);
-        просроченные подтверждает с ошибкой `timeout`. Каждую команду подтверждает
-        `POST /agents/{pcId}/commands/{commandId}/ack`.
+        `type`). Агент вызывает маршрут после heartbeat с `pendingCommands > 0`; дубли отсекает по `id` (24 ч) и
+        отвечает на них ack первого выполнения; просроченные подтверждает с ошибкой `timeout`. Каждую команду
+        подтверждает `POST /agents/{pcId}/commands/{commandId}/ack`.
+        `name` — строка (SHELL_CHANGES п. 3): незнакомое имя агент с club-shell `feat/shell-changes` подтверждает
+        `ack { ok: false, error.code: notFound }` и выполняет остальные команды пачки. У старых агентов незнакомое
+        имя роняет разбор всего ответа — сервер шлёт только имена `ServerCommandType`.
       x-server-status: required
       x-source:
         - src/ClubShell.Core/Http/Endpoints.cs:93
         - src/ClubShell.Core/Abstractions/IServerClient.cs:138
         - src/ClubShell.Core/Http/ServerClient.cs:187
-        - src/ClubShell.Agent/Server/Heartbeat.cs:261
+        - src/ClubShell.Agent/Server/Heartbeat.cs:318
+        - src/ClubShell.Agent/Server/Heartbeat.cs:361
+        - src/ClubShell.Agent/Server/CommandReceiver.cs:171
         - docs/SERVER_API.md:182
         - tools/MockServer/src/routes/pcs.ts:214
         - tools/MockServer/src/ws.ts:113
@@ -678,13 +697,15 @@ paths:
       description: |
         Один ПК клуба. Агент вызывает маршрут для собственного ПК при обработке IPC `sys.pcInfo` (шелл запрашивает при
         старте), кэширует ответ на 60 с; при любой ошибке синтезирует сведения о ПК локально (ошибку не кэширует).
-        `hwid` отдаётся только для собственного ПК вызывающего агента. GET повторяется агентом на 408/425/429/5xx,
-        в том числе на 501 (см. `x-open-question`).
+        `hwid` отдаётся только для собственного ПК вызывающего агента. GET повторяется агентом на 408/425/429/5xx;
+        старые агенты — в том числе на 501 (см. `x-open-question`), агент с club-shell `feat/shell-changes` 501 не
+        повторяет.
       x-server-status: required
       x-server-note: >-
         Решение владельца 2026-09-27: реализуется в v1 — агент вызывает его при каждом старте шелла, 501 повторяется агентом (docs/SHELL_CHANGES.md п. 1).
       x-open-question: >-
-        Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55 —
+        [Для агентов с club-shell feat/shell-changes снято: 501 не повторяется и не засчитывается circuit breaker'ом,
+        SHELL_CHANGES п. 1. Решение required остаётся — ради старых агентов.] Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55 —
         любой статус ≥ 500) и повторяет GET до 5 попыток (RetryPolicy.cs:66-71, AppSettings.cs:242); каждая попытка
         проходит через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155:
         FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с — AppSettings.cs:258, 262). Ошибка не кэшируется
@@ -767,12 +788,16 @@ paths:
         Агент проверяет оба компонента (`agent`, затем `shell`) при старте и каждые `updates.checkIntervalSec`
         (по умолчанию 3600 с, минимум 60 с); любую ошибку логирует и считает, что манифеста нет. Скачивание пакета по
         `manifest.url` требует того же Bearer-токена агента и поддерживает `Range`. GET повторяется агентом на
-        408/425/429/5xx, в том числе на 501 (см. `x-open-question`).
+        408/425/429/5xx; старые агенты — в том числе на 501 (см. `x-open-question`). Проверку по расписанию сервер
+        может выключить: `AgentServerConfig.updates.enabled = false` (агент с club-shell `feat/shell-changes`,
+        SHELL_CHANGES п. 4).
       x-server-status: required
       x-server-note: >-
         Решение владельца 2026-09-27: сервер v1 всегда отвечает 204 («обновлений нет»), пока агент считает 501 временной ошибкой (docs/SHELL_CHANGES.md п. 1). Раздача обновлений не реализована.
       x-open-question: >-
-        Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55 —
+        [Для агентов с club-shell feat/shell-changes снято: 501 не повторяется и не засчитывается circuit breaker'ом
+        (SHELL_CHANGES п. 1), а проверку по расписанию выключает updates.enabled = false. Решение «всегда 204» остаётся —
+        ради старых агентов.] Статус notImplemented (по правилам) вредит агенту. 501 агент считает временной ошибкой (RetryPolicy.cs:55 —
         любой статус ≥ 500) и повторяет GET до 5 попыток (RetryPolicy.cs:66-71, AppSettings.cs:242); каждая попытка
         проходит через один общий для всех запросов агента circuit breaker (RetryPolicy.cs:112-120 и 155:
         FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с — AppSettings.cs:258, 262). Проверка обновлений
@@ -953,12 +978,15 @@ paths:
         ставит тикет в телеметрию (событие `kind = "callAdmin"`, `data` = это же тело) и возвращает шеллу тикет с
         клиентским `ticketId` и без `queuePosition`.
 
-        Пока маршрут не реализован (`notImplemented`), 501 агент считает временной ошибкой (`serverUnavailable`),
-        поэтому вызовы администратора приходят на сервер только как события телеметрии `kind = "callAdmin"` в
-        `POST /agents/{pcId}/telemetry` — сервер v1 должен их разбирать (см. `x-open-question`).
+        Пока маршрут не реализован (`notImplemented`), вызовы администратора приходят на сервер только как события
+        телеметрии `kind = "callAdmin"` в `POST /agents/{pcId}/telemetry` — сервер v1 должен их разбирать (см.
+        `x-open-question`): агент с club-shell `feat/shell-changes` уводит тикет в телеметрию и на
+        `501 notImplemented` (без повторов, SystemHandlers.cs:248), старые агенты — после повторов 501 как
+        `serverUnavailable`.
       x-server-status: notImplemented
       x-open-question: >-
-        Статус notImplemented (по правилам) вредит агенту. POST несёт Idempotency-Key, поэтому на 501 (временная ошибка:
+        [Для агентов с club-shell feat/shell-changes снята часть про повторы и circuit breaker (SHELL_CHANGES п. 1);
+        вопрос об обработке события callAdmin в телеметрии остаётся.] Статус notImplemented (по правилам) вредит агенту. POST несёт Idempotency-Key, поэтому на 501 (временная ошибка:
         RetryPolicy.cs:55, 71) агент делает до 5 попыток (AppSettings.cs:242) через один общий для всех запросов агента
         circuit breaker (RetryPolicy.cs:112-120 и 155: FailureRatio 0,8, MinimumThroughput 5, окно и размыкание 30 с —
         AppSettings.cs:258, 262): при ≤ 1 успешном запросе в 30-секундном окне 5 отказов подряд размыкают цепь на 30 с
@@ -973,6 +1001,7 @@ paths:
         - src/ClubShell.Core/Http/ServerClient.cs:529
         - src/ClubShell.Core/Http/ServerClient.cs:834
         - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:238
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:248
         - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253
         - docs/SERVER_API.md:399
         - tools/MockServer/src/routes/pcs.ts:251
@@ -1038,13 +1067,16 @@ paths:
       description: |
         Находка античита на ПК (при `anticheat.reportViolations`). То же тело агент публикует как WS-событие
         `anticheatViolation`. `pcId` тела должен совпадать с ПК из токена агента. Ошибки агент только логирует; POST без
-        `Idempotency-Key` автоматически не повторяется — отчёт теряется.
+        `Idempotency-Key` автоматически не повторяется — отчёт теряется. Пока операция `notImplemented`, сервер может
+        выключить вызов: `AgentServerConfig.anticheat = { "reportViolations": false }` (агент с club-shell
+        `feat/shell-changes`, SHELL_CHANGES п. 4); WS-событие при этом остаётся.
       x-server-status: notImplemented
       x-source:
         - src/ClubShell.Core/Http/Endpoints.cs:78
         - src/ClubShell.Core/Abstractions/IServerClient.cs:325
         - src/ClubShell.Core/Http/ServerClient.cs:536
         - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:338
+        - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:354
         - src/ClubShell.Agent/AntiCheat/AntiCheatMonitor.cs:361
         - docs/SERVER_API.md:403
         - docs/SERVER_API.md:548

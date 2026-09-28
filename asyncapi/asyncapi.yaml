@@ -17,8 +17,9 @@ info:
     - Адрес: `wss://{host}/ws/agent` — НЕ под `/api/v1`. Агент берёт его из `agent.json → server.wsUrl` (по умолчанию
       `wss://club.example.uz/ws/agent`) или из `AgentServerConfig.wsUrl` ответа `GET /agents/{pcId}/config`;
       допускаются схемы `wss` и `ws` (`ws` — только для мока/разработки).
-    - Рукопожатие: `GET` с `Sec-WebSocket-Protocol: clubshell.v1`, `Authorization: Bearer <JWT агента>` и query
-      `token=<тот же JWT>` (агент шлёт оба способа одновременно, см. §2).
+    - Рукопожатие: `GET` с `Sec-WebSocket-Protocol: clubshell.v1` и `Authorization: Bearer <JWT агента>`. Query
+      `token=<тот же JWT>` шлют только старые агенты (вместе с заголовком); агент с club-shell `feat/shell-changes`
+      токен в URL не кладёт (см. §2).
     - Одно соединение на ПК: новое соединение того же `pcId` вытесняет старое (мок закрывает старое кодом 1000).
       Факт подключения сервер может использовать как признак «ПК онлайн» (мок переводит `offline` → `free`).
     - Сразу после подключения сервер переотправляет все неподтверждённые и неистёкшие команды ПК (старые первыми).
@@ -29,15 +30,20 @@ info:
 
     - JWT агента (тот же `accessToken`, что для REST; RS256, `exp` ≈ 1 ч). Подпись HMAC (`X-Timestamp`/`X-Signature`)
       на WS НЕ используется.
-    - Агент передаёт токен и в заголовке `Authorization: Bearer`, и в query `token` — всегда один и тот же JWT
-      (`RealtimeClient.cs:107,111`). Мок и SERVER_API.md §6 знают только query `token` (`ws.ts:248`). Сервер принимает
-      любой из двух. **Решение сервера (нет ни в клиенте, ни в моке, ни в SERVER_API.md):** заголовок приоритетнее
-      query; если заданы оба и они различаются — закрыть 4401. Агент такой ситуации не создаёт.
+    - Агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 6) передаёт токен только в заголовке
+      `Authorization: Bearer` (`RealtimeClient.cs:108`): JWT в URL попадал в access-логи прокси. Старые агенты шлют
+      тот же JWT и в заголовке, и в query `token`. Сервер принимает любой из двух способов; мок с этой ветки — тоже
+      (заголовок, иначе `?token=`, `ws.ts:248`). Заголовок приоритетнее query; если заданы оба и они различаются —
+      закрыть 4401 (решение сервера; ни один агент такой ситуации не создаёт).
     - Токен проверяется при рукопожатии. Неверный/истёкший/отозванный токен — либо HTTP 401/403 на рукопожатии,
       либо принять апгрейд и закрыть кодом 4401 (так делает мок). Агент обрабатывает оба варианта одинаково:
       `POST /agents/refresh` (при отказе — `POST /agents/register`) и переподключение.
-    - Агент сам НЕ переподключается после обновления токена: открытое соединение живёт дольше `exp`. При отзыве
-      ПК/токенов сервер закрывает соединение кодом 4401 (мок: `POST /mock/reset-tokens`).
+    - Агент с club-shell `feat/shell-changes` обновляет токен за 2 мин до `exp` и переподключает сокет с новым
+      токеном (`ServerConnection.RefreshBeforeExpiryAsync`) — при TTL 1 ч это одно переподключение в час, шелл может
+      увидеть короткое «офлайн/онлайн». Поэтому сервер может закрывать соединение кодом 4401 по `exp` токена. Старые
+      агенты после обновления токена сами не переподключаются: их соединение живёт дольше `exp` до закрытия 4401
+      (восстановление штатное). При отзыве ПК/токенов сервер закрывает соединение кодом 4401 (мок:
+      `POST /mock/reset-tokens`).
 
     ## 3. Сабпротокол `clubshell.v1`
 
@@ -102,10 +108,13 @@ info:
       подтверждает `POST /agents/{pcId}/commands/{commandId}/ack` — даже при живом WS. Поэтому одна команда может
       прийти обоими путями: агент выполнит её один раз, но ack может прийти дважды (WS и REST). Сервер принимает
       повторные ack идемпотентно (последний перезаписывает; у `message` второй ack по REST несёт `ackedAt`).
-    - Дедупликация на агенте — по `id` команды, только в памяти процесса (24 ч, с ограничением числа записей), после
-      перезапуска агента не сохраняется. Повтор по WS агент молча игнорирует БЕЗ повторного ack; потерянный ack
-      вернётся только через REST-путь (кэш ack в `CommandReceiver`). Отсюда: команды с побочным эффектом
-      (`reboot`, `shutdown`, `update`, `launchGame`) сервер отправляет с `expiresAt`.
+    - Дедупликация на агенте — по `id` команды (24 ч, до 1024 записей в памяти, `CommandReceiver`). Агент с club-shell
+      `feat/shell-changes` (SHELL_CHANGES п. 6) на повтор команды по WS и по REST отвечает ack первого выполнения (у
+      ещё выполняемой команды — когда она завершится), а ack выполненных `reboot`/`shutdown` хранит 24 ч на диске
+      (`cache/power-acks.json`): команда, повторно доставленная после вызванной ею перезагрузки, получает прежний ack
+      и ПК снова не перезагружает. Прочие команды после перезапуска агента выполняются повторно. Старые агенты повтор
+      по WS молча игнорировали без ack и хранили всё только в памяти. Поэтому команды с побочным эффектом (`reboot`,
+      `shutdown`, `update`, `launchGame`) сервер по-прежнему отправляет с `expiresAt`.
     - `expiresAt`: агент сравнивает со своими часами; просроченную команду не выполняет и отвечает
       `ack { ok: false, error.code: timeout }`. Запас `expiresAt` — не меньше допустимого расхождения часов.
     - `supersedes`: агент отменяет выполняемую (in-flight) более раннюю команду с этим id; отменённая получает
@@ -130,8 +139,9 @@ info:
     ## 8. События агент → сервер
 
     Без подтверждения и без повторов (fire-and-forget). Если WS не подключён или буфер (1024 кадра) полон, событие
-    теряется — оно НЕ копится в outbox; данные доходят через REST-аналоги (`/sessions/{id}/events`,
-    `/games/{id}/launch-report`, `/agents/{pcId}/telemetry`, `/anticheat/report`). Сейчас агент реально шлёт только
+    теряется — оно НЕ копится в outbox (SERVER_API.md §6.2 с club-shell `feat/shell-changes` говорит так же); данные
+    доходят через REST-аналоги (`/sessions/{id}/events`, `/games/{id}/launch-report` — с этой ветки тоже через
+    офлайн-очередь агента, `/agents/{pcId}/telemetry`, `/anticheat/report`). Сейчас агент реально шлёт только
     `anticheatViolation`, `hardwareChanged`, `offlineQueueFlushed` (`x-agent-emits`). `ts` кадра — время отправки;
     время события — в payload, где оно есть. `id` кадра случаен — сервер может дедуплицировать по нему.
 
@@ -145,9 +155,12 @@ info:
 
     ## 10. Совместимость
 
-    Добавлять поля в payload можно всегда. Новые имена команд безопасны (агент ответит `notFound`), новые имена push и
-    событий — тоже (игнорируются). Новый `type` кадра или новые значения enum внутри payload ломают обработку
-    кадра у текущего агента — только согласованно с релизом агента.
+    Добавлять поля в payload можно всегда. Новые имена команд безопасны (агент ответит `notFound`; с club-shell
+    `feat/shell-changes` — и в REST-пачке `GET /agents/{pcId}/commands`), новые имена push и событий — тоже
+    (игнорируются). Новый `type` кадра и новые значения enum внутри payload агент с этой ветки читает как `unknown`
+    у enum с `x-agent-fallback` (openapi `info.description` §9): кадр неизвестного типа игнорирует, а значение
+    `unknown` в payload обрабатывает сам (например, отклоняет `update` с неизвестным компонентом). У старых агентов
+    и у прочих enum — только согласованно с релизом агента (`x-enum-added`).
   x-source:
     - docs/SERVER_API.md:487
     - src/ClubShell.Core/Realtime/RealtimeClient.cs:29
@@ -160,6 +173,10 @@ info:
     - src/ClubShell.Core/Configuration/AppSettings.cs:209
     - src/ClubShell.Core/Configuration/AppSettings.cs:744
     - tools/MockServer/src/ws.ts:246
+    - src/ClubShell.Core/Realtime/RealtimeClient.cs:108
+    - src/ClubShell.Agent/Server/ServerConnection.cs:282
+    - src/ClubShell.Agent/Server/CommandReceiver.cs:171
+    - src/ClubShell.Agent/Server/CommandReceiver.cs:629
 
 defaultContentType: application/json
 
@@ -182,6 +199,7 @@ servers:
     title: MockServer
     description: Мок из `club-shell/tools/MockServer` (только разработка; `MOCK_SERVER_PORT`, по умолчанию 8080).
     security:
+      - $ref: '#/components/securitySchemes/agentBearer'
       - $ref: '#/components/securitySchemes/agentTokenQuery'
 
 channels:
@@ -319,11 +337,16 @@ channels:
         method: GET
         query:
           type: object
-          description: Query рукопожатия. Агент добавляет `token` к query, уже заданной в `server.wsUrl`.
+          description: >-
+            Query рукопожатия. Старые агенты добавляют `token` к query, уже заданной в `server.wsUrl`; агент с club-shell
+            `feat/shell-changes` query не меняет.
           properties:
             token:
               type: string
-              description: JWT агента (тот же accessToken, что в `Authorization`). Обязателен, если нет заголовка `Authorization`.
+              deprecated: true
+              description: >-
+                JWT агента (тот же accessToken, что в `Authorization`). Обязателен, если нет заголовка `Authorization`.
+                Шлют только старые агенты; агент с club-shell `feat/shell-changes` — нет (SHELL_CHANGES п. 6).
               x-note: >-
                 Риск: токен в URL попадает в access-логи reverse-proxy/балансировщика/сервера и в метрики URL. На
                 прокси и сервере маскировать параметр `token` в логах (или не логировать query у `/ws/agent`),
@@ -351,24 +374,30 @@ channels:
             Authorization:
               type: string
               pattern: '^Bearer \S+$'
-              description: '`Bearer <JWT агента>`; агент шлёт всегда вместе с query `token` (тот же JWT).'
+              description: >-
+                `Bearer <JWT агента>`; агент шлёт всегда. Агент с club-shell `feat/shell-changes` — единственный способ
+                передать токен; старые агенты дублируют тот же JWT в query `token`.
               x-note: >-
-                Решение сервера, нет в клиенте и моке: заголовок приоритетнее query `token`; если заданы оба и они
-                различаются — закрыть 4401. Мок читает только query `token` (tools/MockServer/src/ws.ts:248),
-                SERVER_API.md §6 описывает только query; агент всегда шлёт одинаковый токен в обоих местах.
+                Решение сервера: заголовок приоритетнее query `token`; если заданы оба и они различаются — закрыть 4401.
+                Мок с club-shell feat/shell-changes читает заголовок, а без него — query `token`
+                (tools/MockServer/src/ws.ts:248); SERVER_API.md §6 и SECURITY.md этой ветки описывают заголовок.
               x-source:
-                - src/ClubShell.Core/Realtime/RealtimeClient.cs:107
-                - src/ClubShell.Core/Realtime/RealtimeClient.cs:111
+                - src/ClubShell.Core/Realtime/RealtimeClient.cs:108
+                - tools/MockServer/src/ws.ts:248
         bindingVersion: 0.1.0
     x-close-codes:
       - code: 4401
         sender: server
         when: Токен агента неверен, истёк или отозван (при подключении или в любой момент позже).
-        agent: ServerApiException(unauthorized) → POST /agents/refresh, при 401/403 — POST /agents/register → переподключение через 1 с (без роста задержки).
+        agent: >-
+          ServerApiException(unauthorized) → POST /agents/refresh, при 401/403 — POST /agents/register → переподключение
+          через 1 с (без роста задержки). Агент с club-shell feat/shell-changes обновляет токен за 2 мин до exp и сам
+          переподключается, так что закрытие 4401 по exp его обычно не застаёт.
         x-source:
-          - src/ClubShell.Core/Realtime/RealtimeClient.cs:43
-          - src/ClubShell.Core/Realtime/RealtimeClient.cs:233
-          - src/ClubShell.Agent/Server/ServerConnection.cs:284
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:41
+          - src/ClubShell.Core/Realtime/RealtimeClient.cs:232
+          - src/ClubShell.Agent/Server/ServerConnection.cs:55
+          - src/ClubShell.Agent/Server/ServerConnection.cs:282
           - tools/MockServer/src/ws.ts:251
           - tools/MockServer/src/ws.ts:361
       - code: 4426
@@ -415,6 +444,8 @@ channels:
       agentOutboundBufferFrames: 1024
       agentCommandTimeoutSec: 300
       agentDedupeWindowHours: 24
+      agentPowerAckRetentionHours: 24
+      agentTokenRefreshLeewaySec: 120
       agentReconnectBackoffSec:
         min: 1
         max: 60
@@ -530,10 +561,14 @@ operations:
       - $ref: '#/components/tags/command'
     x-triggered-by:
       - 'POST /admin/pcs/{pcId}/command (kind = reboot)'
-    x-note: Всегда задавать expiresAt — дедупликация агента не переживает перезагрузку, повторная доставка после рестарта снова перезагрузит ПК.
+    x-note: >-
+      Всегда задавать expiresAt. Агент с club-shell feat/shell-changes хранит ack выполненной перезагрузки 24 ч на диске
+      и на повторную доставку после рестарта отвечает им (ПК снова не перезагружается); старые агенты дедуплицировали
+      только в памяти, и повторная доставка после рестарта снова перезагружала ПК.
     x-source:
-      - src/ClubShell.Contracts/Commands/ServerCommand.cs:100
-      - src/ClubShell.Agent/Server/CommandReceiver.cs:324
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:106
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:247
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:271
       - docs/SERVER_API.md:519
       - tools/MockServer/src/routes/admin.ts:259
   sendCommandShutdown:
@@ -554,10 +589,14 @@ operations:
       - $ref: '#/components/tags/command'
     x-triggered-by:
       - 'POST /admin/pcs/{pcId}/command (kind = shutdown)'
-    x-note: Всегда задавать expiresAt — иначе после включения ПК недоставленный ack приведёт к повторному выключению.
+    x-note: >-
+      Всегда задавать expiresAt. Агент с club-shell feat/shell-changes хранит ack выполненного выключения 24 ч на диске и
+      на повторную доставку после включения отвечает им; у старых агентов недоставленный ack приводил к повторному
+      выключению.
     x-source:
-      - src/ClubShell.Contracts/Commands/ServerCommand.cs:103
-      - src/ClubShell.Agent/Server/CommandReceiver.cs:324
+      - src/ClubShell.Contracts/Commands/ServerCommand.cs:109
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:247
+      - src/ClubShell.Agent/Server/CommandReceiver.cs:272
       - docs/SERVER_API.md:520
       - tools/MockServer/src/routes/admin.ts:261
       - tools/MockServer/src/club.ts:620
@@ -1198,22 +1237,22 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: >-
-        `Authorization: Bearer <JWT агента>` в запросе рукопожатия (тот же accessToken, что для REST). Агент шлёт всегда.
-        Предпочтительный способ для сервера.
+        `Authorization: Bearer <JWT агента>` в запросе рукопожатия (тот же accessToken, что для REST). Агент шлёт всегда;
+        агент с club-shell `feat/shell-changes` — только так. Предпочтительный способ для сервера.
       x-source:
-        - src/ClubShell.Core/Realtime/RealtimeClient.cs:111
+        - src/ClubShell.Core/Realtime/RealtimeClient.cs:108
     agentTokenQuery:
       type: httpApiKey
       in: query
       name: token
       description: >-
-        Query `token=<JWT агента>` (SERVER_API.md §6, мок проверяет только его). Агент шлёт всегда вместе с заголовком.
+        Query `token=<JWT агента>` — для совместимости со старыми агентами, которые шлют его вместе с заголовком. Агент
+        с club-shell `feat/shell-changes` query не шлёт; мок принимает оба способа.
       x-note: >-
         Риск утечки токена: URL с `token` пишется в access-логи reverse-proxy, балансировщика и веб-сервера, в
         трассировки и метрики по URL. Маскировать `token` в логах всех звеньев (или не логировать query у `/ws/agent`),
         серверу предпочитать заголовок `Authorization`, а query оставить только для совместимости.
       x-source:
-        - src/ClubShell.Core/Realtime/RealtimeClient.cs:267
         - tools/MockServer/src/ws.ts:248
         - docs/SERVER_API.md:492
 

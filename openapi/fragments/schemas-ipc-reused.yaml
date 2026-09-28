@@ -29,7 +29,8 @@
 #   статические классы IpcMessages, ShellCapabilities, AgentCapabilities.
 # Внешние схемы (определяют другие группы, здесь только $ref): Game, App, Tariff, Transaction, Product, Order,
 #   ChatMessage, Seat, Booking, Tournament, LeaderboardEntry, Achievement.
-# Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter, целые отвергаются),
+# Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter, целые отвергаются;
+# у enum с x-agent-fallback: unknown агент с club-shell feat/shell-changes читает незнакомую строку как unknown),
 # null не пишется (WhenWritingNull), незнакомые поля пропускаются, DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ,
 # TimeOnly -> HH:mm (ClubTimeConverter), DateOnly -> yyyy-MM-dd. Переопределения в этих типах: только [JsonIgnore]
 # у вычисляемого PagedResult.HasMore (на провод не попадает). JsonPropertyName/JsonPolymorphic нет.
@@ -482,12 +483,14 @@ components:
       description: >-
         Флаги разделов шелла (shell.json -> features). По REST: ClubSettings.features кассы (GET/PATCH /admin/club) —
         переключатели владельца, которые сервер переносит в AgentServerConfig.shell.features (там C# хранит частичный
-        объект как JsonElement той же формы). Агент читает ровно эти 8 ключей, отсутствующий флаг = true
-        (PolicyHandlers.cs:270). Поведение агента при false, без обращения к серверу: shop, chat, booking,
-        tournaments, topup, callAdmin — IPC-вызов отклоняется ошибкой policyDenied (features.<флаг>); не проверяют флаг
-        shop.orders, chat.markRead, booking.cancel; apps — пустой список без GET /apps; profile агент не проверяет.
-        При callAdmin = true и ошибке сервера (сеть или retryable, в т.ч. 501 -> serverUnavailable) заявка молча
-        уходит в телеметрию kind=callAdmin, шелл получает успешный SysCallAdminResponse.
+        объект как JsonElement той же формы). Агент читает ровно эти 8 ключей. Отсутствующий флаг у агента и шелла с
+        club-shell feat/shell-changes (SHELL_CHANGES п. 4): shop, chat, booking, tournaments, topup — false; profile,
+        apps, callAdmin — true (PolicyHandlers.cs:271); у старых агентов — true. Поведение агента при false, без
+        обращения к серверу: shop (с club-shell feat/shell-changes — включая shop.orders), chat, booking, tournaments,
+        topup, callAdmin — IPC-вызов отклоняется ошибкой policyDenied (features.<флаг>); не проверяют флаг
+        chat.markRead, booking.cancel; apps — пустой список без GET /apps; profile агент не проверяет.
+        При callAdmin = true и ошибке сервера (сеть, retryable или 501 notImplemented) заявка молча уходит в
+        телеметрию kind=callAdmin, шелл получает успешный SysCallAdminResponse.
       required: [shop, chat, booking, tournaments, profile, topup, apps, callAdmin]
       properties:
         shop:
@@ -514,18 +517,19 @@ components:
         callAdmin:
           type: boolean
           description: Вызов администратора (sys.callAdmin -> POST /support/call-admin).
-      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:915"
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:921"
       x-source:
         - "apps/admin/src/api.ts:271"
         - "tools/MockServer/src/routes/club.ts:254"
         - "tools/MockServer/src/club.ts:291"
         - "tools/MockServer/src/db.ts:682"
-        - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:270"
+        - "src/ClubShell.Agent/Ipc/Handlers/PolicyHandlers.cs:271"
+        - "src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:803"
         - "src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:87"
         - "src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:686"
         - "src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:1021"
-        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:215"
-        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:246"
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:216"
+        - "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:248"
 
     # ------------------------------------------------------------------ Sys payloads
 
@@ -673,7 +677,8 @@ components:
       type: string
       enum: [image, video]
       description: Тип рекламного носителя — image (картинка) или video.
-      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1203"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Ipc/IpcMessage.cs:1209"
 
     AdItem:
       type: object

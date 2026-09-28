@@ -5,7 +5,8 @@
 # Внешние схемы (определяют другие группы, здесь только $ref): Session, SessionEndReason (Session/*.cs),
 # PcStatus (Pc/PcStatus.cs).
 # Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter на каждом enum,
-# целые значения отвергаются), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
+# целые значения отвергаются; у enum с x-agent-fallback: unknown агент с club-shell feat/shell-changes читает
+# незнакомую строку как unknown), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
 # DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ, TimeOnly -> HH:mm (ClubTimeConverter). Money — собственный
 # MoneyJsonConverter (Wallet/Balance.cs:156). В этих файлах нет JsonPropertyName/JsonStringEnumMemberName/
 # JsonPolymorphic; JsonIgnore стоит только на вычисляемых свойствах (User.IsMember, Balance.Total,
@@ -191,6 +192,7 @@ components:
         Вид операции кошелька: topUp — пополнение (платёжная система или наличные); charge — списание за время
         сессии; refund — возврат неиспользованного предоплаченного времени или отменённого заказа; bonus — промо-
         начисление; purchase — покупка в магазине; adjustment — ручная корректировка администратором.
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:8"
 
     TopupProvider:
@@ -199,7 +201,8 @@ components:
       description: >-
         Способ пополнения: payme, click — QR / deep link; uzum — Uzum Bank; cash — наличными на кассе
         (создаёт тикет администратору).
-      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:31"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:34"
 
     TopupStatus:
       type: string
@@ -207,7 +210,8 @@ components:
       description: >-
         Состояние заявки на пополнение: pending — ждёт оплаты; paid — оплачено, баланс обновлён (следом
         walletUpdated); expired — истекла без оплаты; cancelled — отменена пользователем или администратором.
-      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:48"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Wallet/Transaction.cs:54"
 
     Transaction:
       type: object
@@ -318,6 +322,7 @@ components:
       description: >-
         Категория товара: food — горячая еда; drink — напитки; snack — снеки; service — услуги (например, аренда
         гарнитуры); merch — мерч; time — пакеты времени, продаваемые через магазин.
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Shop/Product.cs:9"
 
     Product:
@@ -366,6 +371,7 @@ components:
         персоналом, списанная сумма возвращена.
       x-active-states: [pending, accepted, preparing, delivering]
       x-cancellable-states: [pending]
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Shop/Order.cs:9"
       x-csharp-helpers: "src/ClubShell.Contracts/Shop/Order.cs:31"
 
@@ -507,6 +513,7 @@ components:
         Состояние QR-входа: pending — ещё не отсканирован; scanned — отсканирован, ждёт подтверждения в приложении;
         confirmed — подтверждён, в QrLoginStatus.auth лежит AuthResponse (однократное чтение); expired — истёк или
         уже использован.
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Users/AuthRequest.cs:29"
 
     AuthRequest:
@@ -700,13 +707,17 @@ components:
         Роль пользователя, упорядочена по привилегиям: guest — временный гость; member — зарегистрированный
         участник; vip — VIP; admin — персонал клуба.
       x-privilege-order: [guest, member, vip, admin]
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:13"
 
     Locale:
       type: string
       enum: [en, ru, uz]
-      description: Язык интерфейса — английский, русский, узбекский.
-      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:30"
+      description: >-
+        Язык интерфейса — английский, русский, узбекский. Незнакомый язык в серверном конфиге
+        (AgentServerConfig.shell.locale) агент с club-shell feat/shell-changes игнорирует (PolicyHandlers.cs:164).
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:33"
 
     UserFlags:
       type: string
@@ -934,7 +945,8 @@ components:
       type: string
       enum: [info, warning, error, success]
       description: Важность уведомления — информация, предупреждение, ошибка, успех.
-      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:164"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:170"
 
     NotificationAction:
       type: object
@@ -989,7 +1001,8 @@ components:
       type: string
       enum: [text, system, admin]
       description: Вид сообщения чата — обычное сообщение пользователя, системное, от персонала клуба.
-      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:209"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:218"
 
     ChatRooms:
       type: string
@@ -1085,7 +1098,8 @@ components:
       description: >-
         Жизненный цикл брони: reserved — забронировано, ждёт подтверждения/депозита; confirmed — подтверждено;
         cancelled — отменено; expired — истекло неиспользованным.
-      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:283"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:295"
 
     Seat:
       type: object
@@ -1179,7 +1193,8 @@ components:
       description: >-
         Жизненный цикл турнира: upcoming — анонсирован, регистрация закрыта; registration — идёт регистрация;
         live — идёт; finished — завершён.
-      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:345"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Users/UserProfile.cs:360"
 
     BracketMatch:
       type: object

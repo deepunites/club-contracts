@@ -1417,78 +1417,80 @@ components:
     AdminNotifications:
       type: object
       description: >-
-        Уведомления владельцу. В моке — Telegram-бот; Telegram в продукте запрещён, поэтому `telegramBotToken`,
-        `telegramChatId` и `events` сервер не хранит и не использует: на входе игнорирует, в ответе отдаёт `""` и все
-        ключи `events` = false (касса объявляет поля обязательными). Работает только `bigTopupAt`.
+        Уведомления владельцу: только порог `bigTopupAt`. Telegram в продукте запрещён: `telegramBotToken`,
+        `telegramChatId` и `events` сервер не хранит, не использует и не отдаёт. Касса club-shell `feat/shell-changes`
+        (SHELL_CHANGES п. 17) объявляет `notifications?: { bigTopupAt: number }` и Telegram-полей не читает; поля
+        оставлены в схеме как `deprecated` до `/api/v2` (правило совместимости). Мок с этой ветки отдаёт только
+        `bigTopupAt` (документ клуба v4 удаляет сохранённые настройки Telegram).
       required:
-        - telegramBotToken
-        - telegramChatId
-        - events
         - bigTopupAt
       properties:
         telegramBotToken:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: >-
-            Токен Telegram-бота. Запрещено: всегда `""`. (Мок хранит, в GET отдаёт `••••`, а `••••` в PATCH сохраняет
-            прежний токен.)
+          description: Токен Telegram-бота. Запрещено — сервер не отдаёт.
         telegramChatId:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: Chat id Telegram. Запрещено — всегда `""`.
+          description: Chat id Telegram. Запрещено — сервер не отдаёт.
         events:
           type: object
+          deprecated: true
           propertyNames:
             $ref: '#/components/schemas/AdminClubEvent'
           additionalProperties:
             type: boolean
           x-prohibited: telegram
           description: >-
-            Какие события слать в Telegram, ключи — `AdminClubEvent` (в моке гейтят только отправку в Telegram; вебхуки
-            подписываются своими `events`). Запрещено — сервер отдаёт все ключи = false.
+            Какие события слать в Telegram (прежний мок). Запрещено — сервер не отдаёт; вебхуки подписываются своими
+            `events`.
         bigTopupAt:
           type: integer
           format: int64
           minimum: 0
           description: Порог «крупного пополнения», тийины (событие `bigTopup` и флаг контроля `bigCash`).
       x-source:
-        - apps/admin/src/api.ts:285
-        - tools/MockServer/src/club.ts:256
-        - tools/MockServer/src/club.ts:561
-        - tools/MockServer/src/routes/club.ts:268
-        - tools/MockServer/src/routes/club.ts:323
+        - apps/admin/src/api.ts:330
+        - tools/MockServer/src/club.ts:394
+        - tools/MockServer/src/routes/club.ts:289
 
     AdminNotificationsInput:
       type: object
       description: >-
-        `notifications` в теле `PATCH /admin/club`. Все поля необязательны. Telegram-поля сервер игнорирует (Telegram
-        запрещён); отсутствующий или нечисловой `bigTopupAt` оставляет прежнее значение. Касса шлёт объект целиком, как
-        `AdminNotifications`.
+        `notifications` в теле `PATCH /admin/club`. Все поля необязательны. Касса club-shell `feat/shell-changes` шлёт
+        `{ bigTopupAt }`; Telegram-поля (их шлёт старая касса) сервер принимает и игнорирует (Telegram запрещён);
+        отсутствующий или нечисловой `bigTopupAt` оставляет прежнее значение.
       properties:
         telegramBotToken:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: Игнорируется. (Мок сохраняет; `••••` — оставить прежний токен.)
+          description: Игнорируется.
         telegramChatId:
           type: string
+          deprecated: true
           x-prohibited: telegram
           description: Игнорируется.
         events:
           type: object
+          deprecated: true
           propertyNames:
             $ref: '#/components/schemas/AdminClubEvent'
           additionalProperties:
             type: boolean
           x-prohibited: telegram
-          description: Игнорируется. (Мок сливает с сохранёнными ключами.)
+          description: Игнорируется.
         bigTopupAt:
           type: integer
           format: int64
           minimum: 0
           description: Новый порог «крупного пополнения», тийины; отсутствует — прежний. Мок знак не проверяет.
       x-source:
-        - apps/admin/src/api.ts:285
-        - tools/MockServer/src/routes/club.ts:323
+        - apps/admin/src/api.ts:330
+        - apps/admin/src/pages/IntegrationsPage.tsx:245
+        - tools/MockServer/src/routes/club.ts:316
 
     AdminWebhook:
       type: object
@@ -1659,7 +1661,8 @@ components:
       type: object
       description: >-
         Документ настроек клуба, который редактирует владелец. Читать может любой сотрудник (кассе нужны группы клиентов),
-        менять — владелец (`PATCH /admin/club`). Деньги — тийины.
+        менять — владелец (`PATCH /admin/club`). Деньги — тийины. Секретов в документе нет: ключ API клуба владелец
+        читает отдельно, `GET /admin/club/api-key`.
       required:
         - branding
         - features
@@ -1679,7 +1682,6 @@ components:
         - notifications
         - webhooks
         - control
-        - apiKey
         - events
       properties:
         branding:
@@ -1739,16 +1741,17 @@ components:
         apiKey:
           type: string
           readOnly: true
+          deprecated: true
+          x-sensitive: true
           description: >-
-            Ключ API клуба `ck_<32 hex>` для интеграций: принимается как токен владельца (`Authorization: Bearer ck_…`)
-            на `/admin/*`. Меняется только `POST /admin/club/api-key`. Отдаётся любому сотруднику, как в моке
-            (см. `x-open-question`).
-          x-open-question: >-
-            `GET /admin/club` доступен любому сотруднику (tools/MockServer/src/routes/club.ts:250 `requireStaff(req)`),
-            а мок кладёт в ответ `apiKey: c.apiKey` (routes/club.ts:271). Ключ действует как токен владельца, то есть
-            кассир может повысить себя до владельца. Предложение: кассиру отдавать `""` (касса показывает ключ только
-            на странице «Интеграции», которая ownerOnly — apps/admin/src/App.tsx:138, pages/IntegrationsPage.tsx:88).
-            Норма контракта не меняется до решения владельца.
+            Ключ API клуба `ck_<32 hex>` (действует как токен владельца на `/admin/*`). Сервер его здесь **не отдаёт**
+            (SHELL_CHANGES п. 16): документ читает любой сотрудник, а ключ повышал бы кассира до владельца. Владелец
+            читает ключ через `GET /admin/club/api-key`. Касса club-shell `feat/shell-changes` берёт ключ оттуда, а
+            это поле читает только как запасной вариант от старого сервера (`apiKey?: string`). Свойство оставлено как
+            `deprecated` до `/api/v2`.
+          x-source:
+            - apps/admin/src/api.ts:333
+            - apps/admin/src/pages/IntegrationsPage.tsx:93
         events:
           type: array
           readOnly: true
@@ -1756,9 +1759,9 @@ components:
             $ref: '#/components/schemas/AdminClubEvent'
           description: Справочник всех событий клуба (для выбора подписок вебхука).
       x-source:
-        - apps/admin/src/api.ts:269
+        - apps/admin/src/api.ts:313
         - tools/MockServer/src/club.ts:232
-        - tools/MockServer/src/routes/club.ts:249
+        - tools/MockServer/src/routes/club.ts:289
 
     AdminClubSettingsPatch:
       type: object
@@ -1841,16 +1844,20 @@ components:
 
     AdminApiKeyResponse:
       type: object
-      description: Новый ключ API клуба; прежний перестаёт действовать сразу.
+      description: >-
+        Ключ API клуба: текущий (`GET /admin/club/api-key`) или новый после замены (`POST`; прежний перестаёт
+        действовать сразу). Только владельцу.
       required:
         - apiKey
       properties:
         apiKey:
           type: string
+          x-sensitive: true
           description: Ключ `ck_<32 hex>`.
       x-source:
-        - apps/admin/src/api.ts:519
-        - tools/MockServer/src/routes/club.ts:343
+        - apps/admin/src/api.ts:597
+        - apps/admin/src/api.ts:598
+        - tools/MockServer/src/routes/club.ts:375
 
     # ----------------------------------------------------------------------------------------------------------------
     # Тарифы и цена
@@ -2059,7 +2066,6 @@ components:
         - blacklisted
         - phone
         - birthYear
-        - telegram
         - spent
         - visits
         - level
@@ -2108,8 +2114,21 @@ components:
           description: Год рождения (для ограничений несовершеннолетних); null — неизвестен.
         telegram:
           type: string
+          deprecated: true
           x-prohibited: telegram
-          description: Telegram клиента. Запрещено — сервер не хранит, всегда `""`.
+          description: >-
+            Telegram клиента. Запрещено — сервер не хранит и не отдаёт; касса club-shell `feat/shell-changes` поле не
+            читает (SHELL_CHANGES п. 17). Свойство оставлено как `deprecated` до `/api/v2`.
+        cardId:
+          type:
+            - string
+            - 'null'
+          maxLength: 64
+          description: >-
+            Номер клубной карты для входа на ПК (`POST /auth/login`, `kind = card`); null — карты нет. Уникален без учёта
+            регистра. Задаётся при регистрации или `POST /admin/clients/{id}/card`. Касса club-shell
+            `feat/shell-changes` (SHELL_CHANGES п. 18) объявляет `cardId?: string | null`: старый сервер поле не
+            отдаёт.
         spent:
           type: integer
           format: int64
@@ -2128,8 +2147,8 @@ components:
           type: string
           description: Название уровня.
       x-source:
-        - apps/admin/src/api.ts:425
-        - tools/MockServer/src/routes/club.ts:79
+        - apps/admin/src/api.ts:498
+        - tools/MockServer/src/routes/club.ts:86
         - tools/MockServer/src/club.ts:71
 
     AdminClientList:
@@ -2148,7 +2167,10 @@ components:
 
     AdminClientCreateRequest:
       type: object
-      description: Регистрация клиента на кассе (роль member, нулевой баланс).
+      description: >-
+        Регистрация клиента на кассе (роль member, нулевой баланс). Касса club-shell `feat/shell-changes`
+        (SHELL_CHANGES п. 18) всегда шлёт `password` — введённый кассиром или сгенерированный временный, который касса
+        показывает один раз, — и при необходимости `cardId`.
       required:
         - displayName
         - username
@@ -2184,17 +2206,33 @@ components:
         telegram:
           type: string
           maxLength: 64
+          deprecated: true
           x-prohibited: telegram
-          description: Telegram клиента. Запрещено — сервер принимает и игнорирует.
+          description: Telegram клиента. Запрещено — сервер принимает и игнорирует; касса club-shell `feat/shell-changes` не шлёт.
         password:
           type: string
+          minLength: 4
+          maxLength: 64
+          x-sensitive: true
+          description: >-
+            Пароль входа на ПК (`POST /auth/login`, `kind = password`). Короче 4 символов — `400 validation`,
+            `field = password`, `reason = min`. Нет поля — сервер ставит случайный пароль, которого никто не знает
+            (выдать его можно только сбросом `POST /admin/clients/{id}/password`); прежнего пароля по умолчанию `demo`
+            больше нет.
+        cardId:
+          type:
+            - string
+            - 'null'
           maxLength: 64
           description: >-
-            Пароль входа на ПК. Касса не шлёт; мок принимает и по умолчанию ставит `demo`. Как клиент, созданный на
-            кассе, получает учётные данные, — открытый вопрос.
+            Номер клубной карты для входа на ПК; пробелы по краям обрезаются, пусто или null — без карты. Уже привязан к
+            другому клиенту (без учёта регистра) — `400 validation`, `field = cardId`, `reason = taken`.
       x-source:
-        - apps/admin/src/api.ts:530
-        - tools/MockServer/src/routes/club.ts:413
+        - apps/admin/src/api.ts:608
+        - apps/admin/src/pages/ClientsPage.tsx:359
+        - tools/MockServer/src/routes/club.ts:447
+        - tools/MockServer/src/routes/club.ts:110
+        - tools/MockServer/src/routes/club.ts:117
 
     AdminClientUpdateRequest:
       type: object
@@ -2231,8 +2269,9 @@ components:
             - string
             - 'null'
           maxLength: 64
+          deprecated: true
           x-prohibited: telegram
-          description: Telegram клиента. Запрещено — сервер принимает и игнорирует.
+          description: Telegram клиента. Запрещено — сервер принимает и игнорирует; касса club-shell `feat/shell-changes` не шлёт.
         birthYear:
           type:
             - integer
@@ -2247,9 +2286,48 @@ components:
             - owner
           description: Чёрный список (только владелец).
       x-source:
-        - apps/admin/src/api.ts:538
+        - apps/admin/src/api.ts:621
         - apps/admin/src/pages/ClientsPage.tsx:120
-        - tools/MockServer/src/routes/club.ts:449
+        - tools/MockServer/src/routes/club.ts:485
+
+    AdminClientPasswordRequest:
+      type: object
+      description: >-
+        Тело `POST /admin/clients/{id}/password`: новый пароль входа клиента. Касса генерирует временный пароль и
+        показывает его кассиру один раз (SHELL_CHANGES п. 18).
+      required:
+        - password
+      properties:
+        password:
+          type: string
+          minLength: 4
+          maxLength: 64
+          x-sensitive: true
+          description: Новый пароль (4–64 символа; короче — `400 validation`, `reason = min`; нет — `reason = required`).
+      x-source:
+        - apps/admin/src/api.ts:617
+        - tools/MockServer/src/routes/club.ts:110
+        - tools/MockServer/src/routes/club.ts:524
+
+    AdminClientCardRequest:
+      type: object
+      description: >-
+        Тело `POST /admin/clients/{id}/card`: привязать клубную карту к клиенту или отвязать её.
+      required:
+        - cardId
+      properties:
+        cardId:
+          type:
+            - string
+            - 'null'
+          maxLength: 64
+          description: >-
+            Номер карты; пробелы по краям обрезаются. null или пустая строка — отвязать карту. Уже у другого клиента
+            (без учёта регистра) — `400 validation`, `field = cardId`, `reason = taken`.
+      x-source:
+        - apps/admin/src/api.ts:619
+        - tools/MockServer/src/routes/club.ts:117
+        - tools/MockServer/src/routes/club.ts:535
 
     AdminClientResponse:
       type: object
@@ -3074,10 +3152,20 @@ components:
         - stockReceive
         - stockEdit
         - pcCommand
+        - clientPassword
+        - clientCard
       description: >-
-        Действие персонала в журнале. pcCommand — команда ПК с кассы и перевод тикета ремонта (`meta.kind = repair`).
+        Действие персонала в журнале. pcCommand — команда ПК с кассы и перевод тикета ремонта (`meta.kind = repair`);
+        clientPassword — кассир задал клиенту новый пароль; clientCard — привязал или отвязал карту (`meta.cardId`).
+      x-enum-added:
+        clientPassword: >-
+          club-shell feat/shell-changes (SHELL_CHANGES п. 18): касса этой ветки подписывает значение
+          (ControlPage.tsx:40); старая касса показывает пустую подпись действия.
+        clientCard: >-
+          club-shell feat/shell-changes (SHELL_CHANGES п. 18): касса этой ветки подписывает значение
+          (ControlPage.tsx:41); старая касса показывает пустую подпись действия.
       x-source:
-        - apps/admin/src/api.ts:306
+        - apps/admin/src/api.ts:347
         - tools/MockServer/src/club.ts:177
 
     AdminAuditEntry:
