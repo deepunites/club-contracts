@@ -195,14 +195,18 @@ paths:
       operationId: leaseAccount
       summary: Аренда аккаунта лаунчера из пула клуба
       description: |
-        **Не реализуется в сервере v1.** Пул аккаунтов клуба — открытый продуктовый вопрос Q8. Кроме того, текущий
-        агент подставляет расшифрованный пароль аренды в командную строку лаунчера (`AccountInjector.cs`: Steam
-        `-login <user> <pass>`, Epic `-AUTH_PASSWORD=<pass>`), а пароль в командной строке лаунчера в продукте запрещён.
+        **Не реализуется в сервере v1.** Пул аккаунтов клуба — открытый продуктовый вопрос Q8. Старые агенты
+        подставляли расшифрованный пароль аренды в командную строку лаунчера (Steam `-login <user> <pass>`, Epic
+        `-AUTH_PASSWORD=<pass>`), а это в продукте запрещено. Агент с club-shell `feat/shell-changes` (SHELL_CHANGES
+        п. 10-11) пароля туда не кладёт: Steam и Epic получают сессию из `extra.files` (Steam — с автологином в профиле
+        kiosk), Epic — одноразовый exchange-код (`extra.authType = "exchangeCode"`), иначе лаунчер стартует без учётных
+        данных; пароль — только при `games.accountPool.allowPasswordOnCommandLine = true` (по умолчанию false).
 
-        Чтобы агент вообще не обращался к маршруту, сервер v1 обязан отдавать `requiresAccount: false` у всех игр и
-        `games.accountPool.enabled: false` в `GET /agents/{pcId}/config`. Иначе запуск такой игры вызывает этот GET
-        (`501` → `serverUnavailable` → до 5 HTTP-попыток × 3 попытки `AccountPool`, всё в общий circuit breaker), и
-        запуск заканчивается `accountPoolExhausted`.
+        Чтобы агент вообще не обращался к маршруту, сервер v1 отдаёт `requiresAccount: false` у всех игр и
+        `games.accountPool.enabled: false` в `GET /agents/{pcId}/config`; у агента с club-shell `feat/shell-changes`
+        пул и так выключен по умолчанию (SHELL_CHANGES п. 5). Если запрос всё же придёт: агент с этой ветки на `501`
+        сразу отдаёт шеллу ошибку `notImplemented` (без повторов), старые агенты — до 5 HTTP-попыток × 3 попытки
+        `AccountPool` в общий circuit breaker и затем `accountPoolExhausted`.
 
         Контракт клиента (на будущее): режим `user`; `sessionId` — открытая сессия этого пользователя; ответ
         `AccountLease` с `secret` = AES-256-GCM (ключ — HKDF-SHA256 от `signingSecret`, info `account-pool`), base64
@@ -441,8 +445,19 @@ paths:
         и `result.error`) и после выхода из игры (`phase = exit`, `result.ok = true`, `exitCode`, `playedSec`). Ответ
         `204` без тела (агент принимает любой 2xx).
 
-        - Без `Idempotency-Key`: агент POST не повторяет, любую ошибку только логирует — отчёт теряется. Сервер не
-          должен рассчитывать на доставку каждого отчёта.
+        - Без `Idempotency-Key`: HTTP-повторов нет. Агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 6) кладёт
+          недоставленный отчёт в офлайн-очередь (`cache/offline.db`, таблица `reports`, до `offline.maxQueue`) и
+          повторяет его вместе с outbox — после сетевой ошибки, тайм-аута, отмены и ошибок с кодом `timeout`,
+          `rateLimited`, `serverUnavailable`, `agentOffline`, `unauthorized`, `forbidden` (по статусу: `408`, `429`,
+          `401`, `403`, `5xx` без распознанного кода, кроме `501`); прочие отказы (`4xx`, `internal`, `notImplemented`)
+          только логирует и отбрасывает. Если потерялся ответ, сервер получит тот же отчёт
+          (`phase = launch` или `exit`) повторно — обработка должна это терпеть (например, дедупликация по
+          `sessionId` + `phase` + `result.startedAt`). Очередь отчётов входит в `HeartbeatRequest.offlineQueue`.
+          Старые агенты отчёт не повторяли — он терялся. Сервер не должен рассчитывать на доставку каждого отчёта.
+        - `injectionError` (агент с club-shell `feat/shell-changes`, SHELL_CHANGES п. 10) — почему лаунчер при
+          аренде аккаунта подготовлен не чисто; сервер может поле игнорировать.
+        - `antiCheat.kind` для Riot-игры без пометки античита в каталоге агент с этой ветки пишет как `vanguard`
+          (SHELL_CHANGES п. 14).
         - Успешный `phase = launch` обновляет «последний запуск» пользователя (`Game.lastPlayedAt` для `userId`, мок).
         - Мок проверяет только наличие полей и значения enum (`launcher`, `phase`), существование `sessionId`/`userId`
           не проверяет. Нет игры — `404`, `details.what = "game"`.
@@ -451,8 +466,10 @@ paths:
         - src/ClubShell.Core/Http/Endpoints.cs:144
         - src/ClubShell.Core/Abstractions/IServerClient.cs:228
         - src/ClubShell.Core/Http/ServerClient.cs:373
-        - src/ClubShell.Agent/Games/GameLaunchService.cs:469
-        - src/ClubShell.Agent/Games/GameSessionTracker.cs:230
+        - src/ClubShell.Agent/Games/GameLaunchService.cs:489
+        - src/ClubShell.Agent/Games/GameSessionTracker.cs:235
+        - src/ClubShell.Agent/Session/OfflineSessionStore.cs:473
+        - src/ClubShell.Agent/Session/OfflineSessionStore.cs:868
         - docs/SERVER_API.md:330
         - tools/MockServer/src/routes/games.ts:172
       security:
@@ -534,8 +551,9 @@ paths:
       description: |
         **Не реализуется в сервере v1.** Агент вызывает маршрут только при `shell.features.apps = true`
         (иначе IPC `apps.list` отдаёт пустой список, `GameHandlers.cs:87`), поэтому сервер v1 выключает `features.apps`
-        в `GET /agents/{pcId}/config` (`shell.features`). При временной ошибке (в том числе `501`) и наличии кэша агент
-        отдаёт кэш.
+        в `GET /agents/{pcId}/config` (`shell.features`). При временной ошибке и наличии кэша агент отдаёт кэш; на
+        `501` агент с club-shell `feat/shell-changes` отдаёт шеллу `notImplemented` (без повторов и без кэша), старые
+        агенты считают 501 временной ошибкой.
 
         Контракт клиента: режим `agent`, `ETag`/`If-None-Match`; ответ `AppsListResponse`, `allowed` считается сервером
         по зоне, агент дополнительно сверяет со своей политикой запуска.
@@ -1156,15 +1174,17 @@ paths:
         `403 notOwner`). `activeOnly=true` — только незавершённые (не `done` и не `cancelled`). Ответ `OrderPage`,
         новые первыми.
 
-        Внимание: шелл вызывает IPC `shop.orders` при каждом входе пользователя, а агент **не** проверяет
-        `features.shop` для этого IPC — маршрут будет вызываться и при выключенном магазине (см. открытый вопрос группы).
-        Агент не повторяет на уровне IPC; шелл показывает ошибку в списке заказов.
+        Шелл вызывает IPC `shop.orders` при каждом входе пользователя. Агент с club-shell `feat/shell-changes`
+        (SHELL_CHANGES п. 4) проверяет `features.shop`: при выключенном магазине отвечает шеллу `policyDenied`
+        (`rule = features.shop`) и на сервер не ходит. Старые агенты флаг не проверяли — маршрут вызывался при каждом
+        входе и при выключенном магазине. Агент не повторяет на уровне IPC; шелл показывает ошибку в списке заказов.
       x-server-status: notImplemented
       x-source:
         - src/ClubShell.Core/Http/Endpoints.cs:63
         - src/ClubShell.Core/Abstractions/IServerClient.cs:266
         - src/ClubShell.Core/Http/ServerClient.cs:439
-        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:789
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:800
+        - src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:803
         - apps/shell/src/store/index.ts:47
         - docs/SERVER_API.md:370
         - tools/MockServer/src/routes/shop.ts:140

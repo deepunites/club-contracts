@@ -14,7 +14,10 @@
 # - Касса — браузерное приложение на другом origin: сервер обязан отвечать на CORS (preflight с `Authorization`,
 #   `Content-Type`), как мок (`@fastify/cors`, origin: true, index.ts:236).
 # - Касса всегда шлёт `Content-Type: application/json`, в том числе у GET/DELETE без тела; пустое тело = null.
-# - Касса `Idempotency-Key` не шлёт; создающие/денежные POST принимают его необязательно (`IdempotencyKeyOptional`).
+# - Создающие/денежные POST принимают `Idempotency-Key` необязательно (`IdempotencyKeyOptional`). Касса club-shell
+#   feat/shell-changes (SHELL_CHANGES п. 15) шлёт его на семи денежных маршрутах: /admin/sessions, /admin/sessions/extend,
+#   /admin/sessions/end, /admin/wallet/topup, /admin/promo/redeem, /admin/products/{id}/receive, /admin/shift/close.
+# - Выход — `POST /admin/logout` отзывает токен (SHELL_CHANGES п. 16).
 # - Статус успеха — 200, кроме `POST /admin/sessions` (201); касса проверяет только `res.ok`.
 paths:
 
@@ -30,8 +33,8 @@ paths:
       summary: Вход персонала по PIN
       description: |
         Выдаёт токен персонала по PIN активного сотрудника. Режим `none` (токена ещё нет). Ответ — токен, сотрудник и
-        открытая смена клуба. Касса хранит токен в localStorage и шлёт как `Authorization: Bearer`. Выхода (logout) в
-        контракте нет: касса просто забывает токен; токен перестаёт действовать при отключении сотрудника.
+        открытая смена клуба. Касса хранит токен в localStorage и шлёт как `Authorization: Bearer`. Токен перестаёт
+        действовать после `POST /admin/logout` и при отключении сотрудника.
 
         Ошибки: неверный PIN — `401 unauthorized`, `details.reason = "invalidPin"` (касса на 401 этого маршрута не
         выходит, а показывает ошибку).
@@ -80,6 +83,55 @@ paths:
         '401':
           $ref: '#/components/responses/Unauthorized'
           description: '`unauthorized`, `details.reason = "invalidPin"` — нет активного сотрудника с таким PIN.'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/logout:
+    post:
+      tags:
+        - admin
+      operationId: adminLogout
+      summary: Выход персонала (отзыв токена)
+      description: |
+        Отзывает токен персонала из `Authorization: Bearer`: дальнейшие запросы с ним — `401`, `details.reason =
+        "invalid"`. Кнопка «Выйти» кассы club-shell `feat/shell-changes` (SHELL_CHANGES п. 16) вызывает маршрут и, не
+        дожидаясь ответа, забывает токен локально. Тело — пустой объект `{}`. Всегда `200 { ok: true }`, в том числе для
+        неизвестного или уже отозванного токена (повторный выход безвреден), поэтому `401` здесь нет. Ключ API клуба
+        `ck_…` этим маршрутом не отзывается (для него — `POST /admin/club/api-key`).
+      x-server-status: required
+      x-server-note: >-
+        required: без отзыва токен персонала бессрочен — украденный из localStorage кассы токен работает, пока сотрудника
+        не отключат (docs/OPEN_QUESTIONS.md, admin). Реализация тривиальна (удалить токен из хранилища), а касса этой
+        ветки вызывает маршрут при каждом выходе.
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:582
+        - apps/admin/src/App.tsx:426
+        - tools/MockServer/src/routes/club.ts:175
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Токен отозван (или уже не действовал).
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
         '500':
           $ref: '#/components/responses/InternalError'
 
@@ -394,14 +446,15 @@ paths:
         - owner
         - cashier
       x-source:
-        - apps/admin/src/api.ts:514
+        - apps/admin/src/api.ts:592
         - apps/admin/src/pages/ShiftPage.tsx:149
-        - tools/MockServer/src/routes/club.ts:222
+        - tools/MockServer/src/routes/club.ts:260
         - tools/MockServer/src/control.ts:209
       security:
         - staffBearer: []
       parameters:
         - $ref: '#/components/parameters/XTraceId'
+        - $ref: '#/components/parameters/IdempotencyKeyOptional'
       requestBody:
         required: true
         content:
@@ -416,6 +469,8 @@ paths:
               $ref: '#/components/headers/XTraceIdResponse'
             X-Server-Time:
               $ref: '#/components/headers/XServerTime'
+            Idempotent-Replayed:
+              $ref: '#/components/headers/IdempotentReplayed'
           content:
             application/json:
               schema:
@@ -792,18 +847,18 @@ paths:
       description: |
         Всё, что владелец настраивает на страницах «Клуб»: брендинг, разделы шелла, зоны, цены, группы, бонусы,
         промокоды, счастливые часы, лояльность, ограничения, каталог, баннеры, правила, склад, автоматизация,
-        уведомления, вебхуки, пороги контроля, ключ API. Читают все сотрудники (кассе нужны группы клиентов).
-        Telegram-поля `notifications` запрещены (x-prohibited: telegram): всегда `""`/false. Ключ API — предложение
-        контракта: кассиру `""` (мок отдаёт любому сотруднику).
+        уведомления, вебхуки, пороги контроля. Читают все сотрудники (кассе нужны группы клиентов), поэтому секретов в
+        ответе нет: ключа API (`apiKey`) сервер не отдаёт — владелец читает его `GET /admin/club/api-key`
+        (SHELL_CHANGES п. 16). Telegram-поля `notifications` запрещены и не отдаются (SHELL_CHANGES п. 17).
       x-server-status: required
       x-roles:
         - owner
         - cashier
       x-source:
-        - apps/admin/src/api.ts:517
+        - apps/admin/src/api.ts:595
         - apps/admin/src/settings.ts:29
         - apps/admin/src/pages/ClientsPage.tsx:382
-        - tools/MockServer/src/routes/club.ts:249
+        - tools/MockServer/src/routes/club.ts:289
       security:
         - staffBearer: []
       parameters:
@@ -834,14 +889,15 @@ paths:
         Частичное изменение: касса шлёт только изменённые ключи верхнего уровня, каждый целиком заменяет сохранённый
         (правила слияния — `AdminClubSettingsPatch`). Изменение `features`/`branding`/`catalog`/`rulesText`/`banners`
         повышает версию конфигурации агентов и каталога игр. После успеха касса перечитывает `GET /admin/club`.
-        Telegram-поля принимаются и игнорируются.
+        Telegram-поля (их шлёт старая касса) принимаются и игнорируются; касса club-shell `feat/shell-changes` шлёт
+        `notifications` только с `bigTopupAt`.
       x-server-status: required
       x-roles:
         - owner
       x-source:
-        - apps/admin/src/api.ts:518
+        - apps/admin/src/api.ts:596
         - apps/admin/src/settings.ts:60
-        - tools/MockServer/src/routes/club.ts:277
+        - tools/MockServer/src/routes/club.ts:316
       security:
         - staffBearer: []
       parameters:
@@ -876,6 +932,49 @@ paths:
           $ref: '#/components/responses/InternalError'
 
   /admin/club/api-key:
+    get:
+      tags:
+        - admin
+      operationId: adminApiKey
+      summary: Текущий ключ API клуба (только владелец)
+      description: |
+        Текущий ключ `ck_…` для интеграций. Только владелец: ключ действует как токен владельца на `/admin/*`, поэтому
+        кассиру — `403 forbidden`, `details.reason = "ownerOnly"`. Касса club-shell `feat/shell-changes`
+        (SHELL_CHANGES п. 16) показывает ключ на странице «Интеграции» только отсюда: в `GET /admin/club` его больше нет.
+      x-server-status: required
+      x-server-note: >-
+        required: после того как `GET /admin/club` перестал отдавать ключ, это единственный способ владельцу увидеть
+        действующий ключ, не заменяя его (замена ломает уже настроенные интеграции). Реализация тривиальна.
+      x-roles:
+        - owner
+      x-source:
+        - apps/admin/src/api.ts:597
+        - apps/admin/src/pages/IntegrationsPage.tsx:73
+        - tools/MockServer/src/routes/club.ts:375
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      responses:
+        '200':
+          description: Текущий ключ.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminApiKeyResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+          description: '`forbidden`, `details.reason = "ownerOnly"` — нужна роль владельца.'
+        '500':
+          $ref: '#/components/responses/InternalError'
     post:
       tags:
         - admin
@@ -888,10 +987,10 @@ paths:
       x-roles:
         - owner
       x-source:
-        - apps/admin/src/api.ts:519
-        - apps/admin/src/pages/IntegrationsPage.tsx:140
-        - tools/MockServer/src/routes/club.ts:341
-        - tools/MockServer/src/routes/club.ts:69
+        - apps/admin/src/api.ts:598
+        - apps/admin/src/pages/IntegrationsPage.tsx:128
+        - tools/MockServer/src/routes/club.ts:380
+        - tools/MockServer/src/routes/club.ts:71
       security:
         - staffBearer: []
       parameters:
@@ -930,20 +1029,18 @@ paths:
       operationId: adminTestNotification
       summary: Тестовое уведомление в Telegram (запрещено)
       description: |
-        В моке — тестовое сообщение Telegram-боту владельца (и вебхукам, подписанным на `ruleFired`). Telegram в
-        продукте запрещён: сервер v1 не реализует, отвечает `501` (`serverUnavailable`,
-        `details.reason = "notImplemented"`). Касса вызывает маршрут только при сохранённых токене бота и chat id, а
-        сервер их всегда отдаёт пустыми — поэтому на практике вызова не будет.
+        Прежний мок слал тестовое сообщение Telegram-боту владельца. Telegram в продукте запрещён: сервер не реализует
+        маршрут и отвечает `501 notImplemented`. Касса и мок club-shell `feat/shell-changes` (SHELL_CHANGES п. 17)
+        маршрут не вызывают и не содержат; операция остаётся в контракте только до `/api/v2` (удалять операции можно
+        только в новой версии) — для старых сборок кассы.
       x-server-status: notImplemented
       x-prohibited: telegram
       x-roles:
         - owner
+      deprecated: true
       x-source:
-        - apps/admin/src/api.ts:520
-        - apps/admin/src/pages/IntegrationsPage.tsx:90
-        - apps/admin/src/pages/IntegrationsPage.tsx:99
-        - tools/MockServer/src/routes/club.ts:348
-        - tools/MockServer/src/club.ts:564
+        - tools/MockServer/src/club.ts:5
+        - apps/admin/src/pages/IntegrationsPage.tsx:240
       security:
         - staffBearer: []
       parameters:
@@ -956,7 +1053,7 @@ paths:
               type: object
       responses:
         '200':
-          description: (Мок) уведомление отправлено.
+          description: (Прежний мок) уведомление отправлено.
           headers:
             X-Trace-Id:
               $ref: '#/components/headers/XTraceIdResponse'
@@ -1274,17 +1371,22 @@ paths:
       operationId: adminAddClient
       summary: Зарегистрировать клиента
       description: |
-        Создаёт пользователя-участника (member, нулевые балансы) и его профиль клуба. Логин уникален без учёта регистра
-        (`400 validation`, `field = username`, `reason = taken`). Поле `telegram` запрещено — принимается и
-        игнорируется.
+        Создаёт пользователя-участника (member, нулевые балансы) и его профиль клуба с паролем и, при необходимости,
+        картой, чтобы клиент мог войти на ПК (SHELL_CHANGES п. 18). Касса club-shell `feat/shell-changes` всегда шлёт
+        `password` (введённый или сгенерированный временный, показывается кассиру один раз). Без `password` сервер
+        ставит случайный пароль, которого никто не знает. Поле `telegram` запрещено — принимается и игнорируется.
+
+        Ошибки `400 validation`: `field = username`, `reason = taken` (логин занят без учёта регистра);
+        `field = password`, `reason = min` (короче 4 символов); `field = cardId`, `reason = taken` (карта у другого
+        клиента).
       x-server-status: required
       x-roles:
         - owner
         - cashier
       x-source:
-        - apps/admin/src/api.ts:530
-        - apps/admin/src/pages/ClientsPage.tsx:291
-        - tools/MockServer/src/routes/club.ts:413
+        - apps/admin/src/api.ts:608
+        - apps/admin/src/pages/ClientsPage.tsx:359
+        - tools/MockServer/src/routes/club.ts:447
       security:
         - staffBearer: []
       parameters:
@@ -1335,8 +1437,9 @@ paths:
       description: |
         Частичное изменение профиля: имя, группа, заметка, телефон, год рождения, чёрный список (только владелец —
         кассиру `403 forbidden`, `details.reason = "ownerOnly"`). Смена группы (флаг `discount` при большой скидке) и
-        чёрного списка пишутся в журнал контроля. `telegram` запрещён — принимается и игнорируется.
-        Нет клиента — `404`, `details.what = "user"`.
+        чёрного списка пишутся в журнал контроля. `telegram` запрещён — принимается и игнорируется (касса club-shell
+        `feat/shell-changes` его не шлёт). Пароль и карту этот маршрут не меняет — для них
+        `POST /admin/clients/{id}/password` и `/card`. Нет клиента — `404`, `details.what = "user"`.
       x-server-status: required
       x-roles:
         - owner
@@ -1344,10 +1447,9 @@ paths:
       x-owner-only-fields:
         - blacklisted
       x-source:
-        - apps/admin/src/api.ts:538
+        - apps/admin/src/api.ts:621
         - apps/admin/src/pages/ClientsPage.tsx:129
-        - tools/MockServer/src/routes/club.ts:449
-        - tools/MockServer/src/routes/club.ts:463
+        - tools/MockServer/src/routes/club.ts:485
       security:
         - staffBearer: []
       parameters:
@@ -1378,6 +1480,135 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
           description: '`forbidden`, `details.reason = "ownerOnly"` — `blacklisted` меняет только владелец.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{id}/password:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор клиента (пользователя).
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - admin
+      operationId: adminSetClientPassword
+      summary: Задать клиенту новый пароль
+      description: |
+        «Сбросить пароль» в кассе (SHELL_CHANGES п. 18): касса генерирует временный пароль, отправляет его сюда и
+        показывает кассиру один раз, чтобы тот передал его клиенту. Прежний пароль перестаёт действовать. Журнал
+        контроля — `clientPassword`.
+
+        Ошибки: `400 validation`, `field = password`, `reason` ∈ `required` | `min` (4–64 символа); нет клиента или это
+        гость — `404`, `details.what = "user"`.
+      x-server-status: required
+      x-server-note: >-
+        required: единственный способ восстановить вход клиенту, созданному на кассе или забывшему пароль (вход по
+        паролю, `POST /auth/login`, в v1 required). Касса этой ветки вызывает маршрут кнопкой «Сбросить пароль».
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:617
+        - apps/admin/src/pages/ClientsPage.tsx:179
+        - tools/MockServer/src/routes/club.ts:524
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminClientPasswordRequest'
+      responses:
+        '200':
+          description: Пароль изменён.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OkResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalError'
+
+  /admin/clients/{id}/card:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        description: Идентификатор клиента (пользователя).
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags:
+        - admin
+      operationId: adminBindClientCard
+      summary: Привязать или отвязать клубную карту
+      description: |
+        «Привязать карту» в кассе (SHELL_CHANGES п. 18): карта для входа на ПК (`POST /auth/login`, `kind = card`).
+        `cardId` = null или пустая строка — отвязать. Ответ — карточка клиента после изменения. Журнал контроля —
+        `clientCard` с `meta.cardId`.
+
+        Ошибки: `400 validation`, `field = cardId`, `reason = taken` — карта уже у другого клиента (без учёта регистра);
+        нет клиента или это гость — `404`, `details.what = "user"`.
+      x-server-status: required
+      x-server-note: >-
+        required: вход по карте (`POST /auth/login`, `kind = card`) в v1 required, а потерянную или новую карту иначе
+        привязать нельзя — при регистрации карта задаётся только один раз. Касса этой ветки вызывает маршрут кнопкой
+        «Привязать карту».
+      x-roles:
+        - owner
+        - cashier
+      x-source:
+        - apps/admin/src/api.ts:619
+        - apps/admin/src/pages/ClientsPage.tsx:164
+        - tools/MockServer/src/routes/club.ts:535
+      security:
+        - staffBearer: []
+      parameters:
+        - $ref: '#/components/parameters/XTraceId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AdminClientCardRequest'
+      responses:
+        '200':
+          description: Карточка клиента после изменения.
+          headers:
+            X-Trace-Id:
+              $ref: '#/components/headers/XTraceIdResponse'
+            X-Server-Time:
+              $ref: '#/components/headers/XServerTime'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AdminClientResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+          description: '`unauthorized`, `details.reason = "invalid"` — нет/неверный токен персонала или сотрудник отключён.'
         '404':
           $ref: '#/components/responses/NotFound'
         '500':

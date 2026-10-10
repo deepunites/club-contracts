@@ -13,7 +13,8 @@
 #   VolumeState, SessionStartedEvent, SessionEndedEvent, AntiCheatReport, Balance, ChatMessage, Notification,
 #   Order, Booking, Tournament (последние — только по имени в x-*-schemas, не через $ref).
 # Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter; неизвестная
-# строка = JsonException у агента), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
+# строка = JsonException у агента, кроме enum с x-agent-fallback: unknown — агент с club-shell feat/shell-changes читает
+# её как unknown, JsonDefaults.cs:112), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
 # DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ. Переопределения в этих файлах: JsonIgnore(Never) у ServerError.details,
 # IpcError.details, WsFrame.payload (ключ пишется всегда, даже null); [JsonIgnore] у RefreshConfigCommand.IsAll,
 # AgentEvent.WireName, IpcError.IsRetryable (на провод не попадают). JsonPolymorphic/JsonPropertyName нет.
@@ -45,12 +46,14 @@ components:
         - internal
         - protocolError
         - versionMismatch
+        - notImplemented
       description: >-
         Код ошибки; один и тот же набор в REST-конверте (error.code), IPC (IpcError.code) и шелле. Сервер обязан
-        использовать только эти значения: неизвестную строку агент не распарсит, весь конверт будет отброшен, код
-        выведется из HTTP-статуса (x-from-http-status), а message и details потеряются. HTTP-статус ответа должен
-        совпадать с x-http-status. agentOffline, protocolError (для IPC-кадров) и timeout в основном порождает сам
-        агент; «не реализовано» (501) передаётся как serverUnavailable c details.reason = notImplemented.
+        использовать только эти значения. ErrorCode остаётся строгим (x-agent-fallback нет): код, которого агент не
+        знает, выводится из HTTP-статуса (x-from-http-status); агент с club-shell feat/shell-changes сохраняет при этом
+        message, details и traceId (ServerClient.cs:645), старые агенты отбрасывают конверт целиком. HTTP-статус ответа
+        должен совпадать с x-http-status. agentOffline, protocolError (для IPC-кадров) и timeout в основном порождает сам
+        агент; «не реализовано» (501) — notImplemented.
       x-enum-descriptions:
         unauthorized: Не аутентифицирован, неверный/истёкший токен или учётные данные (401).
         forbidden: Аутентифицирован, но нет прав (роль, привязка, возможность) (403).
@@ -77,6 +80,15 @@ components:
         internal: Непредвиденная ошибка; details = TraceDetails (500).
         protocolError: Нарушение формата конверта/кадра (400).
         versionMismatch: Версия протокола/приложения не поддерживается; details = VersionMismatchDetails (426).
+        notImplemented: >-
+          Операция есть в контракте, но этот сервер её не реализует (501, ответ NotImplemented); details = null или
+          ReasonDetails (reason = notImplemented). Не повторяется: агент не ретраит 501 и не засчитывает его в circuit
+          breaker (RetryPolicy.cs:57), IsRetryable = false.
+      x-enum-added:
+        notImplemented: >-
+          club-shell feat/shell-changes (SHELL_CHANGES п. 1): агент, шелл (Rust/TS после ContractsGen) и касса знают
+          значение. Старый агент код не распарсит, отбросит конверт и по статусу 501 выведет serverUnavailable — то же,
+          что давал прежний временный вариант (serverUnavailable + details.reason = notImplemented).
       x-http-status:
         unauthorized: 401
         forbidden: 403
@@ -98,6 +110,7 @@ components:
         internal: 500
         protocolError: 400
         versionMismatch: 426
+        notImplemented: 501
       x-from-http-status:
         description: >-
           Обратное отображение, которым агент пользуется, когда тело ответа не распарсилось как ServerErrorEnvelope
@@ -111,6 +124,7 @@ components:
         "409": conflict
         "426": versionMismatch
         "429": rateLimited
+        "501": notImplemented
         "504": timeout
         ">=500": serverUnavailable
         other: internal
@@ -130,18 +144,24 @@ components:
         versionMismatch: VersionMismatchDetails
         rateLimited: RateLimitDetails
         serverUnavailable: ReasonDetails
+        notImplemented: "null | ReasonDetails (reason = notImplemented)"
         internal: TraceDetails
       x-discrepancy: >-
         notFound: в C# у IpcError.NotFound(what) details нет (null), NameDetails создаётся только в
         IpcError.UnknownMessage для IPC (IpcErrors.cs:46-49; в ack команды на сервер не попадает: неизвестное имя
-        команды агент подтверждает notFound без details — RealtimeClient.cs:379; ветка UnknownMessage в
-        CommandReceiver.cs:266 недостижима — switch покрывает все значения ServerCommandType); мок на REST шлёт details = { what } (db.ts:76);
+        команды агент подтверждает notFound без details — по WS RealtimeClient.cs:361, по REST-пути Heartbeat.cs:361;
+        ветка UnknownMessage в CommandReceiver недостижима — switch покрывает все значения ServerCommandType); мок на
+        REST шлёт details = { what } (db.ts:76);
         SERVER_API.md форму details для notFound не задаёт. В контракте: REST details = null или свободный объект;
         ни агент, ни шелл details.what не читают (агент передаёт details шеллу как есть).
       x-csharp: "src/ClubShell.Contracts/Errors/ErrorCode.cs:14"
       x-source:
-        - "src/ClubShell.Contracts/Errors/ErrorCode.cs:78"
-        - "src/ClubShell.Core/Http/ServerClient.cs:589"
+        - "src/ClubShell.Contracts/Errors/ErrorCode.cs:76"
+        - "src/ClubShell.Contracts/Errors/ErrorCode.cs:141"
+        - "src/ClubShell.Contracts/Errors/ErrorCode.cs:162"
+        - "src/ClubShell.Core/Http/ServerClient.cs:615"
+        - "src/ClubShell.Core/Http/ServerClient.cs:645"
+        - "src/ClubShell.Core/Http/RetryPolicy.cs:57"
         - "docs/IPC_PROTOCOL.md:117"
         - "src/ClubShell.Core/Http/ServerClient.cs:314"
         - "src/ClubShell.Core/Http/ServerClient.cs:574"
@@ -220,7 +240,7 @@ components:
       type: object
       description: >-
         Ошибка в формате IPC. На сервер приходит в CommandAck.error / WsAck.error, когда агент не смог выполнить
-        команду (например, notFound для неизвестной команды, validation при отсутствии обязательного payload,
+        команду (например, notFound для неизвестной команды — по WS и по REST-пути, validation при отсутствии обязательного payload,
         timeout для просроченной/вытесненной команды, internal при исключении обработчика).
       required: [code, message, details]
       properties:
@@ -380,13 +400,17 @@ components:
       type: string
       enum: [stable, beta]
       description: Канал обновлений.
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:17"
 
     UpdateComponent:
       type: string
       enum: [agent, shell]
-      description: Обновляемый компонент — служба агента или киоск-шелл.
-      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:28"
+      description: >-
+        Обновляемый компонент — служба агента или киоск-шелл. Незнакомое значение агент читает как unknown и такое
+        обновление отклоняет (ack команды update — validation; AgentUpdater.cs:286).
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:31"
 
     UpdateManifest:
       type: object
@@ -455,7 +479,11 @@ components:
         - setVolume
         - refreshConfig
       description: >-
-        Тип команды сервер -> агент (WS-кадр command, поле name; REST GET /agents/{pcId}/commands, поле name).
+        Тип команды сервер -> агент (WS-кадр command, поле name; REST GET /agents/{pcId}/commands, поле name). На
+        проводе name — строка (WsFrame.name, ServerCommandEnvelope.name): имя, которого агент не знает, он подтверждает
+        ack { ok: false, error.code: notFound } по обоим путям. Новое имя команды безопасно для агентов с club-shell
+        feat/shell-changes; у старых агентов неизвестное имя в REST-пачке роняет разбор всей пачки — такое имя
+        добавлять с x-enum-added.
         Payload и результат ack по типу — x-payload-schemas / x-result-schemas (null — нет payload / результат null).
         Для команд из x-payload-optional payload может быть null или отсутствовать; для остальных без payload агент
         отвечает ack { ok: false, error.code: validation, details.field: payload }.
@@ -520,8 +548,9 @@ components:
         showAds: null
         setVolume: VolumeState
         refreshConfig: RefreshConfigResult
-      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:88"
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:94"
       x-source:
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:257"
         - "src/ClubShell.Agent/Server/CommandReceiver.cs:245"
         - "src/ClubShell.Agent/Server/CommandReceiver.cs:271"
         - "src/ClubShell.Agent/Server/CommandReceiver.cs:475"
@@ -564,9 +593,9 @@ components:
     ServerCommandEnvelope:
       type: object
       description: >-
-        Команда в очереди, как её отдаёт GET /agents/{pcId}/commands. Имя вне ServerCommandType ломает разбор всего
-        ответа у агента (JsonException -> protocolError, ни одна команда пачки не выполнится) — отдавать только
-        известные имена. После выполнения агент шлёт POST /agents/{pcId}/commands/{id}/ack с CommandAck.
+        Команда в очереди, как её отдаёт GET /agents/{pcId}/commands. После выполнения агент шлёт
+        POST /agents/{pcId}/commands/{id}/ack с CommandAck для каждого элемента пачки: неизвестное имя — ack
+        { ok: false, error.code: notFound }, просроченная — timeout, остальные выполняются (Heartbeat.cs:318-375).
       required: [id, ts, name]
       properties:
         id:
@@ -578,7 +607,14 @@ components:
           format: date-time
           description: Время выдачи на сервере.
         name:
-          $ref: '#/components/schemas/ServerCommandType'
+          type: string
+          description: >-
+            Имя команды — значение ServerCommandType. В C# строка, как WsFrame.name (club-shell feat/shell-changes,
+            SHELL_CHANGES п. 3): незнакомое имя агент подтверждает ack notFound и выполняет остальные команды пачки.
+            Агенты до feat/shell-changes разбирали name как enum ServerCommandType: незнакомое имя роняло разбор всей
+            пачки (protocolError), ни одна команда не выполнялась. Поэтому сервер шлёт только имена ServerCommandType,
+            новые — по правилу x-enum-added.
+          examples: [lock, message, reboot]
         payload:
           description: Payload по типу (ServerCommandType.x-payload-schemas); null или отсутствует, если данных нет.
         issuedBy:
@@ -592,17 +628,19 @@ components:
           type: [string, "null"]
           format: date-time
           description: Срок годности; просроченную команду агент подтверждает ack с ошибкой timeout.
-      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:205"
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:216"
       x-source:
-        - "src/ClubShell.Agent/Server/Heartbeat.cs:261"
-        - "src/ClubShell.Agent/Server/Heartbeat.cs:278"
+        - "src/ClubShell.Contracts/Commands/ServerCommand.cs:179"
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:318"
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:361"
         - "tools/MockServer/src/ws.ts:153"
 
     ServerCommandsResponse:
       type: object
       description: >-
         Ответ GET /agents/{pcId}/commands — неподтверждённые непросроченные команды, старые первыми. Агент опрашивает
-        его после каждого heartbeat с pendingCommands > 0 (независимо от состояния WS; дубли отсекаются по id).
+        его после каждого heartbeat с pendingCommands > 0 (независимо от состояния WS; дубли отсекаются по id, на
+        дубль агент отвечает ack первого выполнения).
       required: [items]
       properties:
         items:
@@ -1125,8 +1163,9 @@ components:
       type: string
       enum: [command, ack, event, ping, pong, push]
       description: >-
-        Тип WS-кадра. Кадр с неизвестным type агент целиком отбрасывает (JsonException). Входящие ack/event/pong агент
-        игнорирует; на ping отвечает pong с тем же id.
+        Тип WS-кадра. Кадр с неизвестным type агент отбрасывает: старый агент — по JsonException, агент с club-shell
+        feat/shell-changes читает type как unknown и кадр игнорирует. Входящие ack/event/pong агент игнорирует; на ping
+        отвечает pong с тем же id.
       x-enum-descriptions:
         command: Сервер -> агент, команда; требует ack.
         ack: Агент -> сервер, подтверждение команды.
@@ -1134,7 +1173,8 @@ components:
         ping: Keepalive-запрос (сервер каждые 20 с).
         pong: Keepalive-ответ (в течение 10 с).
         push: Сервер -> агент, уведомление; без подтверждения.
-      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:528"
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:539"
       x-source:
         - "src/ClubShell.Core/Realtime/RealtimeClient.cs:318"
         - "src/ClubShell.Core/Realtime/RealtimeClient.cs:339"
@@ -1459,13 +1499,90 @@ components:
         offlineQueue:
           type: integer
           format: int32
-          description: Размер outbox.
+          description: >-
+            Размер outbox: события сессий (без dead-letter) плюс отложенные launch-report (OfflineSessionStore.cs:455).
         shellConnected:
           type: boolean
           description: Жив ли канал к шеллу (named pipe).
-      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:774"
+        gamesVolume:
+          oneOf:
+            - $ref: '#/components/schemas/HeartbeatGamesVolume'
+            - type: "null"
+          description: >-
+            Кто монтирует том библиотеки игр и смонтирован ли он (SHELL_CHANGES п. 9) — чтобы панель видела, у кого том
+            отвалился. Шлёт агент с club-shell feat/shell-changes; старые агенты поле не шлют. Сервер может его
+            игнорировать.
+          x-source:
+            - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:164"
+        antiCheat:
+          oneOf:
+            - $ref: '#/components/schemas/HeartbeatAntiCheat'
+            - type: "null"
+          description: >-
+            Предусловия античитов на ПК (SHELL_CHANGES п. 14) — чтобы сервер скрывал Riot-игры на ПК без Vanguard.
+            Шлёт агент с club-shell feat/shell-changes; старые агенты поле не шлют. Сервер может его игнорировать.
+          x-source:
+            - "src/ClubShell.Agent/Server/Heartbeat.cs:222"
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:790"
       x-source:
-        - "src/ClubShell.Agent/Server/Heartbeat.cs:163"
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:179"
+
+    GamesVolumeOwner:
+      type: string
+      enum: [none, agent, disklessHelper]
+      description: >-
+        Кто монтирует том библиотеки игр (heartbeat gamesVolume.owner): none — никто (storage.gamesShare выключен,
+        ClubDisklessHelper не установлен, только локальные диски); agent — агент подключает SMB-шару
+        storage.gamesShare; disklessHelper — ClubDisklessHelper (iSCSI только для чтения, club-shell docs/DISKLESS.md),
+        он сообщает о томе своему серверу. Только агент -> сервер, поэтому x-agent-fallback нет.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:806"
+
+    HeartbeatGamesVolume:
+      type: object
+      description: Том библиотеки игр в heartbeat (club-shell feat/shell-changes).
+      required: [owner]
+      properties:
+        owner:
+          $ref: '#/components/schemas/GamesVolumeOwner'
+        mounted:
+          type: [boolean, "null"]
+          description: >-
+            Подключён и читается. owner = none — false; owner = disklessHelper — не передаётся (агент не видит монтирование
+            помощника); owner = agent — false, пока задан storage.gamesShare.iscsi (агент iSCSI не монтирует).
+        driveLetter:
+          type: [string, "null"]
+          minLength: 1
+          maxLength: 1
+          description: Буква, которую подключает агент (G); только при owner = agent.
+        since:
+          type: [string, "null"]
+          format: date-time
+          description: Когда mounted последний раз менялся; null — не менялся с запуска агента.
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:823"
+      x-source:
+        - "src/ClubShell.Agent/Storage/GamesShareMounter.cs:164"
+
+    HeartbeatAntiCheat:
+      type: object
+      description: >-
+        Предусловия античитов в heartbeat (club-shell feat/shell-changes); null или отсутствие поля — неизвестно.
+        Сервер по ним может скрывать Riot-игры (Vanguard) на ПК, где их нельзя запустить.
+      properties:
+        vanguardInstalled:
+          type: [boolean, "null"]
+          description: Драйвер Riot Vanguard (служба vgk) установлен и его образ на месте.
+        vanguardLoaded:
+          type: [boolean, "null"]
+          description: Драйвер vgk загружен (грузится при старте ОС; после свежей установки нужна перезагрузка).
+        secureBoot:
+          type: [boolean, "null"]
+          description: Включён UEFI Secure Boot (проверяется на каждом heartbeat).
+        tpm:
+          type: [boolean, "null"]
+          description: Есть TPM (агент запоминает первый ответ WMI до перезапуска).
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:834"
+      x-source:
+        - "src/ClubShell.Agent/Server/Heartbeat.cs:222"
 
     HeartbeatResponse:
       type: object
@@ -1516,14 +1633,14 @@ components:
         принимать любую строку. x-known-values — константы TelemetryEventKinds; x-emitted-by-agent — что агент
         реально отправляет сейчас (agentHealth, callAdmin, shellClientError в классе констант отсутствуют).
         callAdmin — офлайн-очередь вызова администратора: data = CallAdminTicketRequest, отправляется, когда
-        POST /support/call-admin недоступен (сеть или ошибка serverUnavailable/timeout/rateLimited, в т.ч. 501).
+        POST /support/call-admin недоступен (сеть, ошибка serverUnavailable/timeout/rateLimited или 501 notImplemented).
       examples: [shellCrash, shellCrashLoop, policyApplyFailed, updateFailed, pipeError, launcherError, deadletter]
       x-known-values: [shellCrash, shellCrashLoop, policyApplyFailed, updateFailed, pipeError, launcherError, deadletter]
       x-emitted-by-agent:
         shellCrash: "src/ClubShell.Agent/Watchdog/CrashRecovery.cs:180"
         shellCrashLoop: "src/ClubShell.Agent/Watchdog/CrashRecovery.cs:183"
         agentHealth: "src/ClubShell.Agent/AgentWorker.cs:443"
-        callAdmin: "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:253"
+        callAdmin: "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:255"
         shellClientError: "src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:385"
       x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:804"
 
@@ -1563,8 +1680,11 @@ components:
           type: array
           maxItems: 1024
           description: >-
-            Диагностические события. Пока выгрузка не удаётся, агент копит до 1024 событий и шлёт их одной пачкой —
-            сервер должен принимать все 1024 (отказ 400 заблокирует выгрузку: агент не делит пачку).
+            Диагностические события. Агент с club-shell feat/shell-changes (SHELL_CHANGES п. 6) кладёт в пачку не больше
+            100 событий (TelemetryReporter.MaxBatchEvents), остальные — в следующие пачки; копит до 1024. Пачку, на
+            которую сервер ответил 4xx, кроме 401/408/429, агент отбрасывает; после прочих неудач выгрузка отступает
+            экспоненциально (от uploadIntervalSec до 15 мин). Старые агенты шлют до 1024 событий одной пачкой и не
+            делят её — сервер принимает до 1024 (отказ 400 у старого агента блокирует выгрузку).
           items:
             $ref: '#/components/schemas/TelemetryEvent'
         hardware:
@@ -1578,10 +1698,11 @@ components:
           description: Последние ≤ 50 строк лога уровня Warning+, когда events непуст.
           items:
             type: string
-      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:842"
+      x-csharp: "src/ClubShell.Contracts/Commands/ServerCommand.cs:896"
       x-source:
-        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:96"
-        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:290"
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:99"
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:225"
+        - "src/ClubShell.Agent/Server/TelemetryReporter.cs:311"
 
     CallAdminTicketRequest:
       type: object

@@ -86,20 +86,25 @@ info:
     - Окно: `|now − X-Timestamp| ≤ 300 с`. Иначе `401 unauthorized`, `details.reason = "clockSkew"` и заголовок
       `X-Server-Time` (ISO-8601 UTC) — агент вычисляет смещение и повторяет запрос один раз.
     - Повторы кортежа (`pcId`, `X-Timestamp`, `X-Signature`). SERVER_API.md §2.2 требует его уникальности в пределах
-      окна, но буквально это ломает агента (приоритет у кода агента): подпись ставится один раз до отправки
-      (`ServerClient.SendOnceAsync` → `Authorize`), а автоматические повторы (408/425/429/5xx/сетевые ошибки, §8) идут
-      внутри конвейера `HttpClient` с теми же `X-Timestamp`/`X-Signature`; nonce в подписи нет, поэтому два одинаковых
-      запроса в одну секунду (и повтор после `POST /agents/refresh` в ту же секунду без ротации `signingSecret`) дают
-      тот же кортеж. `401` на повтор агент принял бы за протухший токен: лишний refresh с ротацией refresh-токена, а
-      затем ошибка ушла бы в шелл. Норма v1:
+      окна. Агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 2) подписывает **каждую попытку** заново:
+      подпись ставит `RequestSigningHandler` внутри конвейера повторов, а повтор в ту же секунду получает
+      `X-Timestamp` = предыдущий + 1 (не больше нескольких секунд впереди часов агента), так что автоматические
+      повторы (§8) уже не совпадают. Формат заголовков не изменился. Совпасть по-прежнему могут два **разных**
+      логических запроса с одинаковыми методом, путём и телом в одну секунду (два `GET /agents/{pcId}/commands` или
+      `GET /agents/{pcId}/config`; повтор после `POST /agents/refresh` в ту же секунду без ротации `signingSecret`):
+      nonce в подписи нет. У старых агентов повторы идут с той же подписью. `401` на повтор агент принял бы за
+      протухший токен: лишний refresh с ротацией refresh-токена, а затем ошибка ушла бы в шелл. Норма v1:
       - повтор кортежа **не** отклоняется ответом `401` и не считается ошибкой подписи;
       - `GET`/`PUT`/`DELETE`/`HEAD` исполняются заново как обычно; `POST` с `Idempotency-Key` проходят через хранилище
         идемпотентности (§5: исходный ответ);
       - для `POST`/`PATCH` без `Idempotency-Key` (агент их автоматически не повторяет) сервер может лишь журналировать
         повтор кортежа для аудита, не отклоняя запрос (мок окно повторов не реализует).
       Открытый вопрос владельцу: нужна ли в v1 активная защита от повторов неидемпотентных запросов; если да, отказ
-      должен быть не `401` (вызывает refresh), а, например, `409 conflict`, `details.reason = "replay"` (агент 409 не
-      повторяет и токен не обновляет) — по согласованию с агентом.
+      должен быть не `401` с причиной, вызывающей refresh (агент обновляет токен на любой `401`, кроме
+      `clockSkew`/`userToken`), а, например, `409 conflict`, `details.reason = "replay"` (агент 409 не повторяет и
+      токен не обновляет) — по согласованию с агентом. Варианты сузить проверку: только изменяющие методы; исключить
+      запросы с `Idempotency-Key` (их и так отсекает хранилище идемпотентности); записывать кортеж только после
+      окончательного не-5xx ответа; nonce в подписи — изменение провода, только в новой версии.
     - Неверная/отсутствующая подпись — `401`, `details.reason = "signature"`, `details.problem` ∈ `missing` | `mismatch`
       (мок).
     - Сравнение подписи — за постоянное время; агент шлёт hex в нижнем регистре.
@@ -122,10 +127,12 @@ info:
     Любой не-2xx ответ (кроме 304) — `ServerErrorEnvelope`:
     `{ "error": { "code": ErrorCode, "message": string, "details": object | null, "traceId": string } }`.
     Ключ `details` присутствует всегда (`null`, если деталей нет); `traceId` = `X-Trace-Id` запроса.
-    `code` — строго одно из значений `ErrorCode`: неизвестное значение агент не распарсит, отбросит конверт целиком и
-    выведет код из HTTP-статуса (`ErrorCodes.FromHttpStatus`: 400→validation, 401→unauthorized, 402→insufficientFunds,
-    403→forbidden, 404→notFound, 408/504→timeout, 409→conflict, 426→versionMismatch, 429→rateLimited,
-    прочие ≥500→serverUnavailable).
+    `code` — строго одно из значений `ErrorCode`. Код незнакомого агенту значения выводится из HTTP-статуса
+    (`ErrorCodes.FromHttpStatus`: 400→validation, 401→unauthorized, 402→insufficientFunds, 403→forbidden,
+    404→notFound, 408/504→timeout, 409→conflict, 426→versionMismatch, 429→rateLimited, 501→notImplemented,
+    прочие ≥500→serverUnavailable). Агент с club-shell `feat/shell-changes` при этом сохраняет `message`, `details`
+    и `traceId` из тела (`ServerClient.ParseServerError`); старые агенты отбрасывают конверт целиком, а 501 у них
+    даёт `serverUnavailable`.
 
     | HTTP | error.code |
     |------|------------|
@@ -138,7 +145,7 @@ info:
     | 426 | `versionMismatch` (`details: { supported, got }`) |
     | 429 | `rateLimited` (`details.retryAfterSec`) + `Retry-After` |
     | 500 | `internal` |
-    | 501 | см. ответ `NotImplemented` |
+    | 501 | `notImplemented` (см. ответ `NotImplemented`) |
     | 503 | `serverUnavailable` |
 
     ## 5. Idempotency-Key
@@ -149,6 +156,12 @@ info:
     повтор возвращает исходный ответ (тот же статус и тело) с заголовком `Idempotent-Replayed: true`. Ответы с ошибкой не
     сохраняются — повтор исполняется заново (мок, `db.ts` `idempotent`). Только POST с этим заголовком агент считает
     безопасным для автоматического повтора.
+
+    Касса (`apps/admin`, club-shell `feat/shell-changes`, SHELL_CHANGES п. 15) шлёт `Idempotency-Key` на денежных
+    `POST /admin/sessions`, `/admin/sessions/extend`, `/admin/sessions/end`, `/admin/wallet/topup`,
+    `/admin/promo/redeem`, `/admin/products/{id}/receive`, `/admin/shift/close`: один ключ на действие кассира; тот
+    же ключ — при повторе того же тела после сетевой ошибки или 5xx; после любого 2xx или 4xx — новый ключ. Сама
+    касса автоматически не повторяет — повтор делает кассир.
 
     ## 6. ETag / If-None-Match
 
@@ -175,18 +188,28 @@ info:
 
     ## 8. Повторы и circuit breaker агента (что должен учитывать сервер)
 
-    Агент повторяет `GET`/`PUT`/`DELETE`/`HEAD` и `POST` с `Idempotency-Key` на 408/425/429/**любой 5xx** и сетевые ошибки:
-    до 5 попыток, включая первую (4 повтора), экспоненциальная задержка 0,5…15 с с джиттером, `Retry-After` учитывается. Все такие исходы (включая
-    501) считаются отказами общего circuit breaker: ≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на 30 с для
-    **всех** запросов агента к серверу. Тайм-аут одного запроса — 15 с. Прочие 4xx агент не повторяет.
+    Агент повторяет `GET`/`PUT`/`DELETE`/`HEAD` и `POST` с `Idempotency-Key` на 408/425/429/**5xx, кроме 501**, и сетевые
+    ошибки: до 5 попыток, включая первую (4 повтора), экспоненциальная задержка 0,5…15 с с джиттером, `Retry-After`
+    учитывается; каждая попытка подписывается заново (§3). Все такие исходы считаются отказами общего circuit breaker:
+    ≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на 30 с для **всех** запросов агента к серверу. Тайм-аут
+    одного запроса — 15 с. Прочие 4xx агент не повторяет.
+
+    `501` (`notImplemented`) агент с club-shell `feat/shell-changes` (SHELL_CHANGES п. 1) не повторяет и в circuit
+    breaker не засчитывает (`RetryPolicy.IsTransient`), а `ErrorCode.notImplemented` считает окончательной ошибкой
+    (не `IsRetryable`). Старые агенты считают 501 временной ошибкой: повторяют и засчитывают каждую попытку.
 
     ## 9. Совместимость
 
     - Добавлять поля в ответы и необязательные поля в запросы можно всегда (в схемах нет `additionalProperties: false`).
     - Удалять, переименовывать, менять тип/смысл поля, делать обязательное поле необязательным/nullable, добавлять
       обязательное поле запроса — только в `/api/v2`.
-    - Новые значения enum (включая `ErrorCode`) ломают текущего агента: конвертер enum не имеет запасного значения, и
-      весь ответ (или конверт ошибки) не десериализуется. Добавлять только согласованно с релизом агента или в `/api/v2`.
+    - Новые значения enum. У enum с `x-agent-fallback: unknown` агент с club-shell `feat/shell-changes`
+      (SHELL_CHANGES п. 3) читает незнакомую строку как `unknown` и не роняет ответ (числа и `null` по-прежнему
+      отвергаются). Само значение `unknown` на провод не входит: сервер его не шлёт, а на входе отвечает на него
+      `400 validation` (`reason = enum`), как на любое неизвестное значение. У остальных enum (в том числе `ErrorCode`)
+      и у старых агентов незнакомая строка ломает разбор всего ответа (у `ErrorCode` — только кода: §4).
+      Каждое добавленное значение помечается в схеме `x-enum-added: { <значение>: <кто его понимает и что делают
+      старые потребители> }`; добавлять только согласованно с релизом потребителя или в `/api/v2`.
 
     ## 10. Статус реализации: x-server-status, x-prohibited
 
@@ -194,8 +217,9 @@ info:
       зафиксировать контракт клиента, но сервер v1 её не реализует и отвечает `501 Not Implemented` с `ServerErrorEnvelope`
       (ответ `NotImplemented`). Путь при этом существует: 404 на такие операции не отдаётся.
     - `x-prohibited: telegram` — Telegram в продукте запрещён. Такие операции — `notImplemented`; такие поля сервер не
-      хранит и не использует, на входе принимает и игнорирует, в ответах отдаёт пустое значение того же типа
-      (`""`/`false`), а не опускает поле, если потребитель объявил его обязательным.
+      хранит и не использует, на входе принимает и игнорирует. Касса club-shell `feat/shell-changes` (SHELL_CHANGES
+      п. 17) Telegram-поля не читает и не шлёт, поэтому они необязательны и `deprecated`: сервер их не отдаёт
+      (удаление из схемы — в `/api/v2`, правило совместимости §9).
 
     ## 11. Касса `/admin/*`: CORS и тела ответов
 
@@ -205,7 +229,8 @@ info:
     - отвечать на preflight `OPTIONS` (`204`, без авторизации) для методов `GET`, `POST`, `PUT`, `PATCH`, `DELETE`;
     - отдавать `Access-Control-Allow-Origin` для origin кассы (настраиваемый список; мок отражает любой origin) и
       `Vary: Origin`;
-    - `Access-Control-Allow-Headers`: как минимум `Authorization`, `Content-Type` (мок разрешает любые);
+    - `Access-Control-Allow-Headers`: как минимум `Authorization`, `Content-Type`, `Idempotency-Key` (касса шлёт его
+      на денежных операциях, §5; мок разрешает любые);
     - `Access-Control-Expose-Headers: ETag, X-Trace-Id, X-Server-Time, Retry-After` (как мок).
 
     CORS-заголовки нужны и на ответах с ошибкой (401/403/…), иначе касса не прочитает `ServerErrorEnvelope`.
@@ -247,6 +272,13 @@ info:
     - tools/MockServer/src/routes/games.ts:62
     - apps/admin/src/api.ts:18
     - apps/admin/src/api.ts:92
+    - src/ClubShell.Core/Http/RequestSigningHandler.cs:12
+    - src/ClubShell.Core/Http/RetryPolicy.cs:57
+    - src/ClubShell.Core/Http/RetryPolicy.cs:164
+    - src/ClubShell.Core/Http/ServerClient.cs:645
+    - src/ClubShell.Contracts/Errors/ErrorCode.cs:141
+    - src/ClubShell.Contracts/Serialization/JsonDefaults.cs:112
+    - apps/admin/src/api.ts:142
 servers:
   - url: 'https://{host}/api/v1'
     description: Центральный сервер клуба (`agent.json → server.baseUrl` включает `/api/v1`).
@@ -361,10 +393,13 @@ components:
         Токен персонала кассы (непрозрачный, в моке `st_<hex>`), выдаётся `POST /admin/login` по PIN; касса хранит его в
         localStorage и шлёт как `Authorization: Bearer <token>`. Подписи нет. Неверный — `401`, `details.reason = "invalid"`
         (касса на 401 выходит из учётной записи); не хватает роли — `403`, `details.reason = "ownerOnly"`.
+        Кнопка «Выйти» кассы вызывает `POST /admin/logout`: токен отзывается, дальнейшие запросы с ним — `401 invalid`.
       x-source:
         - apps/admin/src/api.ts:89
+        - apps/admin/src/api.ts:582
         - tools/MockServer/src/routes/club.ts:63
         - tools/MockServer/src/routes/club.ts:136
+        - tools/MockServer/src/routes/club.ts:175
   parameters:
     XTimestamp:
       name: X-Timestamp
@@ -417,14 +452,19 @@ components:
       in: header
       required: false
       description: |
-        То же, что `IdempotencyKey`, но необязательный: для создающих/списывающих POST, клиент которых ключ не шлёт
-        (например, касса `apps/admin` не отправляет `Idempotency-Key`). Без ключа идемпотентности нет.
+        То же, что `IdempotencyKey`, но необязательный: клиент может ключ не прислать, и тогда идемпотентности нет.
+        Касса `apps/admin` с club-shell `feat/shell-changes` шлёт его на семи денежных маршрутах (`POST /admin/sessions`,
+        `/admin/sessions/extend`, `/admin/sessions/end`, `/admin/wallet/topup`, `/admin/promo/redeem`,
+        `/admin/products/{id}/receive`, `/admin/shift/close`): один UUID v4 на действие кассира, тот же при повторе того
+        же тела после сетевой ошибки или 5xx (описание API, §5). Старые сборки кассы и агент на других POST ключ не шлют.
       schema:
         type: string
         format: uuid
       x-source:
         - docs/SERVER_API.md:20
-        - apps/admin/src/api.ts:89
+        - apps/admin/src/api.ts:118
+        - apps/admin/src/api.ts:142
+        - tools/MockServer/src/routes/admin.ts:9
     XTraceId:
       name: X-Trace-Id
       in: header
@@ -957,29 +997,30 @@ components:
 
         `Retry-After` на 501 не отправлять.
 
-        Код ошибки — **открытый вопрос владельцу**: подходящего `ErrorCode` нет (в `ErrorCode.cs` нет `notImplemented`),
-        а неизвестный `code` агент не распарсит, отбросит конверт и выведет код из статуса (`ErrorCodes.FromHttpStatus`:
-        501 → `serverUnavailable`). Предварительно, до решения, сервер отвечает `error.code = serverUnavailable`,
-        `details: { reason: "notImplemented" }` — агент получает тот же код, что и без конверта. Альтернатива — добавить
-        `notImplemented` в `ErrorCode` (неповторяемый) согласованно с релизом агента (§9).
+        Код ошибки — `notImplemented` (добавлен в `ErrorCode` по SHELL_CHANGES п. 1, см. `ErrorCode.x-enum-added`),
+        `details` — `null` или `{ reason: "notImplemented" }`. Старый агент неизвестный код не распарсит, отбросит конверт
+        и выведет код из статуса: 501 → `serverUnavailable` — тот же код, что давал прежний временный вариант
+        (`error.code = serverUnavailable`, `details.reason = notImplemented`), поэтому переходного режима не нужно.
 
-        Последствия для агента (учитывать при выборе `x-server-status`):
-        - HTTP-уровень: 501 — «временная» ошибка (`RetryPolicy.IsTransient`: любой ≥ 500). `GET`/`PUT`/`DELETE`/`HEAD`
-          и `POST` с `Idempotency-Key` отправляются до 5 попыток, включая первую (4 повтора), с задержкой 0,5…15 с;
-          каждая попытка — отказ общего circuit breaker'а (≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на
-          30 с для всех запросов агента, в том числе к `required`-операциям).
-        - Прикладной уровень: у `serverUnavailable` `IsRetryable = true`, поэтому вместо ошибки срабатывают офлайн-фолбэки
-          агента:
-          - `POST /support/call-admin` — агент перехватывает ошибку, публикует тикет в телеметрию (`kind = "callAdmin"`,
-            данные — `CallAdminTicketRequest`) и возвращает шеллу выдуманный успешный `SysCallAdminResponse` (новый
-            `ticketId`). Пока операция `notImplemented`, сервер v1 должен обрабатывать такие записи
+        Последствия для агента с club-shell `feat/shell-changes`:
+        - HTTP-уровень: 501 не повторяется и не засчитывается circuit breaker'ом (`RetryPolicy.IsTransient`).
+        - Прикладной уровень: `notImplemented` не `IsRetryable` — офлайн-фолбэки агента не срабатывают, ошибка
+          окончательная:
+          - `POST /support/call-admin` — исключение: агент и на `notImplemented` публикует тикет в телеметрию
+            (`kind = "callAdmin"`, данные — `CallAdminTicketRequest`) и возвращает шеллу успешный `SysCallAdminResponse`
+            с новым `ticketId`. Пока операция `notImplemented`, сервер v1 должен обрабатывать такие записи
             `POST /agents/{pcId}/telemetry`, иначе вызов админа молча теряется;
-          - `GET /games/{id}/accounts/lease` — 3 попытки на уровне приложения (× до 5 HTTP-попыток каждая), затем в шелл
-            уходит `accountPoolExhausted` («Account pool unreachable; no cached lease»); освобождение аренды — до 3
-            попыток, затем молча пропускается (аренда истекает на сервере);
-          - `GET /apps` — отдаётся закэшированный каталог, если он есть;
-          - операции без фолбэка — в шелл уходит `serverUnavailable`.
-        - Касса (`apps/admin`) не повторяет: показывает `AdminError` с `error.code`.
+          - `GET /games/{id}/accounts/lease` — сразу ошибка в шелл (без повторов `AccountPool`); освобождение аренды не
+            повторяется (аренда истекает на сервере). Пул по умолчанию выключен (SHELL_CHANGES п. 5);
+          - `GET /apps` и прочие операции — в шелл уходит `notImplemented` (кэша у никогда не работавшей операции нет).
+
+        Старые агенты (до `feat/shell-changes`): 501 — «временная» ошибка (любой ≥ 500): `GET`/`PUT`/`DELETE`/`HEAD` и
+        `POST` с `Idempotency-Key` уходят до 5 попыток с задержкой 0,5…15 с, каждая — отказ общего circuit breaker'а
+        (≥ 80 % отказов при ≥ 5 запросах за 30 с размыкают цепь на 30 с для всех запросов агента); у `serverUnavailable`
+        `IsRetryable = true`, поэтому срабатывают офлайн-фолбэки (кэш `GET /apps`, 3 попытки лиза, телеметрия
+        `callAdmin`). Учитывать при выборе `x-server-status` для операций, которые вызывают старые агенты.
+
+        Касса (`apps/admin`) не повторяет: показывает `AdminError` с `error.code`.
       headers:
         X-Trace-Id:
           $ref: '#/components/headers/XTraceIdResponse'
@@ -993,7 +1034,7 @@ components:
             notImplemented:
               value:
                 error:
-                  code: serverUnavailable
+                  code: notImplemented
                   message: Not implemented in server v1
                   details:
                     reason: notImplemented
@@ -1008,10 +1049,13 @@ components:
         - src/ClubShell.Core/Configuration/AppSettings.cs:258
         - apps/admin/src/api.ts:104
         - src/ClubShell.Contracts/Errors/ErrorCode.cs:156
-        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:247
-        - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:257
+        - src/ClubShell.Agent/Ipc/Handlers/SystemHandlers.cs:248
+        - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:252
         - src/ClubShell.Agent/Games/Accounts/AccountPool.cs:283
         - src/ClubShell.Agent/Ipc/Handlers/GameHandlers.cs:109
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:76
+        - src/ClubShell.Contracts/Errors/ErrorCode.cs:152
+        - src/ClubShell.Core/Http/RetryPolicy.cs:57
     ServiceUnavailable:
       description: |
         `serverUnavailable` — сервер или внешний провайдер (например, провайдер пополнения) временно недоступен.

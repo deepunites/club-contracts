@@ -4,7 +4,8 @@
 #   (namespace ClubShell.Contracts.Sessions).
 # Внешние схемы (определяют другие группы, здесь только $ref): Money (Wallet/Balance.cs), IpcError (Ipc/IpcErrors.cs).
 # Правила провода: JsonDefaults.cs — camelCase, enum как camelCase-строки (CamelCaseEnumConverter на каждом enum,
-# целые значения отвергаются), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
+# целые значения отвергаются; у enum с x-agent-fallback: unknown агент с club-shell feat/shell-changes читает
+# незнакомую строку как unknown), null не пишется (WhenWritingNull), незнакомые поля пропускаются,
 # DateTimeOffset -> yyyy-MM-ddTHH:mm:ss.fffZ. В этих файлах нет JsonPropertyName/JsonStringEnumMemberName/
 # JsonPolymorphic; единственный JsonIgnore — вычисляемое Session.IsOpenEnded (на провод не попадает).
 # Статические классы-помощники без формы на проводе (SessionStateExtensions) схемами не стали — их семантика
@@ -23,6 +24,7 @@ components:
       description: >-
         Лаунчер/магазин, которым запускается игра: steam (steam://rungameid/<appid>), epic (Epic Games Launcher),
         battleNet, riot (Riot Client), ea (EA app), ubisoft (Ubisoft Connect), exe (прямой исполняемый файл без лаунчера).
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:9"
 
     AntiCheatKind:
@@ -31,8 +33,13 @@ components:
       description: >-
         Античит, от которого зависит игра: none — нет, eac — Easy Anti-Cheat, battlEye — BattlEye,
         vanguard — Riot Vanguard (драйвер ядра, нужны Secure Boot/TPM), faceit — клиент FACEIT,
-        ricochet — Activision Ricochet.
-      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:35"
+        ricochet — Activision Ricochet. Игру с launcher = riot и antiCheat = none агент с club-shell feat/shell-changes
+        считает vanguard (SHELL_CHANGES п. 14): проверяет Vanguard перед запуском и пишет vanguard в
+        LaunchReport.antiCheat.kind.
+      x-agent-fallback: unknown
+      x-csharp: "src/ClubShell.Contracts/Games/LauncherType.cs:38"
+      x-source:
+        - "src/ClubShell.Agent/Games/GameLaunchService.cs:377"
 
     AntiCheatSeverity:
       type: string
@@ -444,11 +451,25 @@ components:
         secret:
           type: string
           contentEncoding: base64
-          description: Зашифрованный пароль или токен (base64 nonce||ciphertext||tag).
+          description: >-
+            Зашифрованный пароль, токен или одноразовый exchange-код Epic (extra.authType = exchangeCode);
+            base64 nonce||ciphertext||tag. Пароль агент с club-shell feat/shell-changes в командную строку лаунчера не
+            кладёт (SHELL_CHANGES п. 11), кроме games.accountPool.allowPasswordOnCommandLine = true (по умолчанию false).
         extra:
           description: >-
-            Специфичные для лаунчера дополнительные данные (steamGuardSecret, authenticatorSeed, region); в C# —
-            JsonElement? (любое значение или null/отсутствует).
+            Специфичные для лаунчера дополнительные данные; в C# — JsonElement? (любое значение или null/отсутствует).
+            Ключи, которые читает агент: steamGuardSecret, authenticatorSeed, region; files — файлы сессии лаунчера
+            (путь с %LOCALAPPDATA%/%APPDATA%/%USERPROFILE% → содержимое), которые агент кладёт в профиль игрока перед
+            запуском: Riot, Battle.net и прочие, а с club-shell feat/shell-changes — также Steam (например,
+            %LOCALAPPDATA%\Steam\local.vdf; автологин ставится в профиле kiosk) и Epic; authType — только Epic:
+            "exchangeCode" означает, что secret — одноразовый exchange-код Epic, лаунчер получает
+            -AUTH_LOGIN=unused -AUTH_PASSWORD=<код> -AUTH_TYPE=exchangecode. Без files и без exchange-кода Steam и Epic
+            стартуют без учётных данных (игрок входит сам), а LaunchReport.injectionError об этом сообщает. Повторно
+            использованная аренда несёт уже потраченный exchange-код — Epic покажет форму входа.
+          x-source:
+            - "src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:69"
+            - "src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:144"
+            - "src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:359"
         expiresAt:
           type: string
           format: date-time
@@ -459,7 +480,9 @@ components:
             - type: "null"
           description: Пакет сохранений, который нужно восстановить перед запуском, если есть.
       x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:122"
-      x-prohibited-note: "пул аккаунтов клуба — открытый продуктовый вопрос Q8; пароль в командной строке лаунчера запрещён"
+      x-prohibited-note: >-
+        пул аккаунтов клуба — открытый продуктовый вопрос Q8 (у агента с club-shell feat/shell-changes выключен по
+        умолчанию); пароль в командной строке лаунчера запрещён — агент кладёт туда только exchange-код Epic
 
     AccountLeaseReleaseReason:
       type: string
@@ -535,7 +558,10 @@ components:
 
     LaunchReport:
       type: object
-      description: Тело POST /games/{id}/launch-report (SERVER_API §4.6).
+      description: >-
+        Тело POST /games/{id}/launch-report (SERVER_API §4.6). Агент с club-shell feat/shell-changes повторяет отчёт
+        из офлайн-очереди, если он не доставлен (см. операцию sendLaunchReport), поэтому сервер может получить один и
+        тот же отчёт (phase = launch или exit) повторно.
       required: [sessionId, userId, result, durationMs, launcher, antiCheat, phase]
       properties:
         sessionId:
@@ -572,7 +598,18 @@ components:
           format: int32
           minimum: 0
           description: Сыграно секунд (phase = exit; мок требует >= 0).
-      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:194"
+        injectionError:
+          type: [string, "null"]
+          description: >-
+            Только phase = launch при запуске с арендой аккаунта Steam или Epic: почему лаунчер подготовлен не чисто —
+            не удалось сбросить автологин Steam в профиле kiosk, не удалось убрать запомненный вход Epic, или в аренде
+            нет ни файлов сессии, ни exchange-кода, и лаунчер стартовал без учётных данных. Несколько причин — через
+            "; ". Нет поля — подготовка прошла чисто. Club-shell feat/shell-changes (SHELL_CHANGES п. 10); сервер может
+            поле игнорировать.
+          x-source:
+            - "src/ClubShell.Agent/Games/Accounts/AccountInjector.cs:41"
+            - "src/ClubShell.Agent/Games/GameLaunchService.cs:491"
+      x-csharp: "src/ClubShell.Contracts/Games/LaunchRequest.cs:198"
 
     # ------------------------------------------------------------------ SessionState.cs
 
@@ -584,6 +621,7 @@ components:
         в офлайн-хранилище; active — таймер идёт; paused — пауза пользователем, таймер стоит; locked — заблокирована
         (пользователь отошёл / администратор), таймер идёт, если тариф не ставит на паузу при блокировке;
         ending — время вышло, льготный период до принудительного завершения; ended — завершена и рассчитана.
+      x-agent-fallback: unknown
       x-open-states: [starting, active, paused, locked, ending]
       x-session-requests-states: [active, paused]
       x-timer-running-states: [active, locked, ending]
@@ -671,7 +709,9 @@ components:
       description: >-
         Почему сессия завершилась: user — пользователем; timeUp — кончилось предоплаченное время; admin —
         администратором; idle — по простою; agentRestart — агент перезапустился и не смог продолжить;
-        error — внутренняя ошибка.
+        error — внутренняя ошибка. Незнакомое значение агент с club-shell feat/shell-changes читает как unknown, а при
+        завершении сессии отправляет серверу admin (SessionManager.cs:329) — unknown на сервер не уходит.
+      x-agent-fallback: unknown
       x-csharp: "src/ClubShell.Contracts/Session/SessionEvent.cs:42"
 
     SessionEvent:
