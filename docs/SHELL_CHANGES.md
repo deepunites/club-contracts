@@ -268,9 +268,10 @@
     Подключение между командами не держать; одновременно помощник принимает до 4 подключений. `profile.attach` и
     `profile.detach` выполняются по одной, `ping` отвечает сразу. Обрыв подключения начатую команду не отменяет:
     помощник доводит её до конца.
-    Поля: `playerId` — `User.Id` игрока из кассы (`src/ClubShell.Contracts/Users/UserProfile.cs:74`) строкой,
-    `[A-Za-z0-9-]{1,64}`, регистр не важен; `windowsUserSid` — SID киоска, в чей профиль раскладывать
-    (`TempUserProvisioner.Sid`, `src/ClubShell.Agent/Users/TempUserProvisioner.cs:97`).
+    Поля: `playerId` — `User.Id` игрока из кассы (`Guid`, `src/ClubShell.Contracts/Users/UserProfile.cs:74`) строкой
+    в формате `D` (`Id.ToString()`, 36 знаков с дефисами) — везде в одном формате: `N` (без дефисов) помощник тоже
+    примет, но это будет другая папка игрока на сервере; `[A-Za-z0-9-]{1,64}`, регистр не важен; `windowsUserSid` —
+    SID киоска, в чей профиль раскладывать (`TempUserProvisioner.Sid`, `src/ClubShell.Agent/Users/TempUserProvisioner.cs:97`).
     - `{"op":"ping"}` → `{"ok":true,"version":"1.7.0"}` (по желанию — при старте агента, версию в журнал);
     - `{"op":"profile.attach","playerId":"…","windowsUserSid":"S-1-5-21-…"}` → `{"ok":true}`: файлы игрока разложены;
     - `{"op":"profile.detach","playerId":"…"}` → `{"ok":true}`: сервер клуба принял новую версию.
