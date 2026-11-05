@@ -275,9 +275,11 @@
     - `{"op":"ping"}` → `{"ok":true,"version":"1.7.0"}` (по желанию — при старте агента, версию в журнал);
     - `{"op":"profile.attach","playerId":"…","windowsUserSid":"S-1-5-21-…"}` → `{"ok":true}`: файлы игрока разложены;
     - `{"op":"profile.detach","playerId":"…"}` → `{"ok":true}`: сервер клуба принял новую версию.
-    Ошибка — `{"ok":false,"error":"<код>","message":"<текст на английском для журнала>"}`. Коды: `disabled`,
+    Ошибка — `{"ok":false,"error":"<код>","message":"<текст для журнала>"}`. Коды: `disabled`,
     `serverUnavailable`, `overLimit`, `notAttached`, `masterMode`, `profileNotFound`, `badRequest`, `internal`. Ответ
     разбирать как JSON (в `message` бывают `\uXXXX`), неизвестные поля пропускать, неизвестный код считать `internal`.
+    `message` — только для журнала, по нему ничего не решать и игроку не показывать: обычно по-английски, но бывает
+    и по-русски (сообщения Windows и проверки архива сохранений).
     **Просим (агент):**
     - **attach — при входе игрока, до запуска игр.** После успешного `auth.login`
       (`src/ClubShell.Agent/Ipc/Handlers/SessionHandlers.cs:204`; ответ онлайн — `:268`, офлайн из кэша — `:323`:
