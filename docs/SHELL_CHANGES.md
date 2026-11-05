@@ -268,6 +268,15 @@
     Подключение между командами не держать; одновременно помощник принимает до 4 подключений. `profile.attach` и
     `profile.detach` выполняются по одной, `ping` отвечает сразу. Обрыв подключения начатую команду не отменяет:
     помощник доводит её до конца.
+    **Проверять, что на том конце помощник.** Канал с этим именем может создать любой процесс, пока служба помощника
+    остановлена или перезапускается, в том числе процесс игрока. Агент — `SYSTEM`, поэтому:
+    - подключаться только с `TokenImpersonationLevel.Identification` (`new NamedPipeClientStream(".",
+      "club-diskless-helper", PipeDirection.InOut, PipeOptions.Asynchronous, TokenImpersonationLevel.Identification)`).
+      Конструктор без этого параметра подключается с уровнем Windows по умолчанию — олицетворение: подложный сервер
+      канала получит токен `SYSTEM` агента;
+    - после подключения сверить `GetNamedPipeServerProcessId` с PID службы `ClubDisklessHelper`
+      (`QueryServiceStatusEx` или `ServiceController` + WMI). Не совпало — ничего не слать, ошибка команды, в журнал
+      агента как ошибку безопасности. Так же делает `saves-test.ps1`.
     Поля: `playerId` — `User.Id` игрока из кассы (`Guid`, `src/ClubShell.Contracts/Users/UserProfile.cs:74`) строкой
     в формате `D` (`Id.ToString()`, 36 знаков с дефисами) — везде в одном формате: `N` (без дефисов) помощник тоже
     примет, но это будет другая папка игрока на сервере; `[A-Za-z0-9-]{1,64}`, регистр не важен; `windowsUserSid` —
